@@ -1,0 +1,60 @@
+[project]
+name = "nelke"
+version = "0.1.0"
+description = "Nelke - self-improving general-purpose agent (research, math, programming)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "openai>=1.30",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.13",
+    "duckduckgo-search>=6.0",
+    "sympy>=1.12",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+nelke = "nelke.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nelke"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests that hit a real LLM endpoint (set NELKE_TEST_REAL=1 to run)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B"]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+no_implicit_optional = true
+check_untyped_defs = true
+show_error_codes = true
+warn_unused_ignores = false

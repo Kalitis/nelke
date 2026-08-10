@@ -1,0 +1,368 @@
+﻿"""The self-improvement cycle engine (see plan §8).
+
+Work loop (self-edit tools on, cwd = repo) -> governance gate -> commit ->
+boot-check (auto-revert on failure) -> AI review -> human gate -> merge ``--no-ff``.
+Every transition is recorded in SQLite (``cycles``/``cycle_steps``/
+``review_requests``) and reported to the active frontend via ``CycleEvent``.
+"""
+
+from __future__ import annotations
+
+import inspect
+import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from nelke.core.agent import Agent
+from nelke.core.db import Database, _now, new_id
+from nelke.core.gitops import GitError, GitRepo
+from nelke.core.governance import Governance
+from nelke.core.llm import ToolCallback
+from nelke.core.memory import MemoryStore
+from nelke.core.reviewer import Reviewer, ReviewVerdict
+from nelke.core.tools.memory import MemoryWriteTool, RecallTool
+from nelke.core.tools.selfedit import (
+    BootCheckTool,
+    GitBranchInfoTool,
+    GitCommitTool,
+    GitRevertTool,
+    ProposeCycleCompleteTool,
+    RunLintTool,
+    RunTestsTool,
+    RunTypecheckTool,
+    SelfEditContext,
+    SelfEditTool,
+    SelfGlobTool,
+    SelfGrepTool,
+    SelfReadTool,
+    SelfWriteTool,
+)
+
+CYCLE_WORK_PROMPT = """You are Nelke operating on your OWN repository. Your job is to
+improve the repository to satisfy the user objective. You have self-edit tools scoped
+to the repo root, memory tools (recall/memory_write under memory/), and git tools.
+The gates (run_tests / run_lint / run_typecheck / boot_check) and commits are run by
+the cycle engine automatically after you finish — do not call them yourself.
+
+Workflow:
+1. Explore the repo (self_read/self_glob/self_grep) and recall relevant memory.
+2. Make focused edits toward the objective; keep existing tests green; add or adjust
+   tests for new behavior when relevant.
+3. When you have a coherent improvement ready, you are done for this step — do NOT
+   loop infinitely; the engine commits, gates and boot-checks, then feeds results back.
+4. Wait for gate feedback. If the gate failed or a commit was reverted, fix the
+   specific problems reported and try again with minimal changes.
+5. When the objective is fully achieved, call propose_cycle_complete.
+Avoid broken syntax/imports: any commit that crashes Nelke is reverted automatically."""
+
+
+@dataclass
+class CycleEvent:
+    kind: str
+    message: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HumanReviewRequest:
+    cycle_id: str
+    objective: str
+    branch: str
+    diff: str
+    ai_verdict: ReviewVerdict
+
+
+@dataclass
+class CycleResult:
+    cycle_id: str
+    objective: str
+    branch: str
+    status: str
+    steps: int = 0
+    ai_verdict: str = ""
+    human_verdict: str = ""
+    message: str = ""
+
+    @property
+    def merged(self) -> bool:
+        return self.status == "merged"
+
+
+def slugify(text: str, limit: int = 24) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-").rstrip("-")
+    return (slug or "task")[:limit].rstrip("-")
+
+
+class CycleEngine:
+    def __init__(
+        self,
+        repo: GitRepo,
+        db: Database,
+        governance: Governance,
+        llm: Any,
+        *,
+        on_event: Callable[[CycleEvent], Any] | None = None,
+        human_approve: Callable[[HumanReviewRequest], bool | Awaitable[bool]] | None = None,
+        max_steps: int = 30,
+        max_step_attempts: int = 3,
+        max_review_rounds: int = 3,
+        on_token: ToolCallback = None,
+    ) -> None:
+        self.repo = repo
+        self.db = db
+        self.governance = governance
+        self.llm = llm
+        self.on_event = on_event
+        self.human_approve = human_approve
+        self.max_steps = max_steps
+        self.max_step_attempts = max_step_attempts
+        self.max_review_rounds = max_review_rounds
+        self.on_token = on_token
+
+    def _emit(self, kind: str, message: str = "", **data: Any) -> None:
+        if self.on_event is not None:
+            self.on_event(CycleEvent(kind=kind, message=message, data=data))
+
+    def _build_working_agent(self, ctx: SelfEditContext, memory: MemoryStore) -> Agent:
+        tools = [
+            SelfReadTool(ctx),
+            SelfWriteTool(ctx),
+            SelfEditTool(ctx),
+            SelfGlobTool(ctx),
+            SelfGrepTool(ctx),
+            RecallTool(memory),
+            MemoryWriteTool(memory),
+            RunLintTool(ctx),
+            RunTypecheckTool(ctx),
+            RunTestsTool(ctx),
+            BootCheckTool(ctx),
+            GitBranchInfoTool(ctx),
+            GitCommitTool(ctx),
+            GitRevertTool(ctx),
+            ProposeCycleCompleteTool(ctx),
+        ]
+        return Agent(
+            name="cycle-worker",
+            system_prompt=CYCLE_WORK_PROMPT,
+            tools=tools,
+            llm=self.llm,
+            iteration_cap=40,
+            stream=False,
+            on_token=self.on_token,
+            memory_index=memory.index_text() or None,
+        )
+
+    def _result(
+        self,
+        cycle_id: str,
+        objective: str,
+        branch: str,
+        status: str,
+        verdict: ReviewVerdict,
+        human: str = "",
+        steps: int = 0,
+        message: str = "",
+    ) -> CycleResult:
+        return CycleResult(
+            cycle_id=cycle_id,
+            objective=objective,
+            branch=branch,
+            status=status,
+            steps=steps,
+            ai_verdict=verdict.verdict if verdict else "",
+            human_verdict=human,
+            message=message,
+        )
+
+    async def run(
+        self,
+        objective: str,
+        *,
+        human_approve: Callable[[HumanReviewRequest], bool | Awaitable[bool]] | None = None,
+    ) -> CycleResult:
+        repo = self.repo
+        if not repo.is_repo():
+            raise RuntimeError(f"not a git repo: {repo.repo}")
+        human_gate = human_approve if human_approve is not None else self.human_approve
+        objective = objective.strip()
+        cycle_id = new_id()
+        branch = f"improve/{cycle_id}-{slugify(objective)}"
+
+        if repo.current_branch() != "main":
+            repo.checkout("main")
+        repo.checkout_new_branch(branch, base="main")
+        self.db.create_cycle(objective, branch, cycle_id=cycle_id)
+        self._emit("cycle_start", f"branch {branch}", cycle_id=cycle_id, branch=branch, objective=objective)
+
+        state: dict[str, Any] = {"propose_complete": False}
+        step_no = 0
+        ctx = SelfEditContext(
+            repo=repo,
+            governance=self.governance,
+            repo_root=repo.repo,
+            state=state,
+            cycle_id_provider=lambda: cycle_id,
+            step_provider=lambda: step_no,
+        )
+        memory = MemoryStore(repo.repo / "memory")
+        agent = self._build_working_agent(ctx, memory)
+        feedback = ""
+        first_run = True
+        committed_any = False
+        verdict: ReviewVerdict | None = None
+
+        while True:
+            # ------------------- WORK PHASE -------------------------------
+            step_cap_hit = False
+            while step_no < self.max_steps:
+                gate_passed = False
+                pending_propose = False
+                for _ in range(self.max_step_attempts):
+                    step_no += 1
+                    state["propose_complete"] = False
+                    task = objective if not feedback else f"{objective}\n\n[feedback]\n{feedback}"
+                    self._emit("step_start", f"step {step_no}", step=step_no)
+                    result = await agent.run(task, reset=first_run)
+                    first_run = False
+                    self.db.add_usage(result.usage, cycle_id=cycle_id)
+                    pending_propose = bool(state["propose_complete"])
+
+                    gate = await self.governance.gate()
+                    self._emit("gate", gate.describe(), step=step_no, passed=gate.passed)
+                    if gate.passed:
+                        feedback = ""
+                        gate_passed = True
+                        break
+                    pending_propose = False
+                    feedback = (
+                        "The governance gate rejected your changes:\n"
+                        + gate.describe()
+                        + "\nFix these exact problems with minimal changes and continue."
+                    )
+
+                if not gate_passed:
+                    if repo.has_changes():
+                        repo.stash_all()
+                    self.db.add_step(cycle_id, step_no, None, "failed-gate", feedback[:500])
+                    self.db.update_cycle(cycle_id, status="failed-gate", ended_at=_now())
+                    self._emit("cycle_error", "gate could not be satisfied", feedback=feedback[:2000])
+                    return self._result(cycle_id, objective, branch, "failed-gate",
+                                        ReviewVerdict("request_changes"),
+                                        steps=step_no, message=feedback[:500])
+
+                if not repo.has_changes():
+                    self._emit("idle", "no changes after a green step")
+                    break
+
+                repo.add_all()
+                sha = repo.commit(
+                    f"Cycle {cycle_id} step {step_no}: {objective[:80]}",
+                    f"Nelke-Self-Improve: cycle {cycle_id} step {step_no}",
+                )
+                committed_any = True
+                self.db.add_step(cycle_id, step_no, sha, "committed", objective[:200])
+                self._emit("commit", f"committed {sha}", step=step_no, sha=sha)
+
+                boot = await self.governance.boot_check()
+                if not boot.ok and not boot.skipped:
+                    repo.revert_commit(sha)
+                    self.db.add_step(cycle_id, step_no, sha, "failed-boot", boot.message[:500])
+                    self._emit("boot_check_failed", f"reverted {sha}: {boot.message[:200]}", step=step_no, sha=sha)
+                    feedback = (
+                        "Your last commit broke the boot check and was reverted automatically. "
+                        "It must import cleanly and pass nelke.boot_check(). Rework the change."
+                    )
+                    continue
+                self.db.add_step(cycle_id, step_no, sha, "ok", "boot check passed")
+                self._emit("step_ok", f"step {step_no} committed, boot-check passed", step=step_no)
+
+                if pending_propose:
+                    break
+                feedback = ""  # clean committed step clears stale feedback
+            else:
+                step_cap_hit = True
+
+            final_diff = repo.diff("main", branch)
+            if not committed_any and not final_diff.strip():
+                self.db.update_cycle(cycle_id, status="no-changes", ended_at=_now())
+                self._emit("cycle_error", "no changes produced")
+                return self._result(cycle_id, objective, branch, "no-changes",
+                                    ReviewVerdict("request_changes"),
+                                    steps=step_no, message="agent made no changes")
+
+            # ------------------- AI REVIEW --------------------------------
+            rounds = 0
+            review_feedback_pending = False
+            while True:
+                rounds += 1
+                reviewer = Reviewer(repo, self.llm, base="main")
+                verdict = await reviewer.review(objective, final_diff)
+                self.db.add_usage(reviewer.last_usage, cycle_id=cycle_id)
+                self.db.create_review_request(cycle_id, "ai", verdict=verdict.verdict, comments=verdict.comments)
+                self.db.update_cycle(cycle_id, ai_verdict=verdict.verdict)
+                self._emit("ai_review", f"AI: {verdict.verdict}", verdict=verdict.verdict,
+                           comments=verdict.comments[:800], round=rounds)
+                if verdict.approved:
+                    review_feedback_pending = False
+                    break
+                if rounds < self.max_review_rounds and step_no < self.max_steps:
+                    feedback = "AI reviewer requested changes:\n" + verdict.comments
+                    review_feedback_pending = True
+                    break
+                self.db.update_cycle(cycle_id, status="request-changes", ended_at=_now())
+                self._emit("cycle_error", "reviewer still requests changes", comments=verdict.comments[:800])
+                return self._result(cycle_id, objective, branch, "request-changes", verdict,
+                                    steps=step_no, message=verdict.comments[:500])
+
+            if review_feedback_pending:
+                if step_cap_hit:
+                    self.db.update_cycle(cycle_id, status="request-changes", ended_at=_now())
+                    return self._result(cycle_id, objective, branch, "request-changes", verdict,
+                                        steps=step_no, message=verdict.comments[:500])
+                self._emit("review_feedback", "resuming work with reviewer feedback")
+                continue  # back to the work phase
+
+            break
+
+        # ------------------- HUMAN GATE -----------------------------------
+        assert verdict is not None
+        human_request = HumanReviewRequest(
+            cycle_id=cycle_id, objective=objective, branch=branch,
+            diff=final_diff, ai_verdict=verdict,
+        )
+        self.db.create_review_request(cycle_id, "human", verdict="pending",
+                                      comments=f"AI: {verdict.verdict}\n{verdict.comments}".strip())
+        self._emit("awaiting_human", "cycle awaits human approval", branch=branch)
+
+        if human_gate is None:
+            self.db.update_cycle(cycle_id, status="awaiting-human", ended_at=_now())
+            self._emit("human_pending", "no human gate attached — leaving branch for review")
+            return self._result(cycle_id, objective, branch, "awaiting-human", verdict, steps=step_no)
+
+        decision = human_gate(human_request)
+        if inspect.isawaitable(decision):
+            decision = await decision  # type: ignore[misc]
+        if not decision:
+            self.db.update_cycle(cycle_id, status="rejected", human_verdict="rejected", ended_at=_now())
+            self._emit("human_rejected", "human rejected cycle", branch=branch)
+            return self._result(cycle_id, objective, branch, "rejected", verdict, human="rejected", steps=step_no)
+
+        # approved -> merge --no-ff into main (co-authored by Nelke)
+        repo.checkout("main")
+        try:
+            repo.merge_no_ff(
+                branch,
+                f"Merge branch {branch!r} (cycle {cycle_id})",
+                "Co-authored-by: Nelke <nelke@local>",
+            )
+        except GitError as exc:
+            self.db.update_cycle(cycle_id, status="merge-conflict", human_verdict="approved", ended_at=_now())
+            self._emit("cycle_error", "merge failed", error=str(exc))
+            return self._result(cycle_id, objective, branch, "merge-conflict", verdict,
+                                human="approved", steps=step_no, message=str(exc)[:500])
+
+        self.db.update_cycle(cycle_id, status="merged", human_verdict="approved", ended_at=_now())
+        self._emit("merged", "cycle merged into main", branch=branch)
+        return self._result(cycle_id, objective, branch, "merged", verdict,
+                            human="approved", steps=step_no)

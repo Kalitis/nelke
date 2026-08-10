@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Nelke — Chat{% endblock %}
+{% block content %}
+<section class="chat">
+  <div id="transcript" class="transcript"></div>
+  <form id="chat-form" class="chat-input">
+    <select id="profile" aria-label="provider profile">
+      {% for p in profiles %}
+        <option value="{{ p.name }}">{{ p.name }} · {{ p.model }}</option>
+      {% endfor %}
+    </select>
+    <input id="chat-text" type="text" placeholder="Ask Nelke…" autocomplete="off" autofocus>
+    <button type="submit">Send</button>
+  </form>
+  <details class="improve">
+    <summary>Self-improvement cycle</summary>
+    <form id="improve-form">
+      <input id="improve-objective" type="text" placeholder="Objective to improve…" autocomplete="off">
+      <label><input id="improve-auto" type="checkbox"> auto-approve</label>
+      <button type="submit">Improve</button>
+    </form>
+    <pre id="improve-log" class="log"></pre>
+  </details>
+</section>
+{% endblock %}

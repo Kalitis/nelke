@@ -12,12 +12,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from nelke.core.llm import LLMResponse, ToolCall
+from nelke.core.session_analyzer import DegradationReport, analyze_degradation
 from nelke.core.tools.base import BaseTool, ToolResult
 from nelke.core.tools.registry import ToolRegistry
 
 TokenHandler = Callable[[str], Any] | None
 ToolHandler = Callable[[str, dict[str, Any]], Any] | None
 ToolResultHandler = Callable[[str, dict[str, Any], str], Any] | None
+DegradedHandler = Callable[[DegradationReport], Any] | None
 
 _EMPTY_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
 
@@ -27,6 +29,7 @@ class AgentResult:
     answer: str
     iterations: int
     tool_calls: int
+    tool_errors: int = 0
     messages: list[dict[str, Any]] = field(default_factory=list)
     stopped: str = "answer"  # "answer" | "max_iterations"
     usage: dict[str, int] = field(default_factory=lambda: dict(_EMPTY_USAGE))
@@ -45,6 +48,8 @@ class Agent:
         on_token: TokenHandler = None,
         on_tool: ToolHandler = None,
         on_tool_result: ToolResultHandler = None,
+        on_degraded: DegradedHandler = None,
+        degrade_error_threshold: int = 3,
         temperature: float | None = None,
         memory_index: str | None = None,
         plan_first: bool = False,
@@ -57,11 +62,14 @@ class Agent:
         self.on_token = on_token
         self.on_tool = on_tool
         self.on_tool_result = on_tool_result
+        self.on_degraded = on_degraded
+        self.degrade_error_threshold = degrade_error_threshold
         self.temperature = temperature
         self.memory_index = memory_index
         self.plan_first = plan_first
         self.registry = ToolRegistry.from_list(tools)
         self._messages: list[dict[str, Any]] = []
+        self._tool_errors = 0
 
     def system_content(self) -> str:
         content = self.system_prompt
@@ -95,6 +103,7 @@ class Agent:
         msgs = self._messages
 
         self._usage = dict(_EMPTY_USAGE)
+        self._tool_errors = 0
         tool_calls_total = 0
         for i in range(self.iteration_cap):
             resp = await self.llm.chat(
@@ -108,19 +117,31 @@ class Agent:
             if not resp.tool_calls:
                 msgs.append({"role": "assistant", "content": resp.content or ""})
                 answer = (resp.content or "").strip()
-                return AgentResult(
+                result = AgentResult(
                     answer=answer, iterations=i + 1, tool_calls=tool_calls_total,
-                    messages=msgs, usage=self._usage,
+                    tool_errors=self._tool_errors, messages=msgs, usage=self._usage,
                 )
+                self._maybe_degrade(result, task)
+                return result
             msgs.append(self._assistant_tool_message(resp))
             for tc in resp.tool_calls:
                 tool_calls_total += 1
-                result = await self._execute_tool(tc)
-                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": result.render()})
-        return AgentResult(
+                tool_result = await self._execute_tool(tc)
+                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result.render()})
+        result = AgentResult(
             answer="", iterations=self.iteration_cap, tool_calls=tool_calls_total,
-            messages=msgs, stopped="max_iterations", usage=self._usage,
+            tool_errors=self._tool_errors, messages=msgs, stopped="max_iterations",
+            usage=self._usage,
         )
+        self._maybe_degrade(result, task)
+        return result
+
+    def _maybe_degrade(self, result: AgentResult, task: str) -> None:
+        if self.on_degraded is None:
+            return
+        report = analyze_degradation(result, task, error_threshold=self.degrade_error_threshold)
+        if report.degraded:
+            self.on_degraded(report)
 
     def _merge_usage(self, usage: dict[str, Any] | None) -> None:
         self._usage["calls"] += 1
@@ -137,12 +158,15 @@ class Agent:
         except Exception as exc:  # noqa: BLE001
             result = ToolResult.failure(f"unknown tool {tc.name!r}: {exc}")
             self._notify_tool_result(tc, result)
+            self._tool_errors += 1
             return result
         try:
             result = await tool.execute(**tc.arguments)
         except Exception as exc:  # noqa: BLE001 - never let a tool crash the loop
             result = ToolResult.failure(f"tool {tc.name} raised: {exc}")
         self._notify_tool_result(tc, result)
+        if not result.ok:
+            self._tool_errors += 1
         return result
 
     def _notify_tool_result(self, tc: ToolCall, result: ToolResult) -> None:
@@ -185,6 +209,8 @@ def make_agent(
     on_token: TokenHandler = None,
     on_tool: ToolHandler = None,
     on_tool_result: ToolResultHandler = None,
+    on_degraded: DegradedHandler = None,
+    degrade_error_threshold: int = 3,
     stream: bool = False,
     iteration_cap: int = 20,
     code_timeout: int = 120,
@@ -233,5 +259,7 @@ def make_agent(
         on_token=on_token,
         on_tool=on_tool,
         on_tool_result=on_tool_result,
+        on_degraded=on_degraded,
+        degrade_error_threshold=degrade_error_threshold,
         memory_index=memory_index,
     )

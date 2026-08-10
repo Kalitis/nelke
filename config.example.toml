@@ -14,13 +14,10 @@ api_key_ref = "OPENROUTER_API_KEY"
 base_url = "http://localhost:1234/v1"
 model = "qwen2.5-coder-7b-instruct"
 api_key = "lm-studio"
+# Local providers bypass OS env proxies by default. If you NEED a proxy for a
+# remote provider, add: extra = { trust_env = true }
 
 [profiles.ollama]
 base_url = "http://localhost:11434/v1"
 model = "qwen3:8b"
 api_key = "ollama"
-
-[profiles.openai]
-base_url = "https://api.openai.com/v1"
-model = "gpt-4o-mini"
-api_key_ref = "OPENAI_API_KEY"

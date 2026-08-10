@@ -68,6 +68,15 @@ class GitRepo:
         result = self._run("status", "--porcelain")
         return bool(result.stdout.strip())
 
+    def paths_changed(self, paths: list[str]) -> bool:
+        """True when any of ``paths`` is modified, staged, or untracked.
+
+        Unlike ``git diff HEAD`` this also catches brand-new untracked files
+        (e.g. a freshly added ``pyproject.toml``).
+        """
+        result = self._run("status", "--porcelain", "--", *paths)
+        return bool(result.stdout.strip())
+
     def stash_all(self) -> GitResult:
         """Stash tracked + untracked changes (used to discard a failed step)."""
         return self._run("stash", "-u", "--include-untracked")

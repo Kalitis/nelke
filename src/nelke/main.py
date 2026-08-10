@@ -159,21 +159,30 @@ def doctor() -> None:
 # launchers for the other frontends
 # --------------------------------------------------------------------------- #
 @app.command()
-def web() -> None:
-    """Launch the web frontend (phase 3)."""
-    cli.launch("web")
+def web(
+    host: str | None = typer.Option(None, "--host", "-h", help="Bind host (default 127.0.0.1)."),
+    port: int | None = typer.Option(None, "--port", "-p", help="Bind port (default 8000)."),
+) -> None:
+    """Launch the web frontend (FastAPI + SSE)."""
+    from nelke.frontends import web as web_frontend
+
+    web_frontend.launch(host=host, port=port)
 
 
 @app.command()
 def tui() -> None:
-    """Launch the TUI frontend (phase 4)."""
-    cli.launch("tui")
+    """Launch the TUI frontend (Textual)."""
+    from nelke.frontends import tui as tui_frontend
+
+    tui_frontend.launch()
 
 
 @app.command()
 def bot() -> None:
-    """Launch the Telegram bot frontend (phase 5)."""
-    cli.launch("bot")
+    """Launch the Telegram bot frontend (aiogram)."""
+    from nelke.frontends import telegram_bot as telegram_frontend
+
+    telegram_frontend.launch()
 
 
 # --------------------------------------------------------------------------- #

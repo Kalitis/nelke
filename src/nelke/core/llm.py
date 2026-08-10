@@ -180,11 +180,25 @@ class LLMClient:
         extra: dict[str, Any] | None = None,
         allow_fallback_parse: bool = True,
     ) -> None:
+        import httpx  # noqa: F401  (imported for the custom http_client below)
         import openai  # lazy import keeps boot path light
 
-        self._client = openai.AsyncOpenAI(
-            base_url=base_url, api_key=api_key, timeout=timeout, **(extra or {})
-        )
+        params: dict[str, Any] = {
+            "base_url": base_url,
+            "api_key": api_key,
+            "timeout": timeout,
+        }
+        extra = dict(extra or {})
+        trust_env = bool(extra.pop("trust_env", False))
+        if extra:
+            params.update(extra)
+        if not trust_env:
+            # httpx defaults to trust_env=True, which on Windows routes even
+            # localhost through the OS-level system proxy (e.g. a VPN/proxy tool
+            # like Hiddify) and yields spurious 502s for local providers such as
+            # LM Studio/Ollama. Local-first: bypass env proxies unless opted in.
+            params["http_client"] = httpx.AsyncClient(trust_env=False)
+        self._client = openai.AsyncOpenAI(**params)
         self.model = model
         self.max_retries = max_retries
         self.timeout = timeout
@@ -210,6 +224,10 @@ class LLMClient:
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         kwargs["stream"] = stream
+        if stream:
+            # ask the server to include usage in the final stream chunk (else
+            # local servers like LM Studio/Ollama omit it and usage stays 0)
+            kwargs["stream_options"] = {"include_usage": True}
 
         resp = await self._request_with_retry(kwargs)
         if not stream:

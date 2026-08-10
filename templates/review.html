@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Nelke — Review{% endblock %}
+{% block content %}
+<section class="review">
+  {% if review %}
+  <h1>Review request</h1>
+  <p class="meta"><strong>Objective:</strong> {{ review.objective }}</p>
+  <p class="meta"><strong>Branch:</strong> {{ review.branch }} · <strong>Status:</strong> {{ review.status }}</p>
+  <p class="meta"><strong>AI verdict:</strong> {{ review.verdict }}</p>
+  {% if review.comments %}<pre class="comments">{{ review.comments }}</pre>{% endif %}
+  <details open><summary>Diff (main…{{ review.branch }})</summary><pre class="diff">{{ review.diff }}</pre></details>
+  <div class="actions">
+    <button id="approve-btn" data-id="{{ review.id }}">✓ Approve &amp; merge</button>
+    <button id="reject-btn" data-id="{{ review.id }}">✗ Reject</button>
+  </div>
+  <p id="review-result" class="result"></p>
+  {% else %}
+  <h1>Review request not found</h1>
+  <p>No review request matches that id.</p>
+  {% endif %}
+</section>
+{% endblock %}

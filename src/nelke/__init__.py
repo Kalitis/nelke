@@ -23,6 +23,8 @@ def boot_check() -> None:
     import nelke.core.llm  # noqa: F401
     import nelke.core.memory  # noqa: F401
     import nelke.core.reviewer  # noqa: F401
+    import nelke.core.services  # noqa: F401
+    import nelke.core.session_analyzer  # noqa: F401
     import nelke.core.tools.base  # noqa: F401
     import nelke.core.tools.fs  # noqa: F401
     import nelke.core.tools.memory  # noqa: F401
@@ -31,6 +33,9 @@ def boot_check() -> None:
     import nelke.core.tools.shell  # noqa: F401
     import nelke.core.tools.subagent  # noqa: F401
     import nelke.core.tools.web  # noqa: F401
+    import nelke.frontends.telegram_bot  # noqa: F401
+    import nelke.frontends.tui  # noqa: F401
+    import nelke.frontends.web  # noqa: F401
     from nelke.core.agent import Agent
     from nelke.core.llm import StubLLM
 

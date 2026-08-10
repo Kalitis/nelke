@@ -94,6 +94,22 @@ def slugify(text: str, limit: int = 24) -> str:
     return (slug or "task")[:limit].rstrip("-")
 
 
+def merge_cycle_branch(repo: GitRepo, branch: str, cycle_id: str = "unknown") -> str:
+    """Checkout ``main`` and merge ``branch`` ``--no-ff`` as a Nelke co-authored merge.
+
+    Shared by :meth:`CycleEngine.run` and the CLI ``review approve`` resolution
+    path so both behave identically. Raises :class:`GitError` on a conflict;
+    callers are responsible for persisting the DB state transition.
+    """
+    repo.checkout("main")
+    repo.merge_no_ff(
+        branch,
+        f"Merge branch {branch!r} (cycle {cycle_id})",
+        "Co-authored-by: Nelke <nelke@local>",
+    )
+    return branch
+
+
 class CycleEngine:
     def __init__(
         self,
@@ -119,10 +135,33 @@ class CycleEngine:
         self.max_step_attempts = max_step_attempts
         self.max_review_rounds = max_review_rounds
         self.on_token = on_token
+        self._synced = False
 
     def _emit(self, kind: str, message: str = "", **data: Any) -> None:
         if self.on_event is not None:
             self.on_event(CycleEvent(kind=kind, message=message, data=data))
+
+    async def _sync_dependencies_if_changed(self) -> bool:
+        """Run ``uv sync`` when ``pyproject.toml``/``uv.lock`` changed this cycle.
+
+        The decision is cached (at most one sync per cycle) so new dependencies
+        are installed before the gate without slowing every step. A missing
+        runner (e.g. a fake governance in tests) short-circuits safely.
+        """
+        if self._synced:
+            return False
+        if not self.repo.paths_changed(["pyproject.toml", "uv.lock"]):
+            return False
+        runner = getattr(self.governance, "runner", None)
+        self._synced = True
+        if runner is None:
+            return False
+        code, out = await runner.run(["uv", "sync"], str(self.repo.repo), 600)
+        if code != 0:
+            self._emit("deps_failed", f"uv sync failed: {out[-500:]}")
+        else:
+            self._emit("deps_synced", "pyproject.toml changed; ran `uv sync`")
+        return True
 
     def _build_working_agent(self, ctx: SelfEditContext, memory: MemoryStore) -> Agent:
         tools = [
@@ -189,9 +228,17 @@ class CycleEngine:
         cycle_id = new_id()
         branch = f"improve/{cycle_id}-{slugify(objective)}"
 
+        if repo.has_changes():
+            # A dirty tree would be silently carried onto the cycle branch and
+            # committed as part of the cycle. Never do that: abort with guidance.
+            raise RuntimeError(
+                "refusing to start a cycle: the working tree has uncommitted changes. "
+                "Commit or stash them first, then re-run the cycle."
+            )
         if repo.current_branch() != "main":
             repo.checkout("main")
         repo.checkout_new_branch(branch, base="main")
+        self._synced = False
         self.db.create_cycle(objective, branch, cycle_id=cycle_id)
         self._emit("cycle_start", f"branch {branch}", cycle_id=cycle_id, branch=branch, objective=objective)
 
@@ -228,6 +275,7 @@ class CycleEngine:
                     self.db.add_usage(result.usage, cycle_id=cycle_id)
                     pending_propose = bool(state["propose_complete"])
 
+                    await self._sync_dependencies_if_changed()
                     gate = await self.governance.gate()
                     self._emit("gate", gate.describe(), step=step_no, passed=gate.passed)
                     if gate.passed:
@@ -349,13 +397,8 @@ class CycleEngine:
             return self._result(cycle_id, objective, branch, "rejected", verdict, human="rejected", steps=step_no)
 
         # approved -> merge --no-ff into main (co-authored by Nelke)
-        repo.checkout("main")
         try:
-            repo.merge_no_ff(
-                branch,
-                f"Merge branch {branch!r} (cycle {cycle_id})",
-                "Co-authored-by: Nelke <nelke@local>",
-            )
+            merge_cycle_branch(repo, branch, cycle_id=cycle_id)
         except GitError as exc:
             self.db.update_cycle(cycle_id, status="merge-conflict", human_verdict="approved", ended_at=_now())
             self._emit("cycle_error", "merge failed", error=str(exc))

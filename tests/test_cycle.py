@@ -134,3 +134,118 @@ async def test_cycle_awaiting_human_without_gate(tmp_repo, db):
     assert result.status == "awaiting-human"
     assert db.get_cycle(result.cycle_id)["status"] == "awaiting-human"
     assert db.list_review_requests(cycle_id=result.cycle_id, open_only=True)
+
+
+def test_merge_cycle_branch_shared(tmp_repo):
+    """The shared merge helper used by both the engine and the CLI review path."""
+    from nelke.core.cycle import merge_cycle_branch
+
+    tmp_repo.checkout_new_branch("improve/shared", base="main")
+    (tmp_repo.repo / "f.txt").write_text("one\ntwo\n", encoding="utf-8")
+    tmp_repo.add_all()
+    tmp_repo.commit("improve", "Nelke-Self-Improve: cycle c1 step 1")
+    merge_cycle_branch(tmp_repo, "improve/shared", cycle_id="c1")
+    assert tmp_repo.current_branch() == "main"
+    assert (tmp_repo.repo / "f.txt").read_text() == "one\ntwo\n"
+    body = tmp_repo._run("log", "-1", "--format=%B").stdout
+    assert "Co-authored-by: Nelke <nelke@local>" in body
+
+
+def test_cli_review_approve_merges(tmp_repo, db):
+    """`nelke review approve <id>` must merge the branch onto main (Phase B2)."""
+    from nelke.config import Settings
+    from nelke.frontends.cli import _resolve_review
+
+    cid = db.create_cycle("objective", "improve/cli-merge-1")
+    db.create_review_request(cid, "human", verdict="pending")
+    tmp_repo.checkout_new_branch("improve/cli-merge-1", base="main")
+    (tmp_repo.repo / "f.txt").write_text("one\ntwo\n", encoding="utf-8")
+    tmp_repo.add_all()
+    tmp_repo.commit("improve f", "Nelke-Self-Improve: cycle c step 1")
+    tmp_repo.checkout("main")
+
+    req = db.list_review_requests(cycle_id=cid)[0]
+    settings = Settings(nelke_home=str(db.path.parent))
+    _resolve_review(settings, req["id"], "approved", tmp_repo.repo)
+
+    cycle = db.get_cycle(cid)
+    assert cycle["status"] == "merged"
+    assert cycle["human_verdict"] == "approved"
+    assert db.list_review_requests(cycle_id=cid)[0]["verdict"] == "approved"
+    assert tmp_repo.current_branch() == "main"
+    assert (tmp_repo.repo / "f.txt").read_text() == "one\ntwo\n"
+    assert "Merge branch" in tmp_repo._run("log", "--merges", "--oneline").stdout
+
+
+def test_cli_review_reject_keeps_branch(tmp_repo, db):
+    """`nelke review reject <id>` must leave the branch unmerged (Phase B2)."""
+    from nelke.config import Settings
+    from nelke.frontends.cli import _resolve_review
+
+    cid = db.create_cycle("objective", "improve/cli-reject-1")
+    db.create_review_request(cid, "human", verdict="pending")
+    tmp_repo.checkout_new_branch("improve/cli-reject-1", base="main")
+    (tmp_repo.repo / "f.txt").write_text("one\ntwo\n", encoding="utf-8")
+    tmp_repo.add_all()
+    tmp_repo.commit("improve f", "Nelke-Self-Improve: cycle c step 1")
+    tmp_repo.checkout("main")
+
+    req = db.list_review_requests(cycle_id=cid)[0]
+    settings = Settings(nelke_home=str(db.path.parent))
+    _resolve_review(settings, req["id"], "rejected", tmp_repo.repo)
+
+    cycle = db.get_cycle(cid)
+    assert cycle["status"] == "rejected"
+    assert cycle["human_verdict"] == "rejected"
+    # main untouched: the new file exists only on the kept branch
+    assert not (tmp_repo.repo / "f.txt").exists()
+    assert tmp_repo.branch_exists("improve/cli-reject-1")
+    assert db.list_review_requests(cycle_id=cid)[0]["verdict"] == "rejected"
+
+
+# --------------------------------------------------------------------------- #
+# Phase B3 - cycle resilience
+# --------------------------------------------------------------------------- #
+async def test_cycle_refuses_dirty_main(tmp_repo, db):
+    import pytest
+
+    (tmp_repo.repo / "README.md").write_text("# dirty\n", encoding="utf-8")
+    assert tmp_repo.has_changes()
+    llm = driver_fake(worker=_scripted_worker([final_response("done")]))
+    engine = _engine(tmp_repo, db, FakeGovernance(), llm)
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        await engine.run("improve something")
+    assert db.list_cycles() == []  # nothing recorded, nothing touched
+
+
+async def test_deps_sync_once_on_pyproject_change(tmp_repo, db):
+    class RecordingRunner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def run(self, args, cwd, timeout):
+            self.calls.append(list(args))
+            return (0, "synced")
+
+    class GovWithRunner(FakeGovernance):
+        def __init__(self, runner) -> None:
+            super().__init__()
+            self.runner = runner
+
+    runner = RecordingRunner()
+    gov = GovWithRunner(runner)
+    llm = driver_fake(worker=_scripted_worker([final_response("done")]))
+    engine = _engine(tmp_repo, db, gov, llm)
+
+    # no dependency file changed -> no sync
+    assert not await engine._sync_dependencies_if_changed()
+    assert runner.calls == []
+
+    # pyproject.toml changed in the working tree -> uv sync runs once
+    (tmp_repo.repo / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    assert await engine._sync_dependencies_if_changed()
+    assert runner.calls == [["uv", "sync"]]
+
+    # decision is cached -> never runs again
+    assert not await engine._sync_dependencies_if_changed()
+    assert runner.calls == [["uv", "sync"]]

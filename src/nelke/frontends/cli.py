@@ -1,4 +1,4 @@
-"""CLI frontend (Typer + Rich): thin adapter over the Nelke core.
+﻿"""CLI frontend (Typer + Rich): thin adapter over the Nelke core.
 
 Implements chat, task, improve, review, memory, config, db and doctor handlers.
 Web/TUI/Telegram are separate phases (3-5) and their launchers report that here.
@@ -11,7 +11,6 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +24,20 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from nelke.config import ProfileError, Settings, get_profile, load_profiles
+from nelke.config import ProfileError, Settings, get_profile, load_env_files, load_profiles
+
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (TypeError, ValueError):
+            pass
+
+# Load ~/.nelke/.env (and ./.) into os.environ before anything reads it, so
+# secrets referenced by profiles via api_key_ref (e.g. OPENAI_API_KEY) are
+# visible — pydantic-settings only loads NELKE_-prefixed fields on its own.
+load_env_files()
 
 console = Console()
 
@@ -92,35 +104,39 @@ class AnswerStream:
         self._live = Live(console=console, refresh_per_second=12, transient=False)
         self._live.start()
 
+    def _update(self) -> None:
+        if self._live is not None:
+            try:
+                self._live.update(self._render())
+            except Exception:  # noqa: BLE001 - a glyph/rendering issue must not kill the run
+                pass
+
     def on_token(self, token: str) -> None:
         self.buffer.append(token)
-        if self._live is not None:
-            self._live.update(self._render())
+        self._update()
 
     def on_tool(self, name: str, args: dict[str, Any]) -> None:
         self.tools.append(f"{name}({_fmt_args(args)})")
-        if self._live is not None:
-            self._live.update(self._render())
+        self._update()
 
     def on_tool_result(self, name: str, args: dict[str, Any], result: str) -> None:
         snippet = " ".join(result.split())
         if len(snippet) > 160:
-            snippet = snippet[:160] + "…"
-        self.results.append(f"[dim]⤷ {name}: {snippet}[/]")
-        if self._live is not None:
-            self._live.update(self._render())
+            snippet = snippet[:160] + "..."
+        self.results.append(f"[dim]=> {name}: {snippet}[/]")
+        self._update()
 
     def _render(self) -> Group:
         parts: list[Any] = []
         if self.tools:
-            parts.append(Text(" → " + " ".join(f"[cyan]{t}[/]" for t in self.tools), style="dim"))
+            parts.append(Text(" -> " + " ".join(f"[cyan]{t}[/]" for t in self.tools), style="dim"))
         if self.results:
             parts.append(Group(*[Text(r) for r in self.results[-4:]]))
         current = "".join(self.buffer)
         if current:
             parts.append(Markdown(current))
         if not parts:
-            parts.append(Text("thinking…", style="dim italic"))
+            parts.append(Text("thinking...", style="dim italic"))
         return Group(*parts)
 
     def finish(self) -> str:
@@ -135,7 +151,7 @@ def _fmt_args(args: dict[str, Any]) -> str:
     for k, v in list(args.items())[:2]:
         text = str(v)
         if len(text) > 60:
-            text = text[:60] + "…"
+            text = text[:60] + "..."
         items.append(f"{k}={text}")
     return ", ".join(items)
 
@@ -149,7 +165,8 @@ def _workspace_for(settings: Settings, session_id: str) -> Path:
     return ws
 
 
-def _build_session_agent(settings: Settings, profile: str | None, stream: AnswerStream | None):
+def _build_session_agent(settings: Settings, profile: str | None, stream: AnswerStream | None,
+                         on_degraded=None):
     from nelke.core.agent import make_agent
 
     llm = get_llm(profile)
@@ -186,6 +203,7 @@ def _build_session_agent(settings: Settings, profile: str | None, stream: Answer
         on_token=stream.on_token if stream else None,
         on_tool=stream.on_tool if stream else None,
         on_tool_result=stream.on_tool_result if stream else None,
+        on_degraded=on_degraded,
         stream=bool(stream),
         iteration_cap=settings.max_agent_iterations,
         code_timeout=settings.code_timeout,
@@ -200,7 +218,19 @@ def run_task(text: str, *, profile: str | None = None, interactive: bool = False
     stream: AnswerStream | None = AnswerStream() if use_live else None
     if stream is not None:
         stream.start()
-    agent, db, session_id, memory = _build_session_agent(settings, profile, stream)
+
+    def on_degraded(report) -> None:
+        console.print()
+        console.print(Panel(
+            "[yellow]Nelke didn't fully complete this task:[/]\n"
+            f"{report.describe()}\n\n"
+            f'[dim]suggested: [bold cyan]nelke improve "{report.suggested_objective}"[/][/]',
+            title="Self-improvement opportunity", border_style="yellow",
+        ))
+
+    agent, db, session_id, memory = _build_session_agent(
+        settings, profile, stream, on_degraded=on_degraded
+    )
     try:
         result = asyncio.run(agent.run(text))
     except Exception as exc:  # noqa: BLE001
@@ -228,7 +258,7 @@ def _usage_line(usage: dict[str, int]) -> str:
     calls = int(usage.get("calls", 0))
     return (
         f"[dim]tokens: {usage.get('total_tokens', 0)} "
-        f"(prompt {usage.get('prompt_tokens', 0)} + completion {usage.get('completion_tokens', 0)}) · "
+        f"(prompt {usage.get('prompt_tokens', 0)} + completion {usage.get('completion_tokens', 0)}) - "
         f"{calls} LLM call{'s' if calls != 1 else ''}[/]"
     )
 
@@ -236,29 +266,84 @@ def _usage_line(usage: dict[str, int]) -> str:
 # --------------------------------------------------------------------------- #
 # Improve (self-improvement cycle)
 # --------------------------------------------------------------------------- #
-def _event_console(events: list[str]) -> Callable[[Any], None]:
-    def sink(event: Any) -> None:
-        label = {
-            "cycle_start": "[bold]Cycle started[/]",
-            "step_start": "[cyan]step[/]",
-            "gate": "[yellow]gate[/]",
-            "commit": "[green]commit[/]",
-            "boot_check_failed": "[bold red]boot-check failed[/]",
-            "step_ok": "[green]step ok[/]",
-            "propose_complete": "[bold magenta]proposing completion[/]",
-            "ai_review": "[bold blue]AI review[/]",
-            "review_feedback": "[magenta]reviewer feedback[/]",
-            "awaiting_human": "[bold yellow]awaiting human review[/]",
-            "human_rejected": "[bold red]human rejected[/]",
-            "merged": "[bold green]merged[/]",
-            "cycle_error": "[bold red]error[/]",
-            "idle": "[dim]idle[/]",
-        }.get(event.kind, event.kind)
-        line = f"{label}: {event.message}"
-        events.append(line)
-        console.print(line)
+class ImproveStream:
+    """Streams cycle events into a live Rich panel with a collapsible gate block."""
 
-    return sink
+    _LABELS = {
+        "cycle_start": "[bold]Cycle started[/]",
+        "step_start": "[cyan]step[/]",
+        "gate": "[yellow]gate[/]",
+        "commit": "[green]commit[/]",
+        "boot_check_failed": "[bold red]boot-check failed[/]",
+        "step_ok": "[green]step ok[/]",
+        "propose_complete": "[bold magenta]proposing completion[/]",
+        "ai_review": "[bold blue]AI review[/]",
+        "review_feedback": "[magenta]reviewer feedback[/]",
+        "awaiting_human": "[bold yellow]awaiting human review[/]",
+        "human_pending": "[dim]no human gate — branch left for review[/]",
+        "human_rejected": "[bold red]human rejected[/]",
+        "merged": "[bold green]merged[/]",
+        "cycle_error": "[bold red]error[/]",
+        "deps_synced": "[cyan]deps synced[/]",
+        "deps_failed": "[bold red]deps sync failed[/]",
+        "idle": "[dim]idle[/]",
+    }
+    _STOP_KINDS = {"awaiting_human", "human_pending", "merged", "human_rejected", "cycle_error"}
+
+    def __init__(self, objective: str) -> None:
+        self.objective = objective
+        self.rows: list[tuple[str, str]] = []
+        self.gate_block: str = ""
+        self._live: Live | None = None
+
+    def start(self) -> None:
+        self._live = Live(console=console, refresh_per_second=10, transient=False)
+        self._live.start()
+        self._update()
+
+    def __call__(self, event: Any) -> None:
+        label = self._LABELS.get(event.kind, event.kind)
+        self.rows.append((label, str(event.message or "")))
+        if event.kind == "gate":
+            self.gate_block = event.message
+        if event.kind in self._STOP_KINDS:
+            self.stop()
+            return
+        self._update()
+
+    def stop(self) -> None:
+        if self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:  # noqa: BLE001 - rendering must never crash the cycle
+                pass
+            self._live = None
+
+    def _update(self) -> None:
+        if self._live is None:
+            return
+        try:
+            self._live.update(self._render())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _render(self) -> Group:
+        parts: list[Any] = [Text(f"objective: {self.objective[:80]}", style="bold")]
+        recent = self.rows[-14:]
+        if recent:
+            parts.append(Group(*[Text(f"{label} {msg}", overflow="ellipsis") for label, msg in recent]))
+        else:
+            parts.append(Text("preparing cycle...", style="dim italic"))
+        if self.gate_block:
+            gate_lines = self.gate_block.splitlines()
+            shown = gate_lines[:24]
+            if len(gate_lines) > 24:
+                shown.append(f"... {len(gate_lines) - 24} more lines")
+            parts.append(
+                Panel("\n".join(shown) or "(no gate output)", title="gate",
+                      border_style="yellow")
+            )
+        return Group(*parts)
 
 
 def improve(objective: str, *, yes: bool = False, profile: str | None = None) -> None:
@@ -274,8 +359,9 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
     db = open_db(settings)
     gov = Governance(git)
 
-    events: list[str] = []
-    drain = _event_console(events)
+    stream = ImproveStream(objective)
+    stream.start()
+    drain = stream
 
     def human_gate(human: HumanReviewRequest) -> bool:
         if yes:
@@ -297,12 +383,14 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
     try:
         result = asyncio.run(engine.run(objective))
     except Exception as exc:  # noqa: BLE001
+        stream.stop()
         _fatal(f"cycle failed: {exc}")
+    stream.stop()
     console.print()
     usage = db.usage_totals(cycle_id=result.cycle_id)
     usage_text = (
         f"tokens: {usage['total_tokens']} (prompt {usage['prompt_tokens']} + "
-        f"completion {usage['completion_tokens']}) · {usage['calls']} LLM calls"
+        f"completion {usage['completion_tokens']})  -  {usage['calls']} LLM calls"
     )
     console.print(Panel(
         f"cycle: [bold]{result.cycle_id}[/]\nbranch: {result.branch}\nstatus: [bold]{result.status}[/]\n"
@@ -317,6 +405,7 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
 # Review requests
 # --------------------------------------------------------------------------- #
 def _resolve_review(settings: Settings, request_id: str, decision: str, repo_path: Path) -> None:
+    from nelke.core.cycle import merge_cycle_branch
     from nelke.core.gitops import GitRepo
 
     db = open_db(settings)
@@ -334,12 +423,7 @@ def _resolve_review(settings: Settings, request_id: str, decision: str, repo_pat
     if decision == "approved":
         git = GitRepo(repo_path)
         try:
-            git.checkout("main")
-            git.merge_no_ff(
-                cycle["branch"],
-                f"Merge branch {cycle['branch']!r} (cycle {cycle['id']})",
-                "Co-authored-by: Nelke <nelke@local>",
-            )
+            merge_cycle_branch(git, cycle["branch"], cycle_id=cycle["id"])
             db.update_cycle(cycle["id"], status="merged", human_verdict="approved", ended_at=_now())
             console.print(f"[green]Approved and merged {cycle['branch']} into main[/]")
         except Exception as exc:  # noqa: BLE001
@@ -532,7 +616,7 @@ def doctor() -> None:
         console.print("[green]api key configured[/]" if key else "[yellow]api key not set (local models ok)[/]")
     except ProfileError as exc:
         console.print(f"[yellow]{exc}[/]")
-    console.print("boot_check…")
+    console.print("boot_check...")
     try:
         import nelke
 

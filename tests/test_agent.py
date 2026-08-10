@@ -70,6 +70,43 @@ async def test_iteration_cap_stops_loop(tmp_path):
     assert result.answer == ""
 
 
+async def test_tool_errors_are_tracked(tmp_path):
+    llm = llm_with_script([
+        tool_response("read", {"path": "missing.txt"}),
+        tool_response("read", {"path": "missing.txt"}),
+        tool_response("read", {"path": "missing.txt"}),
+        final_response("recovered"),
+    ])
+    agent = _agent(tmp_path, llm)
+    result = await agent.run("read missing files")
+    assert result.tool_errors == 3
+    assert result.tool_calls == 3
+
+
+async def test_on_degraded_hook_fires_on_iteration_cap(tmp_path):
+    reports = []
+    loop = [tool_response("read", {"path": "x.txt"})] * 10
+    llm = llm_with_script(loop)
+    agent = _agent(
+        tmp_path, llm, iteration_cap=4,
+        on_degraded=reports.append,
+    )
+    await agent.run("fetch the widget")
+    assert len(reports) == 1
+    assert reports[0].degraded
+    assert reports[0].suggested_objective  # non-empty proposed objective
+
+
+async def test_on_degraded_not_called_on_success(tmp_path):
+    reports = []
+    (tmp_path / "x.txt").write_text("hello world", encoding="utf-8")
+    llm = llm_with_script([tool_response("read", {"path": "x.txt"}), final_response("read it")])
+    agent = _agent(tmp_path, llm, on_degraded=reports.append)
+    result = await agent.run("read x.txt")
+    assert result.tool_errors == 0
+    assert reports == []
+
+
 async def test_stream_tokens_and_tool_notify(tmp_path):
     tokens: list[str] = []
     tools_seen: list[tuple[str, dict]] = []

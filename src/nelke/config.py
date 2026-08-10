@@ -12,11 +12,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HOME = Path.home()
 _ENV_FILES = (".env", str(_HOME / ".nelke" / ".env"))
+
+
+def load_env_files() -> None:
+    """Load ``.env`` files into :data:`os.environ`.
+
+    ``pydantic-settings`` reads ``.env`` only for its own ``NELKE_``-prefixed
+    fields, so secrets referenced by profiles via ``api_key_ref`` (e.g.
+    ``OPENAI_API_KEY``) never reach :data:`os.environ` and
+    :meth:`Profile.resolved_api_key` returns ``None``. Calling this early at
+    startup mirrors a shell ``source .env`` so non-prefixed variables are
+    visible to the whole process. ``override=False`` keeps real environment
+    variables authoritative over file values.
+    """
+    for env_path in _ENV_FILES:
+        p = Path(env_path)
+        if p.exists():
+            load_dotenv(p, override=False)
 
 
 def default_nelke_home() -> Path:

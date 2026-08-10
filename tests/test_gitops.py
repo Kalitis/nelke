@@ -72,6 +72,16 @@ def test_stash_all_discards_changes(tmp_path):
     assert (repo.repo / "f.txt").read_text() == "one\n"
 
 
+def test_paths_changed_detects_untracked_and_modified(tmp_path):
+    repo = _repo(tmp_path)
+    assert not repo.paths_changed(["f.txt"])
+    (repo.repo / "new.py").write_text("x = 1\n", encoding="utf-8")
+    assert repo.paths_changed(["new.py"])  # brand-new untracked file
+    (repo.repo / "f.txt").write_text("one\nchanged\n", encoding="utf-8")
+    assert repo.paths_changed(["f.txt"])  # modified tracked file
+    assert not repo.paths_changed(["README.md"])  # absent file: unchanged
+
+
 def test_checkout_missing_base_raises(tmp_path):
     repo = _repo(tmp_path)
     with pytest.raises(GitError):

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from nelke.core.gitops import GitRepo
 
 GOVERNANCE_TIMEOUT = 900
+BOOT_CHECK_TIMEOUT = 180
 
 
 @dataclass
@@ -94,7 +95,7 @@ class Governance:
 
     async def boot_check(self) -> CheckResult:
         cmd = self._base_cmd(["python", "-c", "import nelke; nelke.boot_check()"])
-        return await self._check("boot-check", cmd, timeout=180)
+        return await self._check("boot-check", cmd, timeout=BOOT_CHECK_TIMEOUT)
 
     async def gate(self) -> GateResult:
         """Run lint -> typecheck -> tests, failing fast on the first hard failure."""

@@ -10,6 +10,8 @@ from nelke.core.tools.base import ToolError
 from nelke.core.tools.selfedit import (
     GitCommitTool,
     SelfEditContext,
+    SelfGrepTool,
+    SelfGlobTool,
     SelfReadTool,
     SelfWriteTool,
 )
@@ -54,3 +56,24 @@ async def test_git_commit_adds_trailer(tmp_repo):
     head = tmp_repo.head_sha()
     body = tmp_repo._run("log", "-1", "--format=%B", head).stdout
     assert "Nelke-Self-Improve: cycle c1 step 1" in body
+
+
+async def test_self_glob_grep_skip_vendor_dirs(tmp_repo):
+    """Vendor/cache trees must never pollute glob/grep (they balloon prompts and
+    defeat prompt caching, and were the trigger for the cycle freezing)."""
+    (tmp_repo.repo / "src").mkdir()
+    (tmp_repo.repo / "src" / "main.py").write_text("def main():\n    pass\n", encoding="utf-8")
+    (tmp_repo.repo / ".venv").mkdir(parents=True)
+    (tmp_repo.repo / ".venv" / "lib.py").write_text("def from_venv():\n    pass\n", encoding="utf-8")
+    (tmp_repo.repo / "__pycache__").mkdir()
+    (tmp_repo.repo / "__pycache__" / "c.py").write_text("x = 1\n", encoding="utf-8")
+
+    ctx = _ctx(tmp_repo)
+    globbed = await SelfGlobTool(ctx).execute(pattern="**/*.py")
+    assert "src/main.py" in globbed.output
+    assert ".venv" not in globbed.output
+    assert "__pycache__" not in globbed.output
+
+    grepped = await SelfGrepTool(ctx).execute(pattern="def ", include="**/*")
+    assert "src/main.py" in grepped.output
+    assert "from_venv" not in grepped.output

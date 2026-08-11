@@ -3,7 +3,13 @@
 Commands:
   /start            greeting + help
   /chat <text>      ack immediately, run the agent, edit the message as the
-                    answer streams in (throttled), then post usage.
+                    answer streams in (throttled), then post usage. Each
+                    Telegram chat keeps a persistent session, so conversations
+                    continue across messages (same as web/TUI).
+  /new              start a brand-new chat (fresh session + per-chat memory).
+  /history          show the current chat's persisted transcript.
+  /chats            list this Telegram chat's conversations.
+  /open <id>        resume an old conversation (/chats shows the ids).
   /improve <obj>    ack, run a self-improvement cycle; the human gate sends an
                     inline ✅/❌ keyboard and awaits the button press.
   /cancel           cancel the running task/cycle for this chat.
@@ -17,6 +23,7 @@ on :class:`NelkeBot` so tests can drive them with a fake bot — no polling.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -115,6 +122,8 @@ class BotState:
     repo_path: Any = None
     # chat_id -> running asyncio.Task (for /cancel)
     tasks: dict[int, asyncio.Task[Any]] = field(default_factory=dict)
+    # chat_id -> current persistent session id (chat history / per-chat memory)
+    current_sessions: dict[int, str] = field(default_factory=dict)
     # cycle_id -> Future[bool] parked on the human gate
     gate_futures: dict[str, asyncio.Future[bool]] = field(default_factory=dict)
     # cycle_id -> (chat_id, message_id) to edit when the gate resolves
@@ -141,6 +150,10 @@ class NelkeBot:
     def _register(self) -> None:
         self.router.message.register(self.on_start, Command("start"))
         self.router.message.register(self.on_chat, Command("chat"))
+        self.router.message.register(self.on_new_chat, Command("new"))
+        self.router.message.register(self.on_history, Command("history"))
+        self.router.message.register(self.on_chats, Command("chats"))
+        self.router.message.register(self.on_open, Command("open"))
         self.router.message.register(self.on_improve, Command("improve"))
         self.router.message.register(self.on_cancel, Command("cancel"))
         self.router.message.register(self.on_memory, Command("memory"))
@@ -150,11 +163,68 @@ class NelkeBot:
     async def on_start(self, message: Message) -> None:
         await message.answer(
             "Nelke bot.\n"
-            "/chat <text> — ask Nelke\n"
+            "/chat <text> — ask Nelke (conversation history is kept)\n"
+            "/new — start a new chat\n"
+            "/history — show this chat's transcript\n"
+            "/chats — list your chats\n"
+            "/open <id> — continue an old chat\n"
             "/improve <objective> — self-improvement cycle\n"
             "/cancel — stop the running task\n"
             "/memory [query] — list memory or recall hits",
         )
+
+    # ---- chat session management -------------------------------------------
+    @staticmethod
+    def _session_meta(row: Any) -> dict[str, Any]:
+        try:
+            meta = json.loads(row["meta"] or "{}")
+            return meta if isinstance(meta, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+
+    def _resolve_session(self, chat_id: int) -> str | None:
+        """The current persisted session id for a Telegram chat, or ``None``."""
+        db = services.open_db(self.state.settings)
+        sid = self.state.current_sessions.get(chat_id)
+        if sid and db.get_session(sid) is not None:
+            return sid
+        for row in db.list_sessions(frontend="telegram", limit=300):
+            if str(self._session_meta(row).get("tg_chat_id")) == str(chat_id):
+                self.state.current_sessions[chat_id] = str(row["id"])
+                return str(row["id"])
+        return None
+
+    def _ensure_session(self, chat_id: int) -> str:
+        sid = self._resolve_session(chat_id)
+        if sid is not None:
+            return sid
+        return self._new_session(chat_id)
+
+    def _new_session(self, chat_id: int) -> str:
+        db = services.open_db(self.state.settings)
+        sid = db.create_session("telegram", meta={"tg_chat_id": str(chat_id)})
+        self.state.current_sessions[chat_id] = sid
+        return sid
+
+    @staticmethod
+    def _title_from_first_user(db: Any, session_id: str) -> str:
+        row = db.first_user_message(session_id)
+        if row is None or not (row["content"] or "").strip():
+            return "New chat"
+        return " ".join(row["content"].split())[:60] or "New chat"
+
+    def _ensure_title(self, session_id: str) -> None:
+        """Title a chat from its first user message once, when unset."""
+        db = services.open_db(self.state.settings)
+        row = db.get_session(session_id)
+        if row is None or self._session_meta(row).get("title"):
+            return
+        row2 = db.first_user_message(session_id)
+        if row2 is None:
+            return
+        title = " ".join((row2["content"] or "").split())[:60].strip()
+        if title:
+            db.update_session_meta(session_id, title=title)
 
     # ---- /chat --------------------------------------------------------------
     async def on_chat(self, message: Message, command: CommandObject) -> None:
@@ -162,12 +232,17 @@ class NelkeBot:
         if not text:
             await message.answer("Usage: /chat <text>")
             return
-        ack = await message.answer(_ACK_CHAT)
         chat_id = message.chat.id
-        task = asyncio.create_task(self._run_chat(chat_id, ack.message_id, text))
+        running = self.state.tasks.get(chat_id)
+        if running is not None and not running.done():
+            await message.answer("busy — wait for the current task to finish or /cancel")
+            return
+        session_id = self._ensure_session(chat_id)
+        ack = await message.answer(_ACK_CHAT)
+        task = asyncio.create_task(self._run_chat(chat_id, ack.message_id, text, session_id))
         self.state.tasks[chat_id] = task
 
-    async def _run_chat(self, chat_id: int, message_id: int, text: str) -> None:
+    async def _run_chat(self, chat_id: int, message_id: int, text: str, session_id: str) -> None:
         last_edit = 0.0
         live_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
 
@@ -205,8 +280,8 @@ class NelkeBot:
             live_usage["calls"] += 1
 
         try:
-            result, _session_id = await services.run_task(
-                text, self.state.settings, self.state.profile,
+            result, _sid = await services.run_chat_turn(
+                text, self.state.settings, self.state.profile, session_id,
                 frontend_name="telegram",
                 callbacks=Callbacks(on_token=on_token, on_usage=on_usage, stream=True),
                 repo=self.state.repo_path,
@@ -218,6 +293,7 @@ class NelkeBot:
             await edit(result.answer or "(no answer)", usage)
             if not result.answer:
                 await self.bot.send_message(chat_id, "(no answer)")
+            self._ensure_title(session_id)
         except asyncio.CancelledError:
             done.set()
             await asyncio.gather(editor, return_exceptions=True)
@@ -229,6 +305,82 @@ class NelkeBot:
             await self.bot.edit_message_text(f"error: {exc}"[:4000], chat_id=chat_id, message_id=message_id)
         finally:
             self.state.tasks.pop(chat_id, None)
+
+    # ---- /new ---------------------------------------------------------------
+    async def on_new_chat(self, message: Message) -> None:
+        chat_id = message.chat.id
+        running = self.state.tasks.get(chat_id)
+        if running is not None and not running.done():
+            await message.answer("busy — wait for the current task to finish or /cancel")
+            return
+        sid = self._new_session(chat_id)
+        await message.answer(f"New chat started ({sid[-8:]}).\n/chat <text> to ask.")
+
+    # ---- /history -----------------------------------------------------------
+    async def on_history(self, message: Message, command: CommandObject) -> None:
+        chat_id = message.chat.id
+        sid = self._resolve_session(chat_id)
+        if sid is None:
+            await message.answer("No chat yet — /chat <text> to start one.")
+            return
+        messages = services.get_chat_messages(self.state.settings, sid)
+        lines: list[str] = []
+        for m in messages:
+            role = str(m.get("role") or "")
+            content = str(m.get("content") or "").strip()
+            if role == "tool" or not content:
+                continue
+            prefix = "🧑 You:" if role == "user" else "🤖 Nelke:"
+            lines.append(f"{prefix}\n{content}")
+        if not lines:
+            await message.answer("No messages yet in this chat.")
+            return
+        await message.answer("\n\n".join(lines[-40:])[:4000])
+
+    # ---- /chats -------------------------------------------------------------
+    async def on_chats(self, message: Message) -> None:
+        chat_id = message.chat.id
+        db = services.open_db(self.state.settings)
+        current = self.state.current_sessions.get(chat_id)
+        lines: list[str] = []
+        for row in db.list_sessions(frontend="telegram", limit=200):
+            if str(self._session_meta(row).get("tg_chat_id")) != str(chat_id):
+                continue
+            title = self._session_meta(row).get("title") or self._title_from_first_user(db, row["id"])
+            marker = " ◀ current" if current and str(row["id"]) == str(current) else ""
+            lines.append(f"· {row['id'][-8:]} {title} ({row['message_count'] or 0} msgs){marker}")
+        if not lines:
+            await message.answer("No chats yet — /chat <text> to start one.")
+            return
+        await message.answer(
+            "Your chats (last 8 chars of id; /open <id> to continue):\n" + "\n".join(lines)[:4000]
+        )
+
+    # ---- /open --------------------------------------------------------------
+    async def on_open(self, message: Message, command: CommandObject) -> None:
+        arg = (command.args or "").strip()
+        chat_id = message.chat.id
+        if not arg:
+            await message.answer("Usage: /open <id> — the id's last 8 chars from /chats")
+            return
+        db = services.open_db(self.state.settings)
+        target: str | None = None
+        for row in db.list_sessions(frontend="telegram", limit=500):
+            if str(self._session_meta(row).get("tg_chat_id")) != str(chat_id):
+                continue
+            rid = str(row["id"])
+            if rid == arg or rid.endswith(arg) or rid.startswith(arg):
+                target = rid
+                break
+        if target is None:
+            await message.answer(f"chat '{arg}' not found — /chats to list your chats")
+            return
+        self.state.current_sessions[chat_id] = target
+        title = self._session_meta(db.get_session(target)).get("title") \
+            or self._title_from_first_user(db, target)
+        await message.answer(
+            f"Opened chat {target[-8:]} {title}.\n/history to see it, /chat <text> to continue."
+        )
 
     # ---- /improve -----------------------------------------------------------
     async def on_improve(self, message: Message, command: CommandObject) -> None:

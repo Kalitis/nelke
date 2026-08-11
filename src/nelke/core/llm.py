@@ -233,8 +233,7 @@ class LLMClient:
         if not stream:
             return self._parse_non_stream(resp, tools)
 
-        content, calls, finish, usage = await self._consume_stream(resp, on_token)
-        return self._finalize(content, calls, finish, usage, tools)
+        return await self._chat_stream(resp, kwargs, tools, on_token)
 
     async def _request_with_retry(self, kwargs: dict[str, Any]) -> Any:
         last: BaseException | None = None
@@ -268,13 +267,43 @@ class LLMClient:
         usage = _usage_to_dict(getattr(resp, "usage", None))
         return self._finalize(content, calls, finish, usage, tools)
 
+    async def _chat_stream(
+        self,
+        resp: Any,
+        kwargs: dict[str, Any],
+        tools: list[dict[str, Any]] | None,
+        on_token: ToolCallback,
+    ) -> LLMResponse:
+        """Stream the reply, retrying only when the stream died before producing output.
+
+        A mid-stream stall yields ``ReadTimeout`` from the transport. Retrying a call
+        that already streamed tokens would re-emit them to the UI, so we retry only
+        when *nothing* was produced (connection failed up front) — bounded by
+        ``self.max_retries`` with the usual backoff.
+        """
+        state = {"started": False}
+        last: BaseException | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                content, calls, finish, usage = await self._consume_stream(resp, on_token, state)
+                return self._finalize(content, calls, finish, usage, tools)
+            except Exception as exc:  # noqa: BLE001 - surfaced as LLMError
+                if state["started"] or attempt >= self.max_retries:
+                    raise LLMError(f"LLM stream failed after {attempt} attempts: {exc}") from exc
+                last = exc
+                await asyncio.sleep(min(2**attempt, 8))
+                resp = await self._client.chat.completions.create(**kwargs)
+        raise LLMError(f"LLM stream failed after {self.max_retries} attempts: {last}")
+
     async def _consume_stream(
-        self, resp: Any, on_token: ToolCallback
+        self, resp: Any, on_token: ToolCallback, state: dict[str, bool] | None = None
     ) -> tuple[str, list[ToolCall], str, dict[str, Any] | None]:
         content = ""
         finish = "stop"
         usage: dict[str, Any] | None = None
         acc: dict[int, dict[str, Any]] = {}
+        if state is not None:
+            state["started"] = False
         async for chunk in resp:
             if chunk.usage is not None:
                 usage = _usage_to_dict(chunk.usage)
@@ -287,10 +316,14 @@ class LLMClient:
             if delta is None:
                 continue
             if delta.content:
+                if state is not None:
+                    state["started"] = True
                 content += delta.content
                 if on_token is not None:
                     on_token(delta.content)
             for tcd in delta.tool_calls or []:
+                if state is not None:
+                    state["started"] = True
                 idx = tcd.index or 0
                 entry = acc.setdefault(idx, {"id": "", "name": "", "args": ""})
                 if tcd.id and tcd.type == "function":

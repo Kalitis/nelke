@@ -55,6 +55,12 @@ _SCHEMA = [
         created_at TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS cycle_events (
+        id TEXT PRIMARY KEY, cycle_id TEXT, kind TEXT, message TEXT,
+        payload TEXT, created_at TEXT, seq INTEGER
+    )
+    """,
 ]
 
 
@@ -187,6 +193,48 @@ class Database:
                 )
             )
 
+    # ---- cycle events (long-lived progress trace) ----------------------------
+    def add_cycle_event(
+        self,
+        cycle_id: str,
+        kind: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        """Persist one cycle event; ``seq`` orders events for e.g. the TUI live log."""
+        self._prepare()
+        eid = new_id()
+        seq = self._next_cycle_event_seq(cycle_id)
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO cycle_events (id, cycle_id, kind, message, payload, created_at, seq) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (eid, cycle_id, kind, message, json.dumps(payload or {}), _now(), seq),
+            )
+        return eid
+
+    def _next_cycle_event_seq(self, cycle_id: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) AS m FROM cycle_events WHERE cycle_id=?", (cycle_id,)
+            ).fetchone()
+            return int(row["m"]) + 1
+
+    def list_cycle_events(
+        self, cycle_id: str, *, after_seq: int | None = None, limit: int | None = None
+    ) -> list[sqlite3.Row]:
+        q = "SELECT * FROM cycle_events WHERE cycle_id=?"
+        args: list[str] = [cycle_id]
+        if after_seq is not None:
+            q += " AND seq>?"
+            args.append(str(after_seq))
+        q += " ORDER BY seq"
+        if limit is not None:
+            q += " LIMIT ?"
+            args.append(str(limit))
+        with self.connect() as conn:
+            return list(conn.execute(q, args))
+
     # ---- review requests -----------------------------------------------------
     def create_review_request(self, cycle_id: str, kind: str, **fields: str) -> str:
         self._prepare()
@@ -245,7 +293,16 @@ class Database:
         self._prepare()
         with self.connect() as conn:
             out: dict[str, int] = {}
-            for table in ("sessions", "messages", "cycles", "cycle_steps", "review_requests", "tasks", "usage_events"):
+            for table in (
+                "sessions",
+                "messages",
+                "cycles",
+                "cycle_steps",
+                "review_requests",
+                "tasks",
+                "usage_events",
+                "cycle_events",
+            ):
                 out[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return out
 

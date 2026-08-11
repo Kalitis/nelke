@@ -19,3 +19,6 @@ config.toml
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# ZCode internal artifacts
+.zcode/

@@ -25,6 +25,7 @@ from textual.widgets import (
     Input,
     ListItem,
     ListView,
+    ProgressBar,
     RichLog,
     Static,
     TabbedContent,
@@ -161,6 +162,8 @@ class NelkeTUI(App):
     .modal-actions { height: auto; align-horizontal: right; padding: 1 0 0 0; }
     TabbedContent { height: 1fr; }
     RichLog { border: $border; height: 1fr; }
+    ProgressBar { margin: 0 0 1 0; }
+    #improve-status { margin-bottom: 1; color: $text-muted; }
     """
 
     BINDINGS = [
@@ -182,6 +185,8 @@ class NelkeTUI(App):
                 yield Input(id="chat-input", placeholder="Ask Nelke… (Enter to send)")
             with TabPane("Improve", id="improve-tab"):
                 yield Input(id="improve-input", placeholder="Objective to improve… (Enter to run)")
+                yield ProgressBar(total=100, show_eta=False, id="improve-progress")
+                yield Static("Idle — no cycle running", id="improve-status")
                 yield RichLog(id="improve-log", markup=True)
             with TabPane("Memory", id="memory-tab"):
                 yield ListView(id="memory-list")
@@ -263,9 +268,27 @@ class NelkeTUI(App):
     @work(exclusive=True, name="improve")
     async def _run_improve(self, objective: str) -> None:
         log = self._query_one_log("improve-log")
+        progress = self.query_one("#improve-progress", ProgressBar)
+        status = self.query_one("#improve-status", Static)
+        self._ui(progress.update, 0)
 
         def on_event(event: Any) -> None:
             self._ui(log.write, f"[dim]{event.kind}:[/] {event.message}")
+            if event.kind in {"commit", "gate"} and event.step is not None and event.data.get("total_steps"):
+                pct = min(100, int(event.step / event.data["total_steps"] * 100))
+                self._ui(progress.update, pct)
+                self._ui(status.update, f"step {event.step}/{event.data['total_steps']}")
+            if event.kind == "agent_tool":
+                tool = event.data.get("tool", "")
+                args = event.data.get("args") or {}
+                args_txt = ", ".join(f"{k}={str(v)[:30]}" for k, v in list(args.items())[:2])
+                self._ui(log.write, f"[bold cyan]  🔧 {tool}({args_txt})[/]")
+                if "path" in args:
+                    self._ui(log.write, f"[dim]  📄 {args['path']}[/]")
+            elif event.kind == "agent_tool_result":
+                self._ui(log.write, f"[dim]  ✔ {event.data.get('snippet', '')[:120]}[/]")
+            elif event.kind == "cycle_start":
+                self._ui(status.update, "running…")
 
         async def human_gate(req: Any) -> bool:
             # Look up the review row so the modal can show the diff.
@@ -280,6 +303,7 @@ class NelkeTUI(App):
                 review = {"objective": req.objective, "branch": req.branch,
                           "diff": req.diff, "verdict": "", "comments": "",
                           "status": "awaiting-human", "id": ""}
+            self._ui(status.update, "awaiting human review")
             decision: bool = await self.push_screen_wait(ReviewModal(review))
             return decision
 
@@ -294,6 +318,8 @@ class NelkeTUI(App):
         except Exception as exc:  # noqa: BLE001
             self._ui(log.write, f"[bold red]error:[/] {exc}")
             return
+        self._ui(progress.update, 100 if result.merged else progress.progress)
+        self._ui(status.update, result.status)
         self._ui(
             log.write,
             f"[bold]cycle {result.status}[/] branch={result.branch} steps={result.steps}",

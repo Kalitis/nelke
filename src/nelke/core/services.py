@@ -154,6 +154,7 @@ def build_chat_session(
         iteration_cap=settings.max_agent_iterations,
         code_timeout=settings.code_timeout,
         web_timeout=settings.web_timeout,
+        db=db,
     )
     return ChatSession(agent=agent, db=db, session_id=session_id, memory=memory)
 
@@ -198,6 +199,7 @@ async def run_cycle(
     repo_path: Path | None = None,
     llm_factory: LLMFactory = _llm_factory_default,
     governance: Any = None,
+    on_token: Any = None,
 ) -> Any:
     """Run a self-improvement cycle. Returns the :class:`CycleResult`.
 
@@ -205,7 +207,8 @@ async def run_cycle(
     ``human_approve`` callable is handed straight to :class:`CycleEngine`
     and may be sync or async (the engine awaits awaitables). ``governance``
     defaults to a real :class:`Governance`; tests pass a fake to avoid
-    running lint/typecheck/tests subprocesses.
+    running lint/typecheck/tests subprocesses. ``on_token`` streams raw
+    cycle-worker tokens if provided.
     """
     from nelke.core.cycle import CycleEngine
 
@@ -222,6 +225,7 @@ async def run_cycle(
         max_steps=settings.max_cycle_steps,
         max_step_attempts=settings.max_step_attempts,
         max_review_rounds=settings.max_review_rounds,
+        on_token=on_token,
     )
     return await engine.run(objective)
 

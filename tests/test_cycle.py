@@ -203,6 +203,49 @@ def test_cli_review_reject_keeps_branch(tmp_repo, db):
     assert db.list_review_requests(cycle_id=cid)[0]["verdict"] == "rejected"
 
 
+async def test_cycle_records_progress_events(tmp_repo, db):
+    """Cycle events (incl. worker tool activity) are persisted with seq order."""
+    events = []
+    llm = driver_fake(worker=_scripted_worker(_good_fix_plan()))
+    engine = _engine(tmp_repo, db, FakeGovernance(), llm, on_event=lambda e: events.append(e.kind))
+    result = await engine.run("add a memory lesson")
+    assert result.merged
+    rows = db.list_cycle_events(result.cycle_id)
+    kinds = {r["kind"] for r in rows}
+    # lifecycle + worker tool activity are all recorded
+    assert {"cycle_start", "step_start", "gate", "commit", "step_ok", "merged"} <= kinds
+    assert "agent_tool" in kinds
+    # the cycle-worker streams its tokens (stream=True) -> agent_token events
+    # are emitted, giving the web/TUI/CLI a live view of the agent's reply.
+    assert "agent_token" in kinds
+    # seq strictly ordered
+    seqs = [r["seq"] for r in rows]
+    assert seqs == sorted(seqs)
+    # payload carries the tool name for the streamed agent_tool
+    tool_ev = next(r for r in rows if r["kind"] == "agent_tool")
+    import json
+
+    payload = json.loads(tool_ev["payload"])
+    assert payload.get("tool") == "self_write"
+
+
+async def test_cycles_tool_reports_progress(settings, tmp_repo, db):
+    """The normal-mode agent's `cycles` tool reports what the cycle did."""
+    from nelke.core.tools.cycles import CyclesTool
+
+    llm = driver_fake(worker=_scripted_worker(_good_fix_plan()))
+    engine = _engine(tmp_repo, db, FakeGovernance(), llm)
+    result = await engine.run("add a memory lesson")
+    assert result.merged
+
+    tool = CyclesTool(db)
+    res = await tool.execute(limit=40)
+    assert res.ok
+    assert "cycle" in res.output.lower()
+    assert "self_write" in res.output
+    assert "merged" in res.output.lower()
+
+
 # --------------------------------------------------------------------------- #
 # Phase B3 - cycle resilience
 # --------------------------------------------------------------------------- #

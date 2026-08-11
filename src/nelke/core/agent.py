@@ -217,10 +217,17 @@ def make_agent(
     web_timeout: float = 30,
     include_web: bool = True,
     include_shell: bool = True,
+    db: Any = None,
 ) -> Agent:
-    """Build a normal-mode agent (workspace-scoped tools)."""
+    """Build a normal-mode agent (workspace-scoped tools).
+
+    ``db`` is optional: when given, the normal-mode agent also gets a
+    :class:`CyclesTool` so it can answer questions about in-flight or finished
+    self-improvement cycles from an ordinary chat, without interrupting them.
+    """
     from pathlib import Path
 
+    from nelke.core.tools.cycles import CyclesTool
     from nelke.core.tools.fs import (
         EditFileTool,
         GlobTool,
@@ -249,6 +256,8 @@ def make_agent(
         tools += [RecallTool(memory), MemoryWriteTool(memory)]
     if task_factory is not None:
         tools += [TaskTool(task_factory)]
+    if db is not None:
+        tools += [CyclesTool(db)]
     return Agent(
         name=name,
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,

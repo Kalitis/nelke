@@ -61,6 +61,29 @@ class AppState:
         # cycle_id -> (Future, review_request_id once known)
         self.gate_futures: dict[str, asyncio.Future[bool]] = {}
         self.gate_request_ids: dict[str, str] = {}
+        # stream-kind -> subscriber_id -> asyncio.Queue (SSE broadcast fan-out)
+        self.stream_events: dict[str, dict[str, asyncio.Queue[dict[str, Any]]]] = {}
+
+
+def _safe_json(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _truthy(value: str | None) -> bool:
+    """Parse a query-param truth value: ``1``/``true``/``yes`` (case-insensitive)."""
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def new_id_short() -> str:
+    import uuid
+
+    return uuid.uuid4().hex[:8]
 
 
 def create_app(state: AppState | None = None) -> FastAPI:
@@ -177,20 +200,122 @@ def create_app(state: AppState | None = None) -> FastAPI:
                 state.gate_request_ids[req.cycle_id] = human_reqs[0]["id"]
             return await future
 
+        def push_events(ev: Any) -> None:
+            """Broadcast each live cycle event to all SSE subscribers."""
+            data = {"cycle_id": getattr(ev, "cycle_id", ""), "kind": ev.kind,
+                    "message": ev.message, "payload": ev.data}
+            for _, events in state.stream_events.items():
+                for q in list(events.values()):
+                    try:
+                        q.put_nowait({"event": "cycle_event",
+                                      "data": json.dumps(data)})
+                    except Exception:  # noqa: BLE001
+                        pass
+
         async def runner() -> None:
             try:
-                await services.run_cycle(
+                result = await services.run_cycle(
                     objective, state.settings, None,
                     human_approve=human_gate,
                     repo_path=state.repo_path,
                     llm_factory=state.llm_factory,
                     governance=state.governance,
+                    on_event=push_events,
                 )
+                # Notify any SSE subscribers that the cycle finished.
+                for _, events in state.stream_events.items():
+                    for q in list(events.values()):
+                        q.put_nowait({
+                            "event": "cycle_result",
+                            "data": json.dumps({
+                                "cycle_id": result.cycle_id, "status": result.status,
+                                "branch": result.branch, "steps": result.steps,
+                            }),
+                        })
             except Exception:  # noqa: BLE001 - the gate future is abandoned on failure
                 pass
 
         asyncio.create_task(runner())
         return JSONResponse({"status": "started"})
+
+    @app.get("/api/cycles/stream")
+    async def api_cycles_stream(request: Request) -> EventSourceResponse:
+        """SSE stream of live cycle progress (persisted trace + live callbacks).
+
+        With ``?replay_only=1`` the generator replays the persisted trace and
+        returns immediately instead of entering the live ``while True`` loop.
+        That gives the response a finite end so it can be consumed by a plain
+        HTTP GET in tests (sse_starlette closes the response once the generator
+        returns); production subscribers use the default infinite stream.
+        """
+        replay_only = _truthy(request.query_params.get("replay_only"))
+        db = services.open_db(state.settings)
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        sub_id = new_id_short()
+
+        # Replay the persisted trace so a late subscriber sees current state.
+        for cycle in list(db.list_cycles())[:3]:
+            events = db.list_cycle_events(cycle["id"], limit=60)
+            for ev in events:
+                try:
+                    payload = json.loads(ev["payload"] or "{}")
+                except Exception:  # noqa: BLE001
+                    payload = {}
+                queue.put_nowait({
+                    "event": "cycle_event",
+                    "data": json.dumps({"cycle_id": cycle["id"], "kind": ev["kind"],
+                                        "message": ev["message"], "payload": payload}),
+                })
+
+        if replay_only:
+            # Finite: drain the replayed events and end the response.
+            async def gen() -> AsyncIterator[dict[str, Any]]:
+                while not queue.empty():
+                    yield queue.get_nowait()
+            return EventSourceResponse(gen())
+
+        state.stream_events.setdefault("cycle", {})[sub_id] = queue
+
+        async def gen() -> AsyncIterator[dict[str, Any]]:
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=10)
+                    except asyncio.TimeoutError:
+                        yield {"event": "ping", "data": "{}"}
+                        continue
+                    yield item
+            finally:
+                state.stream_events.get("cycle", {}).pop(sub_id, None)
+
+        return EventSourceResponse(gen())
+
+    @app.get("/api/cycles")
+    async def api_cycles() -> list[dict[str, Any]]:
+        """Return the persisted cycle progress trace for the web card."""
+        db = services.open_db(state.settings)
+        out: list[dict[str, Any]] = []
+        for cycle in list(db.list_cycles())[:5]:
+            events = db.list_cycle_events(cycle["id"], limit=80)
+            out.append({
+                "id": cycle["id"],
+                "objective": cycle["objective"],
+                "branch": cycle["branch"],
+                "status": cycle["status"],
+                "ai_verdict": cycle["ai_verdict"],
+                "human_verdict": cycle["human_verdict"],
+                "events": [
+                    {
+                        "id": ev["id"], "kind": ev["kind"], "message": ev["message"],
+                        "payload": _safe_json(ev["payload"]), "seq": ev["seq"],
+                        "step": _safe_json(ev["payload"]).get("step") or ev["seq"],
+                    }
+                    for ev in events
+                ],
+            })
+        return out
 
     @app.post("/api/review/{request_id}")
     async def api_resolve_review(request_id: str, payload: dict[str, Any]) -> JSONResponse:

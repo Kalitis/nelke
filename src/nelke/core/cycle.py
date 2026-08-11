@@ -63,6 +63,24 @@ class CycleEvent:
     message: str = ""
     data: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def cycle_id(self) -> str:
+        return str(self.data.get("cycle_id", ""))
+
+    @property
+    def step(self) -> int | None:
+        val = self.data.get("step")
+        return int(val) if val is not None else None
+
+    @property
+    def progress(self) -> tuple[int, int] | None:
+        """(completed_steps, total_steps) for progress rendering."""
+        step = self.data.get("step")
+        total = self.data.get("total_steps")
+        if step is None or total is None:
+            return None
+        return int(step), int(total)
+
 
 @dataclass
 class HumanReviewRequest:
@@ -187,7 +205,7 @@ class CycleEngine:
             tools=tools,
             llm=self.llm,
             iteration_cap=40,
-            stream=False,
+            stream=True,
             on_token=self.on_token,
             memory_index=memory.index_text() or None,
         )
@@ -240,7 +258,6 @@ class CycleEngine:
         repo.checkout_new_branch(branch, base="main")
         self._synced = False
         self.db.create_cycle(objective, branch, cycle_id=cycle_id)
-        self._emit("cycle_start", f"branch {branch}", cycle_id=cycle_id, branch=branch, objective=objective)
 
         state: dict[str, Any] = {"propose_complete": False}
         step_no = 0
@@ -254,6 +271,36 @@ class CycleEngine:
         )
         memory = MemoryStore(repo.repo / "memory")
         agent = self._build_working_agent(ctx, memory)
+
+        def emit(kind: str, message: str = "", **data: Any) -> None:
+            """Emit + persist one cycle event; ``seq``-ordered rows feed progress UIs."""
+            data.setdefault("cycle_id", cycle_id)
+            data.setdefault("total_steps", self.max_steps)
+            try:
+                self.db.add_cycle_event(cycle_id, kind, message, data)
+            except Exception:  # noqa: BLE001 - persistence must never break the cycle
+                pass
+            self._emit(kind, message, **data)
+
+        # Route agent tool activity of the cycle-worker to progress events so
+        # the web card / TG / TUI can stream what the agent is actually doing.
+        def on_worker_token(tok: str) -> None:
+            if self.on_token is not None:
+                self.on_token(tok)
+            emit("agent_token", "", token=tok)
+
+        def on_worker_tool(name: str, args: dict[str, Any]) -> None:
+            emit("agent_tool", f"tool {name}", tool=name, args=args, step=step_no)
+
+        def on_worker_tool_result(name: str, args: dict[str, Any], result: str) -> None:
+            emit("agent_tool_result", "", tool=name, snippet=result[:400], step=step_no)
+
+        agent.on_token = on_worker_token
+        agent.on_tool = on_worker_tool
+        agent.on_tool_result = on_worker_tool_result
+
+        emit("cycle_start", f"branch {branch}", cycle_id=cycle_id, branch=branch, objective=objective)
+
         feedback = ""
         first_run = True
         committed_any = False
@@ -269,7 +316,7 @@ class CycleEngine:
                     step_no += 1
                     state["propose_complete"] = False
                     task = objective if not feedback else f"{objective}\n\n[feedback]\n{feedback}"
-                    self._emit("step_start", f"step {step_no}", step=step_no)
+                    emit("step_start", f"step {step_no}", step=step_no)
                     result = await agent.run(task, reset=first_run)
                     first_run = False
                     self.db.add_usage(result.usage, cycle_id=cycle_id)
@@ -277,7 +324,7 @@ class CycleEngine:
 
                     await self._sync_dependencies_if_changed()
                     gate = await self.governance.gate()
-                    self._emit("gate", gate.describe(), step=step_no, passed=gate.passed)
+                    emit("gate", gate.describe(), step=step_no, passed=gate.passed)
                     if gate.passed:
                         feedback = ""
                         gate_passed = True
@@ -294,13 +341,13 @@ class CycleEngine:
                         repo.stash_all()
                     self.db.add_step(cycle_id, step_no, None, "failed-gate", feedback[:500])
                     self.db.update_cycle(cycle_id, status="failed-gate", ended_at=_now())
-                    self._emit("cycle_error", "gate could not be satisfied", feedback=feedback[:2000])
+                    emit("cycle_error", "gate could not be satisfied", feedback=feedback[:2000])
                     return self._result(cycle_id, objective, branch, "failed-gate",
                                         ReviewVerdict("request_changes"),
                                         steps=step_no, message=feedback[:500])
 
                 if not repo.has_changes():
-                    self._emit("idle", "no changes after a green step")
+                    emit("idle", "no changes after a green step")
                     break
 
                 repo.add_all()
@@ -310,20 +357,20 @@ class CycleEngine:
                 )
                 committed_any = True
                 self.db.add_step(cycle_id, step_no, sha, "committed", objective[:200])
-                self._emit("commit", f"committed {sha}", step=step_no, sha=sha)
+                emit("commit", f"committed {sha}", step=step_no, sha=sha)
 
                 boot = await self.governance.boot_check()
                 if not boot.ok and not boot.skipped:
                     repo.revert_commit(sha)
                     self.db.add_step(cycle_id, step_no, sha, "failed-boot", boot.message[:500])
-                    self._emit("boot_check_failed", f"reverted {sha}: {boot.message[:200]}", step=step_no, sha=sha)
+                    emit("boot_check_failed", f"reverted {sha}: {boot.message[:200]}", step=step_no, sha=sha)
                     feedback = (
                         "Your last commit broke the boot check and was reverted automatically. "
                         "It must import cleanly and pass nelke.boot_check(). Rework the change."
                     )
                     continue
                 self.db.add_step(cycle_id, step_no, sha, "ok", "boot check passed")
-                self._emit("step_ok", f"step {step_no} committed, boot-check passed", step=step_no)
+                emit("step_ok", f"step {step_no} committed, boot-check passed", step=step_no)
 
                 if pending_propose:
                     break
@@ -334,7 +381,7 @@ class CycleEngine:
             final_diff = repo.diff("main", branch)
             if not committed_any and not final_diff.strip():
                 self.db.update_cycle(cycle_id, status="no-changes", ended_at=_now())
-                self._emit("cycle_error", "no changes produced")
+                emit("cycle_error", "no changes produced")
                 return self._result(cycle_id, objective, branch, "no-changes",
                                     ReviewVerdict("request_changes"),
                                     steps=step_no, message="agent made no changes")
@@ -349,8 +396,8 @@ class CycleEngine:
                 self.db.add_usage(reviewer.last_usage, cycle_id=cycle_id)
                 self.db.create_review_request(cycle_id, "ai", verdict=verdict.verdict, comments=verdict.comments)
                 self.db.update_cycle(cycle_id, ai_verdict=verdict.verdict)
-                self._emit("ai_review", f"AI: {verdict.verdict}", verdict=verdict.verdict,
-                           comments=verdict.comments[:800], round=rounds)
+                emit("ai_review", f"AI: {verdict.verdict}", verdict=verdict.verdict,
+                     comments=verdict.comments[:800], round=rounds)
                 if verdict.approved:
                     review_feedback_pending = False
                     break
@@ -359,7 +406,7 @@ class CycleEngine:
                     review_feedback_pending = True
                     break
                 self.db.update_cycle(cycle_id, status="request-changes", ended_at=_now())
-                self._emit("cycle_error", "reviewer still requests changes", comments=verdict.comments[:800])
+                emit("cycle_error", "reviewer still requests changes", comments=verdict.comments[:800])
                 return self._result(cycle_id, objective, branch, "request-changes", verdict,
                                     steps=step_no, message=verdict.comments[:500])
 
@@ -368,7 +415,7 @@ class CycleEngine:
                     self.db.update_cycle(cycle_id, status="request-changes", ended_at=_now())
                     return self._result(cycle_id, objective, branch, "request-changes", verdict,
                                         steps=step_no, message=verdict.comments[:500])
-                self._emit("review_feedback", "resuming work with reviewer feedback")
+                emit("review_feedback", "resuming work with reviewer feedback")
                 continue  # back to the work phase
 
             break
@@ -381,11 +428,11 @@ class CycleEngine:
         )
         self.db.create_review_request(cycle_id, "human", verdict="pending",
                                       comments=f"AI: {verdict.verdict}\n{verdict.comments}".strip())
-        self._emit("awaiting_human", "cycle awaits human approval", branch=branch)
+        emit("awaiting_human", "cycle awaits human approval", branch=branch)
 
         if human_gate is None:
             self.db.update_cycle(cycle_id, status="awaiting-human", ended_at=_now())
-            self._emit("human_pending", "no human gate attached — leaving branch for review")
+            emit("human_pending", "no human gate attached — leaving branch for review")
             return self._result(cycle_id, objective, branch, "awaiting-human", verdict, steps=step_no)
 
         decision = human_gate(human_request)
@@ -393,7 +440,7 @@ class CycleEngine:
             decision = await decision  # type: ignore[misc]
         if not decision:
             self.db.update_cycle(cycle_id, status="rejected", human_verdict="rejected", ended_at=_now())
-            self._emit("human_rejected", "human rejected cycle", branch=branch)
+            emit("human_rejected", "human rejected cycle", branch=branch)
             return self._result(cycle_id, objective, branch, "rejected", verdict, human="rejected", steps=step_no)
 
         # approved -> merge --no-ff into main (co-authored by Nelke)
@@ -401,11 +448,11 @@ class CycleEngine:
             merge_cycle_branch(repo, branch, cycle_id=cycle_id)
         except GitError as exc:
             self.db.update_cycle(cycle_id, status="merge-conflict", human_verdict="approved", ended_at=_now())
-            self._emit("cycle_error", "merge failed", error=str(exc))
+            emit("cycle_error", "merge failed", error=str(exc))
             return self._result(cycle_id, objective, branch, "merge-conflict", verdict,
                                 human="approved", steps=step_no, message=str(exc)[:500])
 
         self.db.update_cycle(cycle_id, status="merged", human_verdict="approved", ended_at=_now())
-        self._emit("merged", "cycle merged into main", branch=branch)
+        emit("merged", "cycle merged into main", branch=branch)
         return self._result(cycle_id, objective, branch, "merged", verdict,
                             human="approved", steps=step_no)

@@ -213,6 +213,7 @@ class MemoryStore:
         query_terms = _tokenize(query)
         if not query_terms:
             return []
+        index_text = self._load_index()
         hits: list[MemoryHit] = []
         for rel in self.files():
             content = self.read(rel.as_posix())
@@ -220,8 +221,7 @@ class MemoryStore:
             if body_score == 0:
                 continue
             # boost by matching the INDEX entry (title+tags+summary)
-            index_entry = self._index_entry(rel.as_posix())
-            entry_score, _ = _recall_one(index_entry, query_terms)
+            entry_score = _recall_one(_index_entry(index_text, rel.as_posix()), query_terms)[0]
             score = body_score + entry_score
             pos = body_pos if body_pos >= 0 else 0
             snippet = _snippet(content, pos)
@@ -229,16 +229,11 @@ class MemoryStore:
         hits.sort(key=lambda h: (-h.score, h.name))
         return hits[:top_k]
 
-    def _index_entry(self, rel_name: str) -> str:
-        """Return the INDEX.md line describing `rel_name` (title + tags + summary)."""
+    def _load_index(self) -> str:
         try:
-            index = self.index_text()
+            return self.index_text()
         except OSError:
             return ""
-        for line in index.splitlines():
-            if f"({rel_name})" in line:
-                return line
-        return ""
 
 
 def _snippet(content: str, pos: int, width: int = 200) -> str:
@@ -249,3 +244,11 @@ def _snippet(content: str, pos: int, width: int = 200) -> str:
     piece = content[start:end].replace("\n", " ")
     prefix = "…" if start > 0 else ""
     return f"{prefix}{piece}"
+
+
+def _index_entry(index_text: str, rel_name: str) -> str:
+    """Return the INDEX.md line describing `rel_name` (title + tags + summary)."""
+    for line in index_text.splitlines():
+        if f"({rel_name})" in line:
+            return line
+    return ""

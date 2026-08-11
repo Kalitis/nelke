@@ -21,7 +21,7 @@ _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
-        tool_calls TEXT, created_at TEXT
+        tool_calls TEXT, tool_call_id TEXT, created_at TEXT
     )
     """,
     """
@@ -63,6 +63,12 @@ _SCHEMA = [
     """,
 ]
 
+# Additive migrations applied after the base schema (for databases created by
+# older versions). Each is wrapped in a try/except so re-running is safe.
+_MIGRATIONS = [
+    "ALTER TABLE messages ADD COLUMN tool_call_id TEXT",
+]
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -86,6 +92,12 @@ class Database:
         with self.connect() as conn:
             for statement in _SCHEMA:
                 conn.execute(statement)
+            for statement in _MIGRATIONS:
+                try:
+                    conn.execute(statement)
+                except sqlite3.OperationalError:
+                    # column already exists (older DB re-migrated)
+                    pass
             conn.commit()
 
     def _prepare(self) -> None:
@@ -109,20 +121,79 @@ class Database:
                 "UPDATE sessions SET ended_at=? WHERE id=?", (_now(), session_id)
             )
 
+    def get_session(self, session_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+
+    def list_sessions(
+        self, frontend: str | None = None, limit: int | None = None
+    ) -> list[sqlite3.Row]:
+        """Sessions ordered by last activity (message time, else start time).
+
+        Each row includes ``message_count`` and ``last_message_at`` computed
+        from the ``messages`` table so chat lists can render titles/labels
+        without a second query per row.
+        """
+        q = (
+            "SELECT s.*, "
+            "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count, "
+            "(SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id) AS last_message_at "
+            "FROM sessions s"
+        )
+        conds: list[str] = []
+        args: list[str] = []
+        if frontend:
+            conds.append("s.frontend = ?")
+            args.append(frontend)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY COALESCE(last_message_at, s.started_at) DESC, s.started_at DESC"
+        if limit is not None:
+            q += " LIMIT ?"
+            args.append(str(limit))
+        with self.connect() as conn:
+            return list(conn.execute(q, args))
+
+    def update_session_meta(self, session_id: str, **fields: Any) -> None:
+        """Merge ``fields`` into the session's ``meta`` JSON blob."""
+        row = self.get_session(session_id)
+        if row is None:
+            return
+        try:
+            meta = json.loads(row["meta"] or "{}")
+        except (ValueError, TypeError):
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(fields)
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET meta=? WHERE id=?", (json.dumps(meta), session_id)
+            )
+
+    def delete_session(self, session_id: str) -> None:
+        """Remove a chat session and its messages (chat management)."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+
     def add_message(
         self,
         session_id: str,
         role: str,
         content: str,
         tool_calls: list[dict[str, Any]] | None = None,
+        tool_call_id: str | None = None,
     ) -> str:
         self._prepare()
         mid = new_id()
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO messages (id, session_id, role, content, tool_calls, created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (mid, session_id, role, content, json.dumps(tool_calls or []), _now()),
+                "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (mid, session_id, role, content, json.dumps(tool_calls or []), tool_call_id, _now()),
             )
         return mid
 
@@ -134,6 +205,15 @@ class Database:
                     (session_id,),
                 )
             )
+
+    def first_user_message(self, session_id: str) -> sqlite3.Row | None:
+        """The first user message, used to derive a chat title."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM messages WHERE session_id=? AND role='user' "
+                "ORDER BY created_at LIMIT 1",
+                (session_id,),
+            ).fetchone()
 
     # ---- cycles / steps ------------------------------------------------------
     def create_cycle(self, objective: str, branch: str, cycle_id: str | None = None) -> str:

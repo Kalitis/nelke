@@ -178,6 +178,31 @@ async def test_usage_is_accumulated(tmp_path):
     assert result.usage == {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11, "calls": 2}
 
 
+async def test_on_usage_reports_each_call_in_real_time(tmp_path):
+    """The on_usage hook fires once per LLM call, as soon as usage is known."""
+    usages: list[dict] = []
+    (tmp_path / "x.txt").write_text("hi", encoding="utf-8")
+
+    class UsageLLM:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def chat(self, messages, *, tools=None, model=None, temperature=None,
+                       max_tokens=None, stream=False, on_token=None):
+            self.n += 1
+            if self.n == 1:
+                return LLMResponse(content="", tool_calls=[ToolCall("call_1", "read", {"path": "x.txt"})],
+                                   usage={"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7})
+            return LLMResponse(content="done", usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4})
+
+    agent = _agent(tmp_path, UsageLLM(), on_usage=usages.append)
+    await agent.run("go")
+    assert usages == [
+        {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+    ]
+
+
 async def test_on_tool_result_notified(tmp_path):
     results_seen: list[tuple[str, str]] = []
     (tmp_path / "x.txt").write_text("hello world", encoding="utf-8")

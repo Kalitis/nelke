@@ -67,6 +67,29 @@ async def test_run_task_persists_usage_and_ends_session(tmp_repo, settings):
     assert totals["calls"] == 1
 
 
+async def test_run_task_persists_usage_per_call_in_real_time(tmp_repo, settings):
+    """Usage is written to the DB per LLM call (real-time), not one aggregate."""
+    from nelke.core.llm import LLMResponse, ToolCall
+
+    responses = [
+        LLMResponse(content="", tool_calls=[ToolCall("call_1", "read", {"path": "x.txt"})],
+                    usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}),
+        LLMResponse(content="done", usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}),
+    ]
+    factory = _llm_factory(responses)
+    result, session_id = await services.run_task(
+        "go", settings, profile=None, frontend_name="web",
+        repo=tmp_repo.repo, llm_factory=factory,
+    )
+    assert result.answer == "done"
+    db = services.open_db(settings)
+    events = db.list_usage(session_id=session_id)
+    assert len(events) == 2  # one usage_events row per LLM call
+    totals = db.usage_totals(session_id=session_id)
+    assert totals["total_tokens"] == 7
+    assert totals["calls"] == 2
+
+
 async def test_run_task_streaming_callbacks_fire(tmp_repo, settings):
     tokens: list[str] = []
     factory = _llm_factory([final_response("hello")])
@@ -286,3 +309,141 @@ def test_open_db_migrates(settings):
     db = services.open_db(settings)
     counts = db.status()
     assert "sessions" in counts
+
+
+# --------------------------------------------------------------------------- #
+# Chats: multiple conversations with history + per-chat memory
+# --------------------------------------------------------------------------- #
+def test_chat_crud_and_titles(settings):
+    cid = services.create_chat(settings, title="First")
+    chats = services.list_chats(settings, frontend="web")
+    assert any(c["id"] == cid and c["title"] == "First" for c in chats)
+
+    assert services.rename_chat(settings, cid, "Renamed")
+    assert services.get_chat(settings, cid)["title"] == "Renamed"
+
+    chat = services.get_chat(settings, cid)
+    assert chat["messages"] == []
+    assert chat["memory"] == []
+
+    assert services.delete_chat(settings, cid)
+    assert services.get_chat(settings, cid) is None
+    assert services.rename_chat(settings, cid, "x") is False
+    assert services.delete_chat(settings, cid) is False
+
+
+def test_list_chats_orders_by_activity_and_derives_title(settings):
+    a = services.create_chat(settings, frontend="web")
+    b = services.create_chat(settings, frontend="web")
+    # title derives from the first user message when no meta title is set
+    db = services.open_db(settings)
+    db.add_message(a, "user", "First user question about math")
+    chats = services.list_chats(settings, frontend="web")
+    assert chats[0]["id"] == a  # newer activity
+    assert any(c["id"] == b for c in chats)
+    assert any(c["id"] == a and "First user question" in c["title"] for c in chats)
+    assert any(c["id"] == a and c["message_count"] == 1 for c in chats)
+
+
+def _chat_llm_factory(responses):
+    """llm_factory that records every messages list it sees, for continuity checks."""
+    seen: list[list[str]] = []
+    state = {"i": 0}
+
+    def _factory(_profile):
+        class _LLM:
+            async def chat(self, messages, *, tools=None, stream=False, on_token=None, **_kw):
+                seen.append([m.get("role") for m in messages])
+                resp = responses[min(state["i"], len(responses) - 1)]
+                state["i"] += 1
+                if stream and on_token is not None and resp.content:
+                    on_token(resp.content)
+                return resp
+
+        return _LLM()
+
+    return _factory, seen
+
+
+async def test_run_chat_turn_persists_transcript(settings, tmp_repo):
+    factory, _ = _chat_llm_factory([final_response("first")])
+    cid = services.create_chat(settings, frontend="tui")
+    result, chat_id = await services.run_chat_turn(
+        "first msg", settings, None, cid,
+        frontend_name="tui", repo=tmp_repo.repo, llm_factory=factory,
+    )
+    assert chat_id == cid
+    assert result.answer == "first"
+    messages = services.get_chat_messages(settings, cid)
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert messages[0]["content"] == "first msg"
+    assert messages[1]["content"] == "first"
+
+
+async def test_run_chat_turn_reloads_history_across_calls(settings, tmp_repo):
+    factory, seen = _chat_llm_factory([final_response("first"), final_response("second")])
+    cid = services.create_chat(settings, frontend="tui")
+    await services.run_chat_turn("first msg", settings, None, cid,
+                                 frontend_name="tui", repo=tmp_repo.repo, llm_factory=factory)
+    await services.run_chat_turn("second msg", settings, None, cid,
+                                 frontend_name="tui", repo=tmp_repo.repo, llm_factory=factory)
+    assert len(seen) == 2
+    assert seen[1].count("user") >= 2  # the reloaded history was passed to the LLM
+
+
+async def test_run_chat_turn_scopes_memory_per_chat(settings, tmp_repo):
+    factory, _ = _chat_llm_factory([final_response("ok")])
+    cid = services.create_chat(settings, frontend="web")
+    await services.run_chat_turn("hi", settings, None, cid,
+                                 frontend_name="web", repo=tmp_repo.repo, llm_factory=factory)
+    # per-chat memory store built inside memory/chats/<session_id>/
+    index = tmp_repo.repo / "memory" / "chats" / cid / "INDEX.md"
+    assert index.exists()
+    assert services.list_chat_memory(settings, cid, repo=tmp_repo.repo) == []
+
+
+# --------------------------------------------------------------------------- #
+# Cycle history browser
+# --------------------------------------------------------------------------- #
+async def test_list_cycles_and_detail(tmp_repo, settings):
+    async def human(_req) -> bool:
+        return True
+
+    factory = _cycle_llm_factory(_good_fix_plan())
+    await services.run_cycle(
+        "add a memory lesson", settings, None,
+        human_approve=human, repo_path=tmp_repo.repo, llm_factory=factory,
+        governance=FakeGovernance(),
+    )
+    cycles = services.list_cycles(settings)
+    assert cycles
+    first = cycles[0]
+    assert first["status"] == "merged"
+    assert first["steps"]  # persisted step trace
+    detail = services.get_cycle_detail(settings, first["id"])
+    assert detail is not None
+    assert detail["id"] == first["id"]
+    assert detail["events"]  # timeline present
+    assert detail["reviews"]
+
+
+def test_reconcile_stale_cycles_marks_empty_branches(tmp_repo, settings):
+    """running cycles with no commits on their branch are stuck/failed."""
+    db = services.open_db(settings)
+    db.create_cycle("ghost branch", "improve/ghost", cycle_id="c-ghost")
+    tmp_repo.checkout_new_branch("improve/empty", base="main")
+    db.create_cycle("no commits", "improve/empty", cycle_id="c-empty")
+    tmp_repo.checkout_new_branch("improve/work", base="main")
+    (tmp_repo.repo / "work.txt").write_text("x", encoding="utf-8")
+    tmp_repo.add_all()
+    tmp_repo.commit("work")
+    db.create_cycle("has commits", "improve/work", cycle_id="c-work")
+
+    marked = services.reconcile_stale_cycles(settings, repo_path=tmp_repo.repo)
+    assert {m["id"] for m in marked} == {"c-ghost", "c-empty"}
+    assert db.get_cycle("c-ghost")["status"] == "stuck"
+    assert db.get_cycle("c-empty")["status"] == "stuck"
+    # a branch with commits (here also the currently checked-out branch) is kept
+    assert db.get_cycle("c-work")["status"] == "running"
+
+

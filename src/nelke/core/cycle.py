@@ -142,6 +142,7 @@ class CycleEngine:
         max_step_attempts: int = 3,
         max_review_rounds: int = 3,
         on_token: ToolCallback = None,
+        on_usage: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self.repo = repo
         self.db = db
@@ -153,6 +154,7 @@ class CycleEngine:
         self.max_step_attempts = max_step_attempts
         self.max_review_rounds = max_review_rounds
         self.on_token = on_token
+        self.on_usage = on_usage
         self._synced = False
 
     def _emit(self, kind: str, message: str = "", **data: Any) -> None:
@@ -295,9 +297,29 @@ class CycleEngine:
         def on_worker_tool_result(name: str, args: dict[str, Any], result: str) -> None:
             emit("agent_tool_result", "", tool=name, snippet=result[:400], step=step_no)
 
+        def on_worker_usage(usage: dict[str, Any]) -> None:
+            """Persist each LLM call's usage live and forward it to the frontend."""
+            try:
+                if usage.get("total_tokens"):
+                    self.db.add_usage(usage, cycle_id=cycle_id)
+            except Exception:  # noqa: BLE001 - persistence must never break the cycle
+                pass
+            emit(
+                "usage", "",
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+            )
+            if self.on_usage is not None:
+                try:
+                    self.on_usage(dict(usage))
+                except Exception:  # noqa: BLE001 - UI updates must never break the cycle
+                    pass
+
         agent.on_token = on_worker_token
         agent.on_tool = on_worker_tool
         agent.on_tool_result = on_worker_tool_result
+        agent.on_usage = on_worker_usage
 
         emit("cycle_start", f"branch {branch}", cycle_id=cycle_id, branch=branch, objective=objective)
 
@@ -317,9 +339,8 @@ class CycleEngine:
                     state["propose_complete"] = False
                     task = objective if not feedback else f"{objective}\n\n[feedback]\n{feedback}"
                     emit("step_start", f"step {step_no}", step=step_no)
-                    result = await agent.run(task, reset=first_run)
+                    await agent.run(task, reset=first_run)
                     first_run = False
-                    self.db.add_usage(result.usage, cycle_id=cycle_id)
                     pending_propose = bool(state["propose_complete"])
 
                     await self._sync_dependencies_if_changed()

@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -37,8 +37,26 @@ from nelke.core.services import Callbacks
 load_env_files()
 
 _PKG_DIR = Path(__file__).resolve().parent
-TEMPLATES_DIR = _PKG_DIR.parent / "templates"
-STATIC_DIR = _PKG_DIR.parent / "static"
+
+
+def _web_asset_dir(name: str, marker: str) -> Path:
+    """Locate the templates/ or static/ directory (single source of truth).
+
+    The canonical copies live at the repo root (``<repo>/<name>``). For wheels
+    built from this repo the same files are bundled into the package
+    (``nelke/<name>``), so fall back to that for installed installs.
+    """
+    from nelke.core import services
+
+    for root in (services.find_repo(), Path.cwd(), _PKG_DIR.parent):
+        cand = root / name
+        if (cand / marker).is_file():
+            return cand
+    return _PKG_DIR.parent / name
+
+
+TEMPLATES_DIR = _web_asset_dir("templates", "base.html")
+STATIC_DIR = _web_asset_dir("static", "app.js")
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +133,16 @@ def create_app(state: AppState | None = None) -> FastAPI:
             return templates.TemplateResponse(request, "review.html", {"review": None})
         return templates.TemplateResponse(request, "review.html", {"review": review})
 
+    @app.get("/cycles", response_class=HTMLResponse)
+    async def cycles_page(request: Request) -> HTMLResponse:
+        cycles = services.list_cycles(state.settings)
+        return templates.TemplateResponse(request, "cycles.html", {"cycles": cycles})
+
+    @app.get("/cycles/{cycle_id}", response_class=HTMLResponse)
+    async def cycle_detail_page(request: Request, cycle_id: str) -> HTMLResponse:
+        cycle = services.get_cycle_detail(state.settings, cycle_id)
+        return templates.TemplateResponse(request, "cycle_detail.html", {"cycle": cycle})
+
     # ---- JSON api ----------------------------------------------------------
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
@@ -127,6 +155,30 @@ def create_app(state: AppState | None = None) -> FastAPI:
     @app.get("/api/reviews")
     async def api_reviews() -> list[dict[str, Any]]:
         return services.list_open_reviews(state.settings)
+
+    @app.get("/api/usage")
+    async def api_usage(
+        session_id: str | None = None, cycle_id: str | None = None,
+    ) -> dict[str, Any]:
+        """DB-backed token usage: running totals + the most recent per-call events."""
+        db = services.open_db(state.settings)
+        totals = db.usage_totals(session_id=session_id, cycle_id=cycle_id)
+        events = db.list_usage(session_id=session_id, cycle_id=cycle_id)
+        return {
+            "totals": totals,
+            "events": [
+                {
+                    "id": r["id"],
+                    "prompt_tokens": r["prompt_tokens"],
+                    "completion_tokens": r["completion_tokens"],
+                    "total_tokens": r["total_tokens"],
+                    "created_at": r["created_at"],
+                    "session_id": r["session_id"],
+                    "cycle_id": r["cycle_id"],
+                }
+                for r in events[-50:]
+            ],
+        }
 
     @app.post("/api/chat")
     async def api_chat(payload: dict[str, Any]) -> EventSourceResponse:
@@ -151,19 +203,117 @@ def create_app(state: AppState | None = None) -> FastAPI:
                     "data": json.dumps({"name": name, "snippet": result[:200]}),
                 })
 
+            def on_usage(usage: dict[str, Any]) -> None:
+                queue.put_nowait({"event": "usage", "data": json.dumps(usage)})
+
             async def runner() -> None:
                 try:
-                    result, _session_id = await services.run_task(
+                    result, session_id = await services.run_task(
                         text, state.settings, profile,
                         frontend_name="web",
                         callbacks=Callbacks(on_token=on_token, on_tool=on_tool,
-                                            on_tool_result=on_tool_result, stream=True),
+                                            on_tool_result=on_tool_result,
+                                            on_usage=on_usage, stream=True),
                         repo=state.repo_path,
                         llm_factory=state.llm_factory,
                     )
                     await queue.put({
                         "event": "done",
-                        "data": json.dumps({"answer": result.answer, "usage": result.usage}),
+                        "data": json.dumps({"answer": result.answer, "usage": result.usage,
+                                            "session_id": session_id}),
+                    })
+                except Exception as exc:  # noqa: BLE001 - surface to the client
+                    await queue.put({"event": "error", "data": json.dumps({"message": str(exc)})})
+                finally:
+                    await queue.put(done)  # type: ignore[arg-type]
+
+            asyncio.create_task(runner())
+            while True:
+                item = await queue.get()
+                if item is done:
+                    break
+                yield item
+
+        return EventSourceResponse(stream())
+
+    # ---- chats (multiple conversations, each with history + memory) --------
+    @app.get("/api/chats")
+    async def api_chats() -> list[dict[str, Any]]:
+        return services.list_chats(state.settings, frontend="web")
+
+    @app.post("/api/chats")
+    async def api_create_chat(payload: dict[str, Any]) -> JSONResponse:
+        title = str(payload.get("title") or "").strip() or None
+        chat_id = services.create_chat(state.settings, title=title, frontend="web")
+        return JSONResponse({"id": chat_id, "title": title or "New chat"})
+
+    @app.get("/api/chats/{chat_id}")
+    async def api_chat_detail(chat_id: str) -> JSONResponse:
+        chat = services.get_chat(state.settings, chat_id, repo=state.repo_path)
+        if chat is None:
+            return JSONResponse({"error": "chat not found"}, status_code=404)
+        return JSONResponse(chat)
+
+    @app.patch("/api/chats/{chat_id}")
+    async def api_rename_chat(chat_id: str, payload: dict[str, Any]) -> JSONResponse:
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return JSONResponse({"error": "empty title"}, status_code=400)
+        if not services.rename_chat(state.settings, chat_id, title):
+            return JSONResponse({"error": "chat not found"}, status_code=404)
+        return JSONResponse({"ok": True, "id": chat_id, "title": title})
+
+    @app.delete("/api/chats/{chat_id}")
+    async def api_delete_chat(chat_id: str) -> JSONResponse:
+        if not services.delete_chat(state.settings, chat_id):
+            return JSONResponse({"error": "chat not found"}, status_code=404)
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/chats/{chat_id}/messages")
+    async def api_chat_message(chat_id: str, payload: dict[str, Any]) -> Response:
+        """Stream one turn inside an existing chat (persisted transcript)."""
+        db = services.open_db(state.settings)
+        if db.get_session(chat_id) is None:
+            return _error_response_not_found()
+        text = str(payload.get("text", "")).strip()
+        profile = payload.get("profile")
+        if not text:
+            return EventSourceResponse(_error_event("empty text"))
+
+        async def stream() -> AsyncIterator[dict[str, Any]]:
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            done = object()
+
+            def on_token(tok: str) -> None:
+                queue.put_nowait({"event": "token", "data": json.dumps({"text": tok})})
+
+            def on_tool(name: str, args: dict[str, Any]) -> None:
+                queue.put_nowait({"event": "tool", "data": json.dumps({"name": name, "args": _trim(args)})})
+
+            def on_tool_result(name: str, args: dict[str, Any], result: str) -> None:
+                queue.put_nowait({
+                    "event": "tool_result",
+                    "data": json.dumps({"name": name, "snippet": result[:200]}),
+                })
+
+            def on_usage(usage: dict[str, Any]) -> None:
+                queue.put_nowait({"event": "usage", "data": json.dumps(usage)})
+
+            async def runner() -> None:
+                try:
+                    result, cid = await services.run_chat_turn(
+                        text, state.settings, profile, chat_id,
+                        frontend_name="web",
+                        callbacks=Callbacks(on_token=on_token, on_tool=on_tool,
+                                            on_tool_result=on_tool_result,
+                                            on_usage=on_usage, stream=True),
+                        repo=state.repo_path,
+                        llm_factory=state.llm_factory,
+                    )
+                    await queue.put({
+                        "event": "done",
+                        "data": json.dumps({"answer": result.answer, "usage": result.usage,
+                                            "chat_id": cid}),
                     })
                 except Exception as exc:  # noqa: BLE001 - surface to the client
                     await queue.put({"event": "error", "data": json.dumps({"message": str(exc)})})
@@ -269,14 +419,14 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
         if replay_only:
             # Finite: drain the replayed events and end the response.
-            async def gen() -> AsyncIterator[dict[str, Any]]:
+            async def replay_gen() -> AsyncIterator[dict[str, Any]]:
                 while not queue.empty():
                     yield queue.get_nowait()
-            return EventSourceResponse(gen())
+            return EventSourceResponse(replay_gen())
 
         state.stream_events.setdefault("cycle", {})[sub_id] = queue
 
-        async def gen() -> AsyncIterator[dict[str, Any]]:
+        async def live_gen() -> AsyncIterator[dict[str, Any]]:
             try:
                 while True:
                     if await request.is_disconnected():
@@ -290,7 +440,19 @@ def create_app(state: AppState | None = None) -> FastAPI:
             finally:
                 state.stream_events.get("cycle", {}).pop(sub_id, None)
 
-        return EventSourceResponse(gen())
+        return EventSourceResponse(live_gen())
+
+    @app.get("/api/cycles/list")
+    async def api_cycles_list() -> list[dict[str, Any]]:
+        """Full self-improvement cycle history (steps + open review links)."""
+        return services.list_cycles(state.settings)
+
+    @app.get("/api/cycles/{cycle_id}")
+    async def api_cycle_detail(cycle_id: str) -> JSONResponse:
+        detail = services.get_cycle_detail(state.settings, cycle_id)
+        if detail is None:
+            return JSONResponse({"error": "cycle not found"}, status_code=404)
+        return JSONResponse(detail)
 
     @app.get("/api/cycles")
     async def api_cycles() -> list[dict[str, Any]]:
@@ -366,6 +528,10 @@ def _trim(args: dict[str, Any]) -> dict[str, Any]:
 
 async def _error_event(message: str) -> AsyncIterator[dict[str, Any]]:
     yield {"event": "error", "data": json.dumps({"message": message})}
+
+
+def _error_response_not_found() -> JSONResponse:
+    return JSONResponse({"error": "chat not found"}, status_code=404)
 
 
 def launch(host: str | None = None, port: int | None = None) -> None:

@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Nelke — Cycle {{ cycle.id }}{% endblock %}
+{% block content %}
+<section class="cycle-detail">
+  <p><a href="/cycles">← all cycles</a></p>
+  {% if cycle %}
+  <h1>{{ cycle.objective or "(no objective)" }}</h1>
+  <p class="meta">
+    <strong>id:</strong> {{ cycle.id }} ·
+    <strong>status:</strong> <span class="badge badge-{{ cycle.status }}">{{ cycle.status }}</span>
+  </p>
+  <p class="meta"><strong>branch:</strong> {{ cycle.branch }}</p>
+  <p class="meta">
+    {% if cycle.ai_verdict %}<strong>AI:</strong> {{ cycle.ai_verdict }}{% endif %}
+    {% if cycle.human_verdict %}<strong>human:</strong> {{ cycle.human_verdict }}{% endif %}
+    {% if cycle.started_at %}· started {{ cycle.started_at }}{% endif %}
+    {% if cycle.ended_at %}· ended {{ cycle.ended_at }}{% endif %}
+  </p>
+
+  {% if cycle.reviews %}
+  <h2>Reviews</h2>
+  <ul class="review-list">
+    {% for r in cycle.reviews %}
+      <li>
+        {{ r.kind }} · {{ r.verdict }}
+        {% if r.kind == 'human' and r.verdict == 'pending' %}
+          <a href="/review/{{ r.id }}">review →</a>
+        {% endif %}
+        {% if r.comments %}<pre class="comments">{{ r.comments }}</pre>{% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if cycle.steps %}
+  <h2>Steps</h2>
+  <ul class="cycle-list">
+    {% for s in cycle.steps %}
+      <li class="cycle-item">
+        <span class="badge badge-{{ s.status }}">step {{ s.step }} · {{ s.status }}</span>
+        <span class="cycle-meta">{{ s.summary or "" }}
+          {% if s.commit_sha %}· commit {{ s.commit_sha }}{% endif %}
+        </span>
+      </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if cycle.events %}
+  <h2>Timeline</h2>
+  <div class="log">
+    {% for ev in cycle.events %}{% set p = ev.payload %}
+      <div class="ev ev-{{ ev.kind }}">
+        {{ ev.kind }}{% if ev.message %}: {{ ev.message }}{% endif %}
+        {% if p.get('verdict') %} · verdict {{ p.get('verdict') }}{% endif %}
+        {% if p.get('step') %} · step {{ p.get('step') }}{% endif %}
+        {% if p.get('sha') %} · {{ p.get('sha') }}{% endif %}
+        {% if p.get('tool') %} · 🔧 {{ p.get('tool') }}{% endif %}
+      </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+  {% else %}
+  <h1>Cycle not found</h1>
+  <p>No cycle matches that id.</p>
+  {% endif %}
+</section>
+{% endblock %}

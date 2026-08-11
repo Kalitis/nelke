@@ -19,6 +19,7 @@ from nelke.core.tools.registry import ToolRegistry
 TokenHandler = Callable[[str], Any] | None
 ToolHandler = Callable[[str, dict[str, Any]], Any] | None
 ToolResultHandler = Callable[[str, dict[str, Any], str], Any] | None
+UsageHandler = Callable[[dict[str, Any]], Any] | None
 DegradedHandler = Callable[[DegradationReport], Any] | None
 
 _EMPTY_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
@@ -48,6 +49,7 @@ class Agent:
         on_token: TokenHandler = None,
         on_tool: ToolHandler = None,
         on_tool_result: ToolResultHandler = None,
+        on_usage: UsageHandler = None,
         on_degraded: DegradedHandler = None,
         degrade_error_threshold: int = 3,
         temperature: float | None = None,
@@ -62,6 +64,7 @@ class Agent:
         self.on_token = on_token
         self.on_tool = on_tool
         self.on_tool_result = on_tool_result
+        self.on_usage = on_usage
         self.on_degraded = on_degraded
         self.degrade_error_threshold = degrade_error_threshold
         self.temperature = temperature
@@ -114,6 +117,7 @@ class Agent:
                 temperature=self.temperature,
             )
             self._merge_usage(resp.usage)
+            self._notify_usage(resp.usage)
             if not resp.tool_calls:
                 msgs.append({"role": "assistant", "content": resp.content or ""})
                 answer = (resp.content or "").strip()
@@ -149,6 +153,14 @@ class Agent:
             return
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             self._usage[key] += int(usage.get(key, 0) or 0)
+
+    def _notify_usage(self, usage: dict[str, Any] | None) -> None:
+        """Report a single LLM call's usage as soon as it is available."""
+        if self.on_usage is None:
+            return
+        if not usage or not usage.get("total_tokens"):
+            return
+        self.on_usage(dict(usage))
 
     async def _execute_tool(self, tc: ToolCall) -> ToolResult:
         if self.on_tool is not None:
@@ -209,6 +221,7 @@ def make_agent(
     on_token: TokenHandler = None,
     on_tool: ToolHandler = None,
     on_tool_result: ToolResultHandler = None,
+    on_usage: UsageHandler = None,
     on_degraded: DegradedHandler = None,
     degrade_error_threshold: int = 3,
     stream: bool = False,
@@ -268,6 +281,7 @@ def make_agent(
         on_token=on_token,
         on_tool=on_tool,
         on_tool_result=on_tool_result,
+        on_usage=on_usage,
         on_degraded=on_degraded,
         degrade_error_threshold=degrade_error_threshold,
         memory_index=memory_index,

@@ -99,6 +99,7 @@ class AnswerStream:
         self.buffer: list[str] = []
         self.tools: list[str] = []
         self.results: list[str] = []
+        self.usage_total: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
         self._live: Live | None = None
 
     def start(self) -> None:
@@ -127,8 +128,23 @@ class AnswerStream:
         self.results.append(f"[dim]=> {name}: {snippet}[/]")
         self._update()
 
+    def on_usage(self, usage: dict[str, Any]) -> None:
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            self.usage_total[key] += int(usage.get(key, 0) or 0)
+        self.usage_total["calls"] += 1
+        self._update()
+
     def _render(self) -> Group:
         parts: list[Any] = []
+        if self.usage_total.get("total_tokens"):
+            usage = self.usage_total
+            parts.append(
+                Text(
+                    f"tokens: {usage['total_tokens']}"
+                    f" ({usage['calls']} call{'s' if usage['calls'] != 1 else ''})",
+                    style="dim",
+                )
+            )
         if self.tools:
             parts.append(Text(" -> " + " ".join(f"[cyan]{t}[/]" for t in self.tools), style="dim"))
         if self.results:
@@ -193,6 +209,22 @@ def _build_session_agent(settings: Settings, profile: str | None, stream: Answer
             web_timeout=settings.web_timeout,
         )
 
+    # Persist each LLM call's usage as it happens, then forward to the stream so
+    # the live panel and the DB both stay in sync in real time.
+    user_on_usage = stream.on_usage if stream else None
+
+    def on_usage(usage: dict[str, Any]) -> None:
+        try:
+            if usage.get("total_tokens"):
+                db.add_usage(usage, session_id=session_id)
+        except Exception:  # noqa: BLE001 - persistence must never break the run
+            pass
+        if user_on_usage is not None:
+            try:
+                user_on_usage(usage)
+            except Exception:  # noqa: BLE001 - rendering must never break the run
+                pass
+
     agent = make_agent(
         workspace=workspace,
         llm=llm,
@@ -204,6 +236,7 @@ def _build_session_agent(settings: Settings, profile: str | None, stream: Answer
         on_token=stream.on_token if stream else None,
         on_tool=stream.on_tool if stream else None,
         on_tool_result=stream.on_tool_result if stream else None,
+        on_usage=on_usage,
         on_degraded=on_degraded,
         stream=bool(stream),
         iteration_cap=settings.max_agent_iterations,
@@ -239,8 +272,6 @@ def run_task(text: str, *, profile: str | None = None, interactive: bool = False
         db.end_session(session_id)
         _fatal(f"agent failed: {exc}")
     db.end_session(session_id)
-    if result.usage.get("total_tokens"):
-        db.add_usage(result.usage, session_id=session_id)
 
     if interactive:
         if stream is not None:
@@ -301,6 +332,7 @@ class ImproveStream:
         self.rows: list[tuple[str, str]] = []
         self.gate_block: str = ""
         self.tool_lines: list[str] = []
+        self.usage_total: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
         self._live: Live | None = None
         self._progress = Progress(TextColumn("[progress.description]{task.description}"),
                                   BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"))
@@ -315,6 +347,13 @@ class ImproveStream:
         self._update()
 
     def __call__(self, event: Any) -> None:
+        if event.kind == "usage":
+            payload = event.data or {}
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                self.usage_total[key] += int(payload.get(key, 0) or 0)
+            self.usage_total["calls"] += 1
+            self._update()
+            return
         label = self._LABELS.get(event.kind, event.kind)
         self.rows.append((label, str(event.message or "")))
         if event.kind == "gate":
@@ -360,6 +399,16 @@ class ImproveStream:
         parts: list[Any] = [Text(f"objective: {self.objective[:80]}", style="bold")]
         if self._total_steps:
             parts.append(self._progress)
+        if self.usage_total.get("total_tokens"):
+            usage = self.usage_total
+            parts.append(
+                Text(
+                    f"tokens: {usage['total_tokens']} (prompt {usage['prompt_tokens']} "
+                    f"+ completion {usage['completion_tokens']}) · "
+                    f"{usage['calls']} call{'s' if usage['calls'] != 1 else ''}",
+                    style="dim",
+                )
+            )
         if self.tool_lines:
             parts.append(Group(*[Text(line, overflow="ellipsis") for line in self.tool_lines]))
         recent = self.rows[-14:]
@@ -625,6 +674,25 @@ def db_status() -> None:
     for name, count in counts.items():
         table.add_row(name, str(count))
     console.print(table)
+
+
+def db_cleanup() -> None:
+    """Mark abandoned ``running`` cycles as ``stuck``; print what changed."""
+    from nelke.core.services import reconcile_stale_cycles
+
+    settings = open_settings()
+    marked = reconcile_stale_cycles(settings)
+    table = Table(title="Reconciled stale cycles", box=box.SIMPLE)
+    table.add_column("cycle")
+    table.add_column("branch")
+    table.add_column("reason")
+    if not marked:
+        console.print("[green]No stale running cycles found.[/]")
+        return
+    for m in marked:
+        table.add_row(m["id"], m["branch"], m["reason"])
+    console.print(table)
+    console.print(f"[yellow]marked {len(marked)} cycle(s) as stuck[/]")
 
 
 def doctor() -> None:

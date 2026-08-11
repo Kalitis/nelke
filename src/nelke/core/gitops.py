@@ -106,6 +106,18 @@ class GitRepo:
         result = self._run("rev-parse", "--verify", "--quiet", f"refs/heads/{name}")
         return result.ok
 
+    def ahead_counts(self, base: str, branch: str) -> int:
+        """Number of commits on ``branch`` not reachable from ``base``.
+
+        Used to detect stuck cycles: a ``running`` cycle whose branch carries no
+        commits ahead of ``main`` can never have produced a mergeable result, so
+        it is a stuck/failed run rather than an in-progress one.
+        """
+        result = self._run("rev-list", "--count", f"{base}..{branch}")
+        if not result.ok or not result.stdout.strip().isdigit():
+            return 0
+        return int(result.stdout.strip())
+
     # Staging & commit
     def add_all(self, paths: list[str] | None = None) -> GitResult:
         return self._run("add", "--", *(paths or ["."]), check=True)

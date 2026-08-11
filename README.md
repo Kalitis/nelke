@@ -50,6 +50,16 @@ review modal. The Telegram bot edits messages as the answer streams and sends
 inline ✅/❌ buttons for the human gate. All resolve the same `review_requests`
 row — the first frontend to resolve wins.
 
+### Chats and cycles history
+
+Both the web and TUI frontends manage **multiple named chats**: each chat keeps
+its own persisted transcript (in SQLite `sessions`/`messages`, including tool
+calls) and its own per-chat memory store (`memory/chats/<session_id>/`) that the
+agent reads via `recall`/writes via `memory_write`. Opening a chat reloads its
+history so conversations continue across restarts. Self-improvement **cycles**
+live in a separate view — the web `/cycles` page and the TUI "Improve" tab list
+every cycle with its steps, timeline events and review links.
+
 Telegram needs `NELKE_TELEGRAM_TOKEN` in `~/.nelke/.env` (see `.env.example`);
 web host/port come from `NELKE_WEB_HOST`/`NELKE_WEB_PORT`. If api.telegram.org
 is blocked from your network, set `NELKE_TELEGRAM_PROXY` to your local proxy
@@ -73,12 +83,12 @@ src/nelke/
 │   ├── gitops.py      # git wrappers (subprocess)
 │   └── db.py          # SQLite: sessions, cycles, steps, review_requests
 ├── frontends/
-│   ├── cli.py         # CLI (Typer + Rich)
-│   ├── web.py         # FastAPI + Jinja2 + SSE
-│   ├── tui.py         # Textual TUI
+│   ├── cli.py          # CLI (Typer + Rich)
+│   ├── web.py          # FastAPI + Jinja2 + SSE
+│   ├── tui.py          # Textual TUI
 │   └── telegram_bot.py # aiogram Telegram bot
-├── templates/         # Jinja2 templates (web)
-└── static/            # CSS/JS (web)
+├── templates/          # Jinja2 templates (web) — single source of truth
+└── static/             # CSS/JS (web)
 ```
 
 ## Self-improvement cycle

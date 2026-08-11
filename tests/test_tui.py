@@ -34,6 +34,19 @@ def test_stream_sink_collects_tokens_and_tools():
     assert "the answer is 42" in sink.results[0]
 
 
+def test_stream_sink_accumulates_live_usage():
+    from nelke.frontends.tui import StreamSink, build_tui_callbacks
+
+    sink = StreamSink()
+    callbacks = build_tui_callbacks(sink)
+    assert callbacks.on_usage is not None
+    callbacks.on_usage({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+    callbacks.on_usage({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+    total = sink.usage_total
+    assert total["total_tokens"] == 7
+    assert total["calls"] == 2
+
+
 async def test_callbacks_propagate_from_agent_run(tmp_path):
     """An agent driven by a FakeLLM feeds the sink through the callbacks."""
     from nelke.core.agent import Agent
@@ -143,3 +156,73 @@ async def test_memory_tab_lists_files(settings, tmp_repo):
         # one item rendered
         items = list(lv.children)
         assert items, "expected the alpha.md item in the memory list"
+
+
+# --------------------------------------------------------------------------- #
+# Chat list / new chat / persistence
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_chat_tab_has_chat_list_and_new_chat(settings, tmp_repo):
+    from textual.widgets import Button, ListView
+
+    from nelke.frontends.tui import AppStateData, NelkeTUI
+
+    app = NelkeTUI(state=AppStateData(settings=settings, repo_path=tmp_repo.repo))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert isinstance(app.query_one("#chat-list"), ListView)
+        assert isinstance(app.query_one("#chat-new"), Button)
+        assert app.query_one("#cycle-list") is not None
+
+
+@pytest.mark.asyncio
+async def test_chat_submit_creates_chat_and_persists_history(settings, tmp_repo):
+    from nelke.frontends.tui import AppStateData, NelkeTUI
+
+    def factory(_profile):
+        class _LLM:
+            async def chat(self, messages, *, tools=None, stream=False, on_token=None, **_kw):
+                if stream and on_token:
+                    on_token("hi back")
+                return LLMResponse(
+                    content="hi back",
+                    usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                )
+
+        return _LLM()
+
+    app = NelkeTUI(state=AppStateData(
+        settings=settings, llm_factory=factory, repo_path=tmp_repo.repo,
+    ))
+    async with app.run_test() as pilot:
+        chat_input = app.query_one("#chat-input")
+        chat_input.value = "hello"
+        from textual.widgets import Input
+
+        chat_input.post_message(Input.Submitted(chat_input, "hello"))
+        await pilot.pause(delay=0.3)
+        await pilot.pause(delay=0.3)
+
+        # a chat was created and persisted
+        assert app._active_chat
+        messages = services.get_chat_messages(settings, app._active_chat)
+        assert [m["role"] for m in messages] == ["user", "assistant"]
+        assert messages[0]["content"] == "hello"
+        # chat list was refreshed
+        lv = app.query_one("#chat-list")
+        assert list(lv.children)
+
+
+@pytest.mark.asyncio
+async def test_new_chat_button_creates_empty_chat(settings, tmp_repo):
+    from textual.widgets import Button
+
+    from nelke.frontends.tui import AppStateData, NelkeTUI
+
+    app = NelkeTUI(state=AppStateData(settings=settings, repo_path=tmp_repo.repo))
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.query_one("#chat-new", Button).press()
+        await pilot.pause()
+        assert app._active_chat
+        assert services.get_chat_messages(settings, app._active_chat) == []

@@ -22,3 +22,5 @@ Thumbs.db
 
 # ZCode internal artifacts
 .zcode/
+gui-test-screenshots/
+node_modules/

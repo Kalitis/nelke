@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Nelke — Cycles{% endblock %}
+{% block content %}
+<section class="cycles">
+  <h1>Self-improvement cycles</h1>
+  {% if cycles %}
+  <ul class="cycle-list">
+    {% for c in cycles %}
+      <li class="cycle-item">
+        <a class="cycle-item-main" href="/cycles/{{ c.id }}">
+          <span class="cycle-objective">{{ c.objective or "(no objective)" }}</span>
+          <span class="cycle-meta">
+            {{ c.id }} · branch {{ c.branch }}
+            · {{ c.steps|length }} step{{ 's' if c.steps|length != 1 }}
+            {% if c.started_at %}· {{ c.started_at }}{% endif %}
+          </span>
+        </a>
+        <span class="badge badge-{{ c.status }}">{{ c.status }}</span>
+        <span class="cycle-verdicts">
+          {% if c.ai_verdict %}<span class="muted">AI: {{ c.ai_verdict }}</span>{% endif %}
+          {% if c.human_verdict %}<span class="muted">human: {{ c.human_verdict }}</span>{% endif %}
+        </span>
+        {% if c.human_review_id %}
+          <a class="review-link" href="/review/{{ c.human_review_id }}">open review →</a>
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No cycles yet — run one from the chat page or <code>nelke improve "&lt;objective&gt;"</code>.</p>
+  {% endif %}
+</section>
+{% endblock %}

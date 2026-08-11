@@ -24,3 +24,6 @@ Thumbs.db
 .zcode/
 gui-test-screenshots/
 node_modules/
+
+# Per-chat memory (session-scoped, not durable repo knowledge)
+memory/chats/

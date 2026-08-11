@@ -1,35 +1,52 @@
 {% extends "base.html" %}
 {% block title %}Nelke — Chat{% endblock %}
 {% block content %}
-<section class="chat">
-  <div id="transcript" class="transcript"></div>
-  <form id="chat-form" class="chat-input">
-    <select id="profile" aria-label="provider profile">
-      {% for p in profiles %}
-        <option value="{{ p.name }}">{{ p.name }} · {{ p.model }}</option>
-      {% endfor %}
-    </select>
-    <input id="chat-text" type="text" placeholder="Ask Nelke…" autocomplete="off" autofocus>
-    <button type="submit">Send</button>
-  </form>
-  <details class="improve" open>
-    <summary>Self-improvement cycle</summary>
-    <form id="improve-form">
-      <input id="improve-objective" type="text" placeholder="Objective to improve…" autocomplete="off">
-      <label><input id="improve-auto" type="checkbox"> auto-approve</label>
-      <button type="submit">Improve</button>
-    </form>
-    <div id="cycle-card" class="cycle-card">
-      <div class="cycle-card-status">
-        <span id="cycle-status" class="cycle-status">idle</span>
-        <span id="cycle-objective" class="cycle-objective"></span>
-      </div>
-      <div class="progress-track"><div id="cycle-progress" class="progress-fill" style="width:0%"></div></div>
-      <div id="cycle-thought" class="cycle-thought" aria-label="agent live output"></div>
-      <pre id="improve-log" class="log"></pre>
+<section class="chat-layout">
+  <aside class="chat-sidebar">
+    <div class="chat-sidebar-head">
+      <button id="new-chat" class="new-chat" type="button">+ New chat</button>
     </div>
-  </details>
+    <div id="chat-list" class="chat-list"></div>
+  </aside>
+  <div class="chat-main">
+    <div id="chat-title-row" class="chat-title-row">
+      <h1 id="chat-title" class="chat-title">Chats</h1>
+      <span id="live-usage" class="usage-counter" title="live token usage for this chat (persisted to the DB)">tokens: 0</span>
+      <button id="chat-rename" class="ghost" type="button" hidden>Rename</button>
+      <button id="chat-delete" class="ghost danger" type="button" hidden>Delete</button>
+    </div>
+    <div id="transcript" class="transcript"><p class="empty">Pick a chat or start a new one.</p></div>
+    <div id="chat-memory" class="chat-memory" hidden></div>
+    <form id="chat-form" class="chat-input">
+      <select id="profile" aria-label="provider profile">
+        {% for p in profiles %}
+          <option value="{{ p.name }}">{{ p.name }} · {{ p.model }}</option>
+        {% endfor %}
+      </select>
+      <input id="chat-text" type="text" placeholder="Ask Nelke…" autocomplete="off" autofocus disabled>
+      <button type="submit" disabled>Send</button>
+    </form>
+  </div>
 </section>
+<details class="improve" open>
+  <summary>Self-improvement cycle</summary>
+  <form id="improve-form">
+    <input id="improve-objective" type="text" placeholder="Objective to improve…" autocomplete="off">
+    <label><input id="improve-auto" type="checkbox"> auto-approve</label>
+    <button type="submit">Improve</button>
+  </form>
+  <p class="cycles-link"><a href="/cycles">View cycle history →</a></p>
+  <div id="cycle-card" class="cycle-card">
+    <div class="cycle-card-status">
+      <span id="cycle-status" class="cycle-status">idle</span>
+      <span id="cycle-objective" class="cycle-objective"></span>
+      <span id="cycle-usage" class="usage-counter" title="live token usage for this cycle (persisted to the DB)">tokens: 0</span>
+    </div>
+    <div class="progress-track"><div id="cycle-progress" class="progress-fill" style="width:0%"></div></div>
+    <div id="cycle-thought" class="cycle-thought" aria-label="agent live output"></div>
+    <pre id="improve-log" class="log"></pre>
+  </div>
+</details>
 {% endblock %}
 {% block scripts %}
 <script src="/static/cycle.js"></script>

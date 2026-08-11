@@ -102,6 +102,7 @@ class StreamSink:
     tokens: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     results: list[str] = field(default_factory=list)
+    usages: list[dict[str, Any]] = field(default_factory=list)
 
     def on_token(self, token: str) -> None:
         self.tokens.append(token)
@@ -113,9 +114,32 @@ class StreamSink:
         snippet = " ".join(result.split())[:160]
         self.results.append(f"=> {name}: {snippet}")
 
+    def on_usage(self, usage: dict[str, Any]) -> None:
+        self.usages.append(dict(usage))
+
+    @property
+    def usage_total(self) -> dict[str, int]:
+        totals: dict[str, int] = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": len(self.usages),
+        }
+        for u in self.usages:
+            totals["prompt_tokens"] += int(u.get("prompt_tokens", 0) or 0)
+            totals["completion_tokens"] += int(u.get("completion_tokens", 0) or 0)
+            totals["total_tokens"] += int(u.get("total_tokens", 0) or 0)
+        return totals
+
     @property
     def answer(self) -> str:
         return "".join(self.tokens)
+
+
+def _usage_text(total: dict[str, int]) -> str:
+    calls = int(total.get("calls", 0))
+    return (
+        f"tokens: {total.get('total_tokens', 0)} "
+        f"(prompt {total.get('prompt_tokens', 0)} + completion {total.get('completion_tokens', 0)})"
+        f" · {calls} call{'s' if calls != 1 else ''}"
+    )
 
 
 def _fmt_args(args: dict[str, Any]) -> str:
@@ -132,7 +156,8 @@ def build_tui_callbacks(sink: StreamSink) -> Callbacks:
     """Wire a :class:`StreamSink` into a :class:`Callbacks` for ``run_task``."""
     return Callbacks(
         on_token=sink.on_token, on_tool=sink.on_tool,
-        on_tool_result=sink.on_tool_result, stream=True,
+        on_tool_result=sink.on_tool_result, on_usage=sink.on_usage,
+        stream=True,
     )
 
 
@@ -164,6 +189,16 @@ class NelkeTUI(App):
     RichLog { border: $border; height: 1fr; }
     ProgressBar { margin: 0 0 1 0; }
     #improve-status { margin-bottom: 1; color: $text-muted; }
+    #chat-usage { margin-bottom: 1; color: $text-muted; }
+    #improve-usage { margin-bottom: 1; color: $text-muted; }
+    .tab-actions { height: auto; margin-bottom: 1; }
+    .chat-split { height: 1fr; }
+    .chat-split > ListView { width: 30; margin-right: 1; border: $border; }
+    .chat-main { width: 1fr; height: 1fr; }
+    .chat-sidemeta { color: $text-muted; }
+    #chat-new { margin-right: 1; }
+    #cycle-list { height: 8; border: $border; margin-bottom: 1; }
+    #cycle-detail { height: 1fr; }
     """
 
     BINDINGS = [
@@ -174,20 +209,35 @@ class NelkeTUI(App):
     def __init__(self, state: AppStateData | None = None) -> None:
         super().__init__()
         self.state = state or AppStateData(settings=Settings())
-        # continuity: keep the chat session across turns
-        self._chat_session: Any = None
+        # active chat session + parallel id lists for the ListView widgets
+        self._active_chat: str | None = None
+        self._chat_ids: list[str] = []
+        self._cycle_ids: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
         with TabbedContent():
             with TabPane("Chat", id="chat-tab"):
-                yield RichLog(id="chat-log", markup=True)
-                yield Input(id="chat-input", placeholder="Ask Nelke… (Enter to send)")
+                yield Horizontal(
+                    Button("+ New chat", id="chat-new", variant="primary"),
+                    Button("Refresh", id="chat-refresh"),
+                    classes="tab-actions",
+                )
+                with Horizontal(classes="chat-split"):
+                    yield ListView(id="chat-list")
+                    with Vertical(classes="chat-main"):
+                        yield RichLog(id="chat-log", markup=True)
+                        yield Static("tokens: 0", id="chat-usage")
+                        yield Input(id="chat-input", placeholder="Ask Nelke… (Enter to send)")
             with TabPane("Improve", id="improve-tab"):
                 yield Input(id="improve-input", placeholder="Objective to improve… (Enter to run)")
                 yield ProgressBar(total=100, show_eta=False, id="improve-progress")
                 yield Static("Idle — no cycle running", id="improve-status")
+                yield Static("tokens: 0", id="improve-usage")
                 yield RichLog(id="improve-log", markup=True)
+                yield Static("Cycle history — select a cycle to inspect", classes="chat-sidemeta")
+                yield ListView(id="cycle-list")
+                yield RichLog(id="cycle-detail", markup=True, classes="chat-main")
             with TabPane("Memory", id="memory-tab"):
                 yield ListView(id="memory-list")
                 yield Input(id="recall-input", placeholder="Recall query… (Enter)")
@@ -197,6 +247,8 @@ class NelkeTUI(App):
     def on_mount(self) -> None:
         self.title = "Nelke"
         self._refresh_memory()
+        self._refresh_chats()
+        self._refresh_cycles()
 
     # ---- helpers ------------------------------------------------------------
     def _ui(self, fn: Any, *args: Any, **kwargs: Any) -> None:
@@ -214,12 +266,82 @@ class NelkeTUI(App):
             self.call_from_thread(fn, *args, **kwargs)
 
     # ---- Chat ---------------------------------------------------------------
+    @on(Button.Pressed, "#chat-new")
+    def _on_chat_new(self) -> None:
+        chat_id = services.create_chat(self.state.settings, frontend="tui")
+        self._active_chat = chat_id
+        self._refresh_chats(select_id=chat_id)
+        log = self._query_one_log("chat-log")
+        log.clear()
+        log.write("[dim]new chat — say hi.[/]")
+        self.query_one("#chat-input", Input).focus()
+
+    @on(Button.Pressed, "#chat-refresh")
+    def _on_chat_refresh(self) -> None:
+        self._refresh_chats()
+        if self._active_chat:
+            chat = services.get_chat(self.state.settings, self._active_chat, repo=self.state.repo_path)
+            if chat:
+                self._render_chat_history(chat["messages"], clear=True)
+
+    @on(ListView.Selected, "#chat-list")
+    def _on_chat_select(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self._chat_ids):
+            self._active_chat = self._chat_ids[idx]
+            self._load_chat_into_log(self._active_chat)
+
+    def _refresh_chats(self, select_id: str | None = None) -> None:
+        try:
+            chats = services.list_chats(self.state.settings, frontend="tui")
+        except Exception:  # noqa: BLE001 - chat list is best-effort
+            return
+        lv = self.query_one("#chat-list", ListView)
+        lv.clear()
+        self._chat_ids = []
+        for c in chats:
+            self._chat_ids.append(c["id"])
+            lv.append(ListItem(Static(f"{c['title']}  ({c['message_count']})")))
+        if select_id and select_id in self._chat_ids:
+            lv.index = self._chat_ids.index(select_id)
+
+    def _load_chat_into_log(self, chat_id: str) -> None:
+        log = self._query_one_log("chat-log")
+        log.clear()
+        chat = services.get_chat(self.state.settings, chat_id, repo=self.state.repo_path)
+        if chat is None:
+            log.write("[bold red]chat not found[/]")
+            return
+        log.write(f"[bold]chat:[/] {chat['title']}  [dim]{chat['id']}[/]")
+        if chat.get("memory"):
+            log.write(f"[dim]chat memory: {', '.join(m['name'] for m in chat['memory'][:8])}[/]")
+        self._render_chat_history(chat["messages"], clear=False)
+
+    def _render_chat_history(self, messages: list[dict[str, Any]], clear: bool = True) -> None:
+        log = self._query_one_log("chat-log")
+        if clear:
+            log.clear()
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content") or ""
+            if role == "user":
+                log.write(f"[bold cyan]you:[/] {content}")
+            elif role == "assistant":
+                log.write(f"[green]nelke:[/] {content or '(no answer)'}")
+            elif role == "tool":
+                log.write(f"[dim]  ↳ tool: {content[:120]}[/]")
+        if not messages:
+            log.write("[dim]no messages yet — say hi.[/]")
+
     @on(Input.Submitted, "#chat-input")
     def _on_chat_submit(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         if not text:
             return
         event.input.value = ""
+        if not self._active_chat:
+            self._active_chat = services.create_chat(self.state.settings, frontend="tui")
+            self._refresh_chats(select_id=self._active_chat)
         self._query_one_log("chat-log").write(f"[bold cyan]you:[/] {text}")
         self._run_chat(text)
 
@@ -227,11 +349,23 @@ class NelkeTUI(App):
     async def _run_chat(self, text: str) -> None:
         sink = StreamSink()
         log = self._query_one_log("chat-log")
+        usage_widget = self.query_one("#chat-usage", Static)
+        chat_id = self._active_chat
+        if chat_id is None:
+            chat_id = services.create_chat(self.state.settings, frontend="tui")
+            self._active_chat = chat_id
+        callbacks = build_tui_callbacks(sink)
+
+        def on_usage(usage: dict[str, Any]) -> None:
+            sink.on_usage(usage)
+            self._ui(usage_widget.update, _usage_text(sink.usage_total))
+
+        callbacks.on_usage = on_usage
         try:
-            result, _session_id = await services.run_task(
-                text, self.state.settings, self.state.profile,
+            result, _chat_id = await services.run_chat_turn(
+                text, self.state.settings, self.state.profile, chat_id,
                 frontend_name="tui",
-                callbacks=build_tui_callbacks(sink),
+                callbacks=callbacks,
                 repo=self.state.repo_path,
                 llm_factory=self.state.llm_factory or services._llm_factory_default,
             )
@@ -240,12 +374,8 @@ class NelkeTUI(App):
             return
         # drain the sink onto the log
         self._ui(self._render_sink, log, sink)
-        usage = result.usage
-        if usage.get("total_tokens"):
-            self._ui(
-                log.write,
-                f"[dim]tokens: {usage.get('total_tokens', 0)} ({usage.get('calls', 0)} calls)[/]",
-            )
+        self._ui(usage_widget.update, _usage_text(sink.usage_total))
+        self._ui(self._refresh_chats)
 
     def _render_sink(self, log: RichLog, sink: StreamSink) -> None:
         for tool in sink.tools:
@@ -270,9 +400,18 @@ class NelkeTUI(App):
         log = self._query_one_log("improve-log")
         progress = self.query_one("#improve-progress", ProgressBar)
         status = self.query_one("#improve-status", Static)
+        usage_widget = self.query_one("#improve-usage", Static)
+        cycle_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
         self._ui(progress.update, 0)
+        self._ui(usage_widget.update, "tokens: 0")
 
         def on_event(event: Any) -> None:
+            if event.kind == "usage":
+                data = event.data or {}
+                cycle_usage["total_tokens"] += int(data.get("total_tokens", 0) or 0)
+                cycle_usage["calls"] += 1
+                self._ui(usage_widget.update, _usage_text(cycle_usage))
+                return
             self._ui(log.write, f"[dim]{event.kind}:[/] {event.message}")
             if event.kind in {"commit", "gate"} and event.step is not None and event.data.get("total_steps"):
                 pct = min(100, int(event.step / event.data["total_steps"] * 100))
@@ -324,6 +463,44 @@ class NelkeTUI(App):
             log.write,
             f"[bold]cycle {result.status}[/] branch={result.branch} steps={result.steps}",
         )
+        self._ui(self._refresh_cycles)
+
+    # ---- Cycle history ------------------------------------------------------
+    def _refresh_cycles(self) -> None:
+        try:
+            cycles = services.list_cycles(self.state.settings)
+        except Exception:  # noqa: BLE001 - history is best-effort
+            return
+        lv = self.query_one("#cycle-list", ListView)
+        lv.clear()
+        self._cycle_ids = []
+        for c in cycles:
+            self._cycle_ids.append(c["id"])
+            objective = (c.get("objective") or "")[:40] or c["id"]
+            lv.append(ListItem(Static(f"[{c['status']}] {objective}")))
+
+    @on(ListView.Selected, "#cycle-list")
+    def _on_cycle_select(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is None or not (0 <= idx < len(self._cycle_ids)):
+            return
+        detail = services.get_cycle_detail(self.state.settings, self._cycle_ids[idx])
+        detail_log = self.query_one("#cycle-detail", RichLog)
+        detail_log.clear()
+        if detail is None:
+            detail_log.write("[dim]cycle not found[/]")
+            return
+        detail_log.write(f"[bold]{detail['objective'] or '(no objective)'}[/]  [dim]{detail['id']}[/]")
+        detail_log.write(
+            f"status: {detail['status']}  ai={detail['ai_verdict']}  "
+            f"human={detail['human_verdict']}  branch={detail['branch']}"
+        )
+        for step in detail["steps"]:
+            detail_log.write(
+                f"  [dim]step {step['step']}[/] {step['status']}  {str(step['summary'] or '')[:80]}"
+            )
+        for ev in detail["events"]:
+            detail_log.write(f"[dim]{ev['kind']}:[/] {ev['message'] or ''}")
 
     # ---- Memory -------------------------------------------------------------
     def _refresh_memory(self) -> None:

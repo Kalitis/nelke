@@ -41,6 +41,14 @@
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  // Live cycle token usage (per-call usage_events persisted to the DB).
+  var usageTokens = 0;
+  function resetUsageTokens() { usageTokens = 0; updateUsageLabel(); }
+  function updateUsageLabel() {
+    var el_ = el("cycle-usage");
+    if (el_) el_.textContent = "tokens: " + usageTokens;
+  }
+
   // ---- Event rendering ---------------------------------------------------
   function render(ev) {
     var kind = ev.kind;
@@ -49,7 +57,11 @@
     if (kind === "cycle_start") {
       statusEl.textContent = "running";
       objectiveEl.textContent = ev.payload && ev.payload.objective ? ev.payload.objective : msg;
+      resetUsageTokens();
       appendLine("cycle started — " + msg);
+    } else if (kind === "usage") {
+      usageTokens += payload.total_tokens || 0;
+      updateUsageLabel();
     } else if (kind === "step_start") {
       statusEl.textContent = "step " + (payload.step || "");
       appendLine("—— step " + payload.step + " ——");

@@ -64,6 +64,69 @@ details summary { cursor: pointer; color: var(--muted); }
 }
 .cycle-thought:empty { display: none; }
 
+/* ---- chat layout (sidebar + conversation) ---- */
+.chat-layout { display: grid; grid-template-columns: 280px 1fr; gap: 1rem; align-items: start; }
+.chat-sidebar {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.75rem; max-height: 70vh; overflow: auto;
+}
+.chat-sidebar-head { margin-bottom: 0.5rem; }
+.new-chat { width: 100%; }
+.chat-list { display: flex; flex-direction: column; gap: 0.25rem; }
+.chat-item {
+  display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+  width: 100%; text-align: left; background: transparent; border-color: transparent;
+}
+.chat-item:hover { background: var(--bg); }
+.chat-item.active { background: var(--bg); border-color: var(--accent); }
+.chat-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-item-count { color: var(--muted); font-size: 0.8em; flex: none; }
+.chat-main { min-width: 0; }
+.chat-title-row { display: flex; align-items: center; gap: 0.75rem; margin: 0 0 0.5rem 0; }
+.chat-title { margin: 0; font-size: 1.25rem; }
+.usage-counter { color: var(--muted); font-size: 0.85em; font-variant-numeric: tabular-nums; margin-left: auto; }
+button.ghost { background: transparent; border-color: var(--border); padding: 0.25rem 0.6rem; font-size: 0.85rem; }
+button.ghost.danger:hover { border-color: var(--err); color: var(--err); }
+.user-line { color: var(--accent); margin-bottom: 0.35rem; }
+.user-line::before { content: "you: "; }
+.answer { margin: 0 0 0.75rem 0; }
+.transcript .answer { color: var(--fg); }
+.chat-memory {
+  background: var(--panel); border: 1px dashed var(--border); border-radius: 6px;
+  padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; font-size: 0.85em;
+}
+.memory-head { color: var(--muted); font-weight: 700; margin-bottom: 0.25rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.memory-entry { color: var(--muted); }
+.cycles-link { margin: 0.25rem 0 0 0; font-size: 0.9em; }
+
+/* ---- cycles history pages ---- */
+.cycle-list { list-style: none; padding: 0; margin: 0; }
+.cycle-item {
+  display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+  padding: 0.6rem 0; border-bottom: 1px solid var(--border);
+}
+.cycle-item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
+.cycle-objective { color: var(--fg); }
+.cycle-meta { color: var(--muted); font-size: 0.85em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cycle-verdicts { display: flex; gap: 0.5rem; }
+.review-link { font-size: 0.9em; }
+.badge {
+  font-size: 0.75em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+  padding: 0.15rem 0.5rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted);
+  flex: none;
+}
+.badge-running, .badge-awaiting-human { color: var(--accent); border-color: var(--accent); }
+.badge-merged { color: var(--ok); border-color: var(--ok); }
+.badge-rejected, .badge-failed-gate, .badge-merge-conflict, .badge-cycle_error { color: var(--err); border-color: var(--err); }
+.cycle-detail h2 { margin: 1.25rem 0 0.25rem 0; font-size: 1.05rem; }
+.cycle-detail .meta { margin: 0.25rem 0; }
+.review-list { list-style: none; padding: 0; }
+.review-list pre.comments { white-space: pre-wrap; }
+.ev { font-size: 0.85em; margin: 0.1rem 0; }
+.ev-merged, .ev-step_ok { color: var(--ok); }
+.ev-cycle_error, .ev-human_rejected, .ev-boot_check_failed { color: var(--err); }
+.ev-agent_tool { color: var(--muted); }
+
 .memory-list { list-style: none; padding: 0; }
 .memory-list li { padding: 0.4rem 0; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; }
 .memory-list .size { color: var(--muted); }

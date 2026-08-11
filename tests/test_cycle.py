@@ -29,6 +29,20 @@ def _good_fix_plan():
     ]
 
 
+def _usage_resp(resp, total: int = 2):
+    """Attach usage to a scripted LLM response (defaults to total=2 tokens)."""
+    from dataclasses import replace
+
+    return replace(
+        resp,
+        usage={
+            "prompt_tokens": total,
+            "completion_tokens": total,
+            "total_tokens": total,
+        },
+    )
+
+
 async def test_cycle_merge_into_main(tmp_repo, db):
     events = []
     llm = driver_fake(worker=_scripted_worker(_good_fix_plan()))
@@ -204,9 +218,15 @@ def test_cli_review_reject_keeps_branch(tmp_repo, db):
 
 
 async def test_cycle_records_progress_events(tmp_repo, db):
-    """Cycle events (incl. worker tool activity) are persisted with seq order."""
+    """Cycle events (incl. worker tool activity + live usage) are persisted."""
     events = []
-    llm = driver_fake(worker=_scripted_worker(_good_fix_plan()))
+    worker = [
+        _usage_resp(tool_response("self_write", {"path": "memory/facts/work.md", "content": "# Work\n\ndone"})),
+        _usage_resp(final_response("step done")),
+        _usage_resp(tool_response("propose_cycle_complete", {})),
+        _usage_resp(final_response("complete")),
+    ]
+    llm = driver_fake(worker=_scripted_worker(worker))
     engine = _engine(tmp_repo, db, FakeGovernance(), llm, on_event=lambda e: events.append(e.kind))
     result = await engine.run("add a memory lesson")
     assert result.merged
@@ -218,6 +238,10 @@ async def test_cycle_records_progress_events(tmp_repo, db):
     # the cycle-worker streams its tokens (stream=True) -> agent_token events
     # are emitted, giving the web/TUI/CLI a live view of the agent's reply.
     assert "agent_token" in kinds
+    # per-call usage is emitted + persisted to usage_events in real time
+    assert "usage" in kinds
+    usage_events = db.list_usage(cycle_id=result.cycle_id)
+    assert any(u["total_tokens"] > 0 for u in usage_events)
     # seq strictly ordered
     seqs = [r["seq"] for r in rows]
     assert seqs == sorted(seqs)

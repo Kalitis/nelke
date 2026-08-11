@@ -146,6 +146,12 @@ def db_status() -> None:
     cli.db_status()
 
 
+@db_app.command("cleanup")
+def db_cleanup() -> None:
+    """Mark abandoned running cycles as stuck/failed."""
+    cli.db_cleanup()
+
+
 app.add_typer(db_app, name="db")
 
 
@@ -165,7 +171,9 @@ def web(
 ) -> None:
     """Launch the web frontend (FastAPI + SSE)."""
     from nelke.frontends import web as web_frontend
+    from nelke.frontends.telegram_bot import start_companion as telegram_companion
 
+    telegram_companion()
     web_frontend.launch(host=host, port=port)
 
 
@@ -173,7 +181,9 @@ def web(
 def tui() -> None:
     """Launch the TUI frontend (Textual)."""
     from nelke.frontends import tui as tui_frontend
+    from nelke.frontends.telegram_bot import start_companion as telegram_companion
 
+    telegram_companion()
     tui_frontend.launch()
 
 
@@ -199,9 +209,11 @@ def _check_llm(profile: str | None) -> None:
 
 
 def _interactive_chat(profile: str | None) -> None:
-
     from rich.prompt import Prompt
 
+    from nelke.frontends.telegram_bot import start_companion as telegram_companion
+
+    telegram_companion()
     _intro()
     while True:
         try:

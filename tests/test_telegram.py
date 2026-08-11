@@ -150,6 +150,7 @@ async def test_chat_acks_and_edits_answer(settings, tmp_repo):
     await nelke.on_chat(msg, _cmd("hello"))
     await _wait_for(state)
     assert any("hello world" in e["text"] for e in fake.edits)
+    assert any("tokens: 4" in e["text"] for e in fake.edits)
 
 
 async def test_chat_empty_args_usage_hint(settings, tmp_repo):

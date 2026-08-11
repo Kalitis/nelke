@@ -129,7 +129,10 @@ def test_chat_streams_tokens_and_done(settings, tmp_repo):
     events = _parse_sse(r.text)
     kinds = [e for e, _ in events]
     assert "token" in kinds
+    assert "usage" in kinds  # live per-call usage is streamed to the client
     assert "done" in kinds
+    usage_ev = json.loads(next(d for e, d in events if e == "usage"))
+    assert usage_ev["total_tokens"] == 5
     done_data = json.loads(next(d for e, d in events if e == "done"))
     assert done_data["answer"] == "hello there"
     assert done_data["usage"]["total_tokens"] == 5
@@ -171,6 +174,107 @@ def test_chat_tags_session_as_web(settings, tmp_repo):
     db = services.open_db(settings)
     rows = db.connect().execute("SELECT frontend FROM sessions").fetchall()
     assert any(r["frontend"] == "web" for r in rows)
+
+
+# --------------------------------------------------------------------------- #
+# Chats (multiple conversations, each with history + memory)
+# --------------------------------------------------------------------------- #
+def test_chats_create_list_detail_rename_delete(settings, tmp_repo):
+    from nelke.core import services
+
+    factory = _scripted_llm_factory([final_response("hi")])
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        # create
+        r = client.post("/api/chats", json={"title": "First"})
+        assert r.status_code == 200
+        cid = r.json()["id"]
+
+        # list + detail
+        lst = client.get("/api/chats").json()
+        assert any(c["id"] == cid for c in lst)
+        det = client.get("/api/chats/" + cid).json()
+        assert det["title"] == "First"
+        assert det["messages"] == []
+
+        # rename
+        assert client.patch("/api/chats/" + cid, json={"title": "Renamed"}).status_code == 200
+        assert client.get("/api/chats/" + cid).json()["title"] == "Renamed"
+        assert client.patch("/api/chats/" + cid, json={"title": " "}).status_code == 400
+
+        # delete
+        assert client.delete("/api/chats/" + cid).status_code == 200
+        assert client.get("/api/chats/" + cid).status_code == 404
+        assert client.delete("/api/chats/" + cid).status_code == 404
+
+    assert services.get_chat(settings, cid) is None
+
+
+def test_chat_message_in_session_persists_history(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("hello there")])
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        cid = client.post("/api/chats", json={}).json()["id"]
+        r = client.post(f"/api/chats/{cid}/messages", json={"text": "hi", "profile": None})
+        assert r.status_code == 200
+        events = _parse_sse(r.text)
+        assert any(e == "done" for e, _ in events)
+        det = client.get("/api/chats/" + cid).json()
+        roles = [m["role"] for m in det["messages"]]
+        assert "user" in roles
+        assert "assistant" in roles
+    # per-chat memory store created in the repo
+    chat_mem = tmp_repo.repo / "memory" / "chats" / cid / "INDEX.md"
+    assert chat_mem.exists()
+
+
+def test_chat_message_unknown_chat_returns_404(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        r = client.post("/api/chats/doesnotexist/messages", json={"text": "hi"})
+    assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Cycles history pages + api
+# --------------------------------------------------------------------------- #
+def test_cycles_list_and_detail(settings, tmp_repo):
+    factory = _scripted_llm_factory(_good_fix_plan(), cycle_reviewer=_approved_reviewer())
+    app = create_app(AppState(
+        settings=settings, llm_factory=factory,
+        governance=FakeGovernance(), repo_path=tmp_repo.repo,
+    ))
+    TestClient(app).post("/api/improve", json={"objective": "seed cycle", "auto_approve": True})
+
+    with TestClient(app) as c:
+        lst = c.get("/api/cycles/list").json()
+        assert lst
+        cid = lst[0]["id"]
+        assert lst[0]["status"] == "merged"
+        assert lst[0]["steps"]
+
+        det = c.get("/api/cycles/" + cid)
+        assert det.status_code == 200
+        body = det.json()
+        assert body["id"] == cid
+        assert body["events"]
+
+        page = c.get("/cycles")
+        assert page.status_code == 200
+        assert cid in page.text
+
+        det_page = c.get("/cycles/" + cid)
+        assert det_page.status_code == 200
+        assert "Steps" in det_page.text
+        assert "Timeline" in det_page.text
+
+
+def test_cycle_detail_unknown_404(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        assert client.get("/api/cycles/nope").status_code == 404
 
 
 # --------------------------------------------------------------------------- #

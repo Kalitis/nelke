@@ -40,6 +40,12 @@ _ACK_CHAT = "🤔 working…"
 _ACK_IMPROVE = "🔧 cycle starting…"
 _EDIT_INTERVAL = 0.5  # throttle message edits while streaming
 _PROGRESS_REPORT_EVENTS = 12  # one TG progress report per this many cycle events
+_REPORT_KINDS = {
+    "cycle_start", "step_start", "gate", "commit", "boot_check_failed",
+    "step_ok", "propose_complete", "ai_review", "review_feedback",
+    "awaiting_human", "human_pending", "human_rejected", "merged",
+    "cycle_error", "deps_synced", "deps_failed", "idle",
+}
 
 
 def _cycle_progress_report(settings: Settings, cycle_id: str, *, repo_path: Any = None) -> str:
@@ -54,8 +60,21 @@ def _cycle_progress_report(settings: Settings, cycle_id: str, *, repo_path: Any 
         f"objective: {cycle['objective'][:80]}",
         f"branch: {cycle['branch']}",
     ]
+    usage_total = 0
+    usage_calls = 0
     for ev in events:
         kind = ev["kind"]
+        if kind == "usage":
+            import json
+
+            payload = {}
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (ValueError, TypeError):
+                pass
+            usage_total += int(payload.get("total_tokens", 0) or 0)
+            usage_calls += 1
+            continue
         if kind == "agent_token":
             continue
         if kind in {"agent_tool", "agent_tool_result"}:
@@ -77,6 +96,8 @@ def _cycle_progress_report(settings: Settings, cycle_id: str, *, repo_path: Any 
                 lines.append(f"  · → {tool}: {payload.get('snippet', '')[:120]}")
             continue
         lines.append(f"  · {ev['kind']}: {(ev['message'] or '')[:160]}")
+    if usage_total:
+        lines.append(f"tokens: {usage_total} ({usage_calls} calls)")
     return "\n".join(lines[:60])
 
 
@@ -148,6 +169,7 @@ class NelkeBot:
 
     async def _run_chat(self, chat_id: int, message_id: int, text: str) -> None:
         last_edit = 0.0
+        live_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
 
         async def edit(answer: str, usage: dict[str, Any] | None = None) -> None:
             nonlocal last_edit
@@ -156,7 +178,8 @@ class NelkeBot:
                 return
             last_edit = now
             body = answer or "…"
-            if usage and usage.get("total_tokens"):
+            usage = usage or live_usage
+            if usage.get("total_tokens"):
                 body += f"\n\ntokens: {usage['total_tokens']}"
             try:
                 await self.bot.edit_message_text(body[:4000], chat_id=chat_id, message_id=message_id)
@@ -176,17 +199,22 @@ class NelkeBot:
         def on_token(tok: str) -> None:
             sink_tokens.append(tok)
 
+        def on_usage(usage: dict[str, Any]) -> None:
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                live_usage[key] += int(usage.get(key, 0) or 0)
+            live_usage["calls"] += 1
+
         try:
             result, _session_id = await services.run_task(
                 text, self.state.settings, self.state.profile,
                 frontend_name="telegram",
-                callbacks=Callbacks(on_token=on_token, stream=True),
+                callbacks=Callbacks(on_token=on_token, on_usage=on_usage, stream=True),
                 repo=self.state.repo_path,
                 llm_factory=self.state.llm_factory or services._llm_factory_default,
             )
             done.set()
             await asyncio.gather(editor, return_exceptions=True)
-            usage = result.usage or {}
+            usage = result.usage or live_usage
             await edit(result.answer or "(no answer)", usage)
             if not result.answer:
                 await self.bot.send_message(chat_id, "(no answer)")
@@ -253,6 +281,23 @@ class NelkeBot:
             self.state.gate_messages[req.cycle_id] = (chat_id, message_id)
             return await future
 
+        report_tasks: set[asyncio.Task[Any]] = set()
+        cycle_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+
+        def on_event(ev: Any) -> None:
+            # schedule the progress report as a task: CycleEngine._emit calls
+            # on_event synchronously, so the async maybe_report needs a task.
+            if ev.kind not in _REPORT_KINDS:
+                return
+            task = asyncio.create_task(maybe_report(ev.cycle_id))
+            report_tasks.add(task)
+            task.add_done_callback(report_tasks.discard)
+
+        def on_usage(usage: dict[str, Any]) -> None:
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                cycle_usage[key] += int(usage.get(key, 0) or 0)
+            cycle_usage["calls"] += 1
+
         try:
             result = await services.run_cycle(
                 objective, self.state.settings, self.state.profile,
@@ -260,10 +305,16 @@ class NelkeBot:
                 repo_path=self.state.repo_path,
                 llm_factory=self.state.llm_factory or services._llm_factory_default,
                 governance=self.state.governance,
-                on_event=lambda ev: maybe_report(ev.cycle_id),
+                on_event=on_event,
+                on_usage=on_usage,
             )
+            if report_tasks:
+                await asyncio.gather(*report_tasks, return_exceptions=True)
+            final = f"cycle {result.status}\nbranch: {result.branch}\nsteps: {result.steps}"
+            if cycle_usage["total_tokens"]:
+                final += f"\ntokens: {cycle_usage['total_tokens']} ({cycle_usage['calls']} calls)"
             await self.bot.edit_message_text(
-                f"cycle {result.status}\nbranch: {result.branch}\nsteps: {result.steps}",
+                final,
                 chat_id=chat_id, message_id=message_id,
             )
         except asyncio.CancelledError:
@@ -326,6 +377,37 @@ class NelkeBot:
 # --------------------------------------------------------------------------- #
 # Launcher
 # --------------------------------------------------------------------------- #
+_companion_started = False
+
+
+def start_companion() -> None:
+    """Start the Telegram bot in a daemon thread, alongside web/tui/cli.
+
+    Lets the user keep talking to Nelke over Telegram while away from the
+    keyboard (e.g. at lunch). No-op when ``NELKE_TELEGRAM_TOKEN`` is unset or
+    the companion is already running; failures only warn on stderr so the
+    host frontend never crashes because of the bot.
+    """
+    global _companion_started
+    if _companion_started:
+        return
+    if not os.environ.get("NELKE_TELEGRAM_TOKEN"):
+        return
+    import threading
+
+    def _run() -> None:
+        try:
+            launch()
+        except Exception as exc:  # noqa: BLE001 - best-effort companion
+            import sys
+
+            print(f"[nelke] telegram companion stopped: {exc}", file=sys.stderr)
+
+    _companion_started = True
+    thread = threading.Thread(target=_run, name="nelke-telegram-companion", daemon=True)
+    thread.start()
+
+
 def launch() -> None:
     """Run the Telegram bot (long polling).
 

@@ -7,6 +7,7 @@ injected into the agent system prompt. Session/task logs belong in SQLite, not h
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,12 @@ _INDEX_NAME = "INDEX.md"
 _HEADING_RE = re.compile(r"^#\s+(.+)$")
 _TAGS_RE = re.compile(r"^tags\s*:\s*(.+)$", re.IGNORECASE)
 _WORD_SPLIT_RE = re.compile(r"[^\w]+")
+# Stopwords dropped from queries to avoid noise matches.
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "been", "was", "were", "it", "its", "that", "this", "these",
+    "those", "from", "as", "by", "at", "be", "have", "has", "do", "does",
+}
 
 
 @dataclass
@@ -43,6 +50,68 @@ def _summary(content: str) -> str:
             continue
         return s
     return ""
+
+
+def _tokenize(text: str) -> list[str]:
+    return [w for w in _WORD_SPLIT_RE.split(text.lower()) if w and w not in _STOPWORDS]
+
+
+def _score_terms(all_terms: list[str], query_terms: list[str]) -> tuple[int, int]:
+    """Return (score, first_hit_pos) via term-frequency ranking.
+
+    Each query term contributes ``min(count_in_doc, count_in_query)`` weighted by
+    its ``1 + log(count)`` term frequency, so documents that repeat a query term
+    rank higher, while exact matches are naturally weighted more than sparse
+    ones. No inverse-document-frequency is applied (bodies are short).
+    """
+    if not all_terms:
+        return 0, -1
+    qfreq = {t: query_terms.count(t) for t in dict.fromkeys(query_terms)}
+    total = 0.0
+    first_hit = -1
+    for term, qn in qfreq.items():
+        cn = all_terms.count(term)
+        if cn == 0:
+            continue
+        contrib = min(cn, qn) * (1.0 + math.log(1 + cn))
+        total += contrib
+        idx = -1
+        for i, t in enumerate(all_terms):
+            if t == term:
+                idx = i
+                break
+        if first_hit < 0 or (idx >= 0 and idx < first_hit):
+            first_hit = idx
+    return int(round(total * 100)), first_hit
+
+
+def _fuzzy_tokenize(text: str) -> list[str]:
+    """Tokenize, then stem simple plurals (suffix ``s``/``es``) for fuzzy matches."""
+    out = []
+    for w in _tokenize(text):
+        if w.endswith("ies") and len(w) > 4:
+            out.append(w[:-3] + "y")
+        elif w.endswith("es") and len(w) > 3:
+            out.append(w[:-2])
+        elif w.endswith("s") and len(w) > 3 and not w.endswith("ss"):
+            out.append(w[:-1])
+        out.append(w)
+    return out
+
+
+def _recall_one(content: str, query_terms: list[str]) -> tuple[int, int]:
+    """Combined exact + stemmed-fuzzy scoring for a single document."""
+    exact = _tokenize(content)
+    exact_score, exact_pos = _score_terms(exact, query_terms)
+    fuzzy = _fuzzy_tokenize(content)
+    fuzzy_terms = list(dict.fromkeys(query_terms))
+    fuzzy_score, fuzzy_pos = _score_terms(fuzzy, fuzzy_terms)
+    # boost exact matches over fuzzy-only ones
+    score = max(exact_score, fuzzy_score)
+    if score == 0:
+        return 0, -1
+    pos = exact_pos if exact_pos >= 0 else fuzzy_pos
+    return score, pos
 
 
 class MemoryStore:
@@ -133,30 +202,43 @@ class MemoryStore:
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def recall(self, query: str, top_k: int = 8) -> list[MemoryHit]:
-        """Simple keyword relevance search over memory files."""
+        """Relevance search over memory files.
+
+        Scoring combines term-frequency ranking (with log dampening) over the raw
+        body, a stemmed fuzzy pass (so plurals/queries still match), and a boost
+        when the query terms appear in the file's INDEX entry (title/tags/summary).
+        """
         if not query.strip():
             return []
-        query_words = {w for w in _WORD_SPLIT_RE.split(query.lower()) if w and w not in {"the", "a", "an"}}
-        if not query_words:
+        query_terms = _tokenize(query)
+        if not query_terms:
             return []
-        scored: list[MemoryHit] = []
+        hits: list[MemoryHit] = []
         for rel in self.files():
             content = self.read(rel.as_posix())
-            lower = content.lower()
-            score = 0
-            first_hit = -1
-            for w in query_words:
-                idx = lower.find(w)
-                if idx >= 0:
-                    score += 1
-                    if first_hit < 0 or idx < first_hit:
-                        first_hit = idx
-            if score == 0:
+            body_score, body_pos = _recall_one(content, query_terms)
+            if body_score == 0:
                 continue
-            snippet = _snippet(content, first_hit)
-            scored.append(MemoryHit(name=rel.as_posix(), score=score, snippet=snippet))
-        scored.sort(key=lambda h: (-h.score, h.name))
-        return scored[:top_k]
+            # boost by matching the INDEX entry (title+tags+summary)
+            index_entry = self._index_entry(rel.as_posix())
+            entry_score, _ = _recall_one(index_entry, query_terms)
+            score = body_score + entry_score
+            pos = body_pos if body_pos >= 0 else 0
+            snippet = _snippet(content, pos)
+            hits.append(MemoryHit(name=rel.as_posix(), score=score, snippet=snippet))
+        hits.sort(key=lambda h: (-h.score, h.name))
+        return hits[:top_k]
+
+    def _index_entry(self, rel_name: str) -> str:
+        """Return the INDEX.md line describing `rel_name` (title + tags + summary)."""
+        try:
+            index = self.index_text()
+        except OSError:
+            return ""
+        for line in index.splitlines():
+            if f"({rel_name})" in line:
+                return line
+        return ""
 
 
 def _snippet(content: str, pos: int, width: int = 200) -> str:

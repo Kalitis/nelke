@@ -48,6 +48,25 @@ def test_recall_ranks_by_keyword_hits(tmp_path):
     assert "skills.md" in names
 
 
+def test_recall_fuzzy_matches_plurals(tmp_path):
+    store = _store(tmp_path)
+    store.write("facts/pytest.md", "# Pytest\n\nRun the tests before merging.", overwrite=True)
+    store.write("facts/other.md", "# Other\n\nNothing related.", overwrite=True)
+    # "test" (singular) should still match "tests" (plural) via stemming
+    hits = store.recall("test", top_k=5)
+    assert hits
+    assert hits[0].name == "facts/pytest.md"
+
+
+def test_recall_boosted_by_index_entry(tmp_path):
+    store = _store(tmp_path)
+    store.write("facts/math.md", "# Math\n\nSome body text with no query words.", overwrite=True)
+    store.build_index()
+    hits = store.recall("quantum", top_k=5)
+    # no body hits at all, so nothing matches
+    assert hits == []
+
+
 def test_recall_empty_query_returns_none(tmp_path):
     store = _store(tmp_path)
     assert store.recall("   ") == []

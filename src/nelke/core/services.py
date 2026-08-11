@@ -216,6 +216,7 @@ def build_chat_session(
         web_timeout=settings.web_timeout,
         db=db,
         temperature=settings.agent_temperature,
+        plan_first=settings.plan_first,
     )
     if existing:
         history = db.list_messages(session_id)
@@ -424,6 +425,24 @@ def memory_overview(repo: Path) -> list[dict[str, Any]]:
         size = path.stat().st_size if path.exists() else 0
         out.append({"name": rel.as_posix(), "size": size})
     return out
+
+
+def memory_file_content(repo: Path, name: str) -> str | None:
+    """Contents of a single memory file, or ``None`` if it does not exist.
+
+    ``name`` must match a known memory file (relative path with ``.md``). This
+    is the safe lookup for the web viewer: it refuses anything outside the
+    memory dir or without the ``.md`` extension, so a crafted ``name`` cannot
+    escape to arbitrary files.
+    """
+    store = open_memory(repo)
+    rels = {rel.as_posix() for rel in store.files()}
+    if name not in rels:
+        return None
+    try:
+        return store.read(name)
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def recall_memory(repo: Path, query: str, top_k: int = 8) -> list[MemoryHit]:

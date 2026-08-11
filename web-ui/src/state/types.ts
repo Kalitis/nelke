@@ -53,6 +53,54 @@ export interface Profile {
   model: string;
 }
 
+export type CycleStatus = "running" | "merged" | "rejected" | "stuck" | string;
+
+export interface CycleStep {
+  step: number;
+  status: string;
+  commit_sha: string | null;
+  summary: string | null;
+}
+
+export interface CycleSummary {
+  id: string;
+  objective: string;
+  branch: string | null;
+  status: CycleStatus;
+  ai_verdict: string | null;
+  human_verdict: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  steps: CycleStep[];
+  human_review_id: string | null;
+}
+
+export interface CycleEvent {
+  id: number;
+  kind: string;
+  message: string;
+  payload: Record<string, unknown>;
+  seq: number;
+}
+
+export interface CycleReview {
+  id: string;
+  kind: string;
+  verdict: string;
+  comments: string;
+  resolved_at: string | null;
+}
+
+export interface CycleDetail extends CycleSummary {
+  events: CycleEvent[];
+  reviews: CycleReview[];
+}
+
+export interface MemoryFile {
+  name: string;
+  size: number;
+}
+
 export interface UsageTotals {
   prompt_tokens: number;
   completion_tokens: number;

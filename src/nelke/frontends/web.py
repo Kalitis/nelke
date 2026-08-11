@@ -104,6 +104,21 @@ def _spa_index_html() -> str:
     return (dist / "index.html").read_text(encoding="utf-8")
 
 
+def _spa_response_or_none() -> HTMLResponse | None:
+    """Return the SPA entry as an HTMLResponse when a build/dev mode is active.
+
+    The SPA owns client-side routing for ``/``, ``/cycles``, ``/cycles/{id}``,
+    ``/memory`` and ``/review/{id}``; when it is available each of those page
+    routes serves the SPA bundle so the React router can take over. Legacy
+    Jinja2 pages remain the fallback when ``NELKE_WEB_LEGACY=1`` (in which
+    case ``_spa_index_html()`` already returns ``""``).
+    """
+    html = _spa_index_html()
+    if not html:
+        return None
+    return HTMLResponse(html)
+
+
 # --------------------------------------------------------------------------- #
 # App state
 # --------------------------------------------------------------------------- #
@@ -180,12 +195,18 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
     @app.get("/memory", response_class=HTMLResponse)
     async def memory_page(request: Request) -> HTMLResponse:
+        spa = _spa_response_or_none()
+        if spa is not None:
+            return spa
         repo = state.repo_path or services.find_repo(state.settings)
         files = services.memory_overview(repo)
         return templates.TemplateResponse(request, "memory.html", {"files": files})
 
     @app.get("/review/{request_id}", response_class=HTMLResponse)
     async def review_page(request: Request, request_id: str) -> HTMLResponse:
+        spa = _spa_response_or_none()
+        if spa is not None:
+            return spa
         review = services.get_review(state.settings, request_id, repo_path=state.repo_path)
         if review is None:
             return templates.TemplateResponse(request, "review.html", {"review": None})
@@ -193,11 +214,17 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
     @app.get("/cycles", response_class=HTMLResponse)
     async def cycles_page(request: Request) -> HTMLResponse:
+        spa = _spa_response_or_none()
+        if spa is not None:
+            return spa
         cycles = services.list_cycles(state.settings)
         return templates.TemplateResponse(request, "cycles.html", {"cycles": cycles})
 
     @app.get("/cycles/{cycle_id}", response_class=HTMLResponse)
     async def cycle_detail_page(request: Request, cycle_id: str) -> HTMLResponse:
+        spa = _spa_response_or_none()
+        if spa is not None:
+            return spa
         cycle = services.get_cycle_detail(state.settings, cycle_id)
         return templates.TemplateResponse(request, "cycle_detail.html", {"cycle": cycle})
 
@@ -211,6 +238,26 @@ def create_app(state: AppState | None = None) -> FastAPI:
     @app.get("/api/profiles")
     async def api_profiles() -> list[dict[str, str]]:
         return _profile_rows()
+
+    @app.get("/api/memory")
+    async def api_memory() -> list[dict[str, Any]]:
+        """Memory file index (name + size) for the SPA memory viewer."""
+        repo = state.repo_path or services.find_repo(state.settings)
+        return services.memory_overview(repo)
+
+    @app.get("/api/memory/{name:path}")
+    async def api_memory_file(name: str) -> JSONResponse:
+        """Contents of a single memory file (markdown), 404 if unknown.
+
+        ``name`` is the posix-relative path (e.g. ``chats/<id>/roadmap.md``).
+        ``services.memory_file_content`` only accepts files actually present
+        in the memory dir, so crafted paths cannot escape it.
+        """
+        repo = state.repo_path or services.find_repo(state.settings)
+        content = services.memory_file_content(repo, name)
+        if content is None:
+            return JSONResponse({"error": "memory file not found"}, status_code=404)
+        return JSONResponse({"name": name, "content": content})
 
     @app.get("/api/reviews")
     async def api_reviews() -> list[dict[str, Any]]:

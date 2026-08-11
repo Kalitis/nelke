@@ -10,6 +10,7 @@ import type {
 } from "@/state/types";
 import { activePath, findActiveLeaf } from "@/lib/tree";
 import { pathToRoot } from "@/lib/tree";
+import { loadString, saveString } from "@/lib/storage";
 
 interface ChatState {
   chats: ChatSummary[];
@@ -60,7 +61,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadProfiles: async () => {
     try {
       const profiles = await api.profiles();
-      set({ profiles, profile: get().profile ?? profiles[0]?.name ?? null });
+      // Prefer the previously chosen profile (persisted across reloads), then
+      // whatever is already in memory, then the first available profile.
+      const saved = loadString("profile");
+      const valid = (name: string | null): name is string =>
+        !!name && profiles.some((p) => p.name === name);
+      const profile = valid(get().profile)
+        ? get().profile
+        : valid(saved)
+          ? saved
+          : (profiles[0]?.name ?? null);
+      set({ profiles, profile });
     } catch (err) {
       set({ error: String(err) });
     }
@@ -119,7 +130,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  setProfile: (name) => set({ profile: name }),
+  setProfile: (name) => {
+    saveString("profile", name);
+    set({ profile: name });
+  },
 
   sendMessage: async (text) => {
     const { activeChatId, profile, chat } = get();

@@ -10,8 +10,8 @@ from nelke.core.tools.base import ToolError
 from nelke.core.tools.selfedit import (
     GitCommitTool,
     SelfEditContext,
-    SelfGrepTool,
     SelfGlobTool,
+    SelfGrepTool,
     SelfReadTool,
     SelfWriteTool,
 )

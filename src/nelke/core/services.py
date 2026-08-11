@@ -188,6 +188,7 @@ def build_chat_session(
             iteration_cap=settings.max_agent_iterations,
             code_timeout=settings.code_timeout,
             web_timeout=settings.web_timeout,
+            temperature=settings.agent_temperature,
         )
 
     agent = make_agent(
@@ -207,6 +208,7 @@ def build_chat_session(
         code_timeout=settings.code_timeout,
         web_timeout=settings.web_timeout,
         db=db,
+        temperature=settings.agent_temperature,
     )
     if existing:
         history = db.list_messages(session_id)
@@ -283,6 +285,7 @@ async def run_cycle(
         max_review_rounds=settings.max_review_rounds,
         on_token=on_token,
         on_usage=on_usage,
+        agent_temperature=settings.agent_temperature,
     )
     return await engine.run(objective)
 

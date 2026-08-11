@@ -207,6 +207,7 @@ def _build_session_agent(settings: Settings, profile: str | None, stream: Answer
             iteration_cap=settings.max_agent_iterations,
             code_timeout=settings.code_timeout,
             web_timeout=settings.web_timeout,
+            temperature=settings.agent_temperature,
         )
 
     # Persist each LLM call's usage as it happens, then forward to the stream so
@@ -243,6 +244,7 @@ def _build_session_agent(settings: Settings, profile: str | None, stream: Answer
         code_timeout=settings.code_timeout,
         web_timeout=settings.web_timeout,
         db=db,
+        temperature=settings.agent_temperature,
     )
     return agent, db, session_id, memory
 
@@ -461,6 +463,7 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
         max_steps=settings.max_cycle_steps,
         max_step_attempts=settings.max_step_attempts,
         max_review_rounds=settings.max_review_rounds,
+        agent_temperature=settings.agent_temperature,
     )
     try:
         result = asyncio.run(engine.run(objective))

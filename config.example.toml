@@ -28,3 +28,20 @@ api_key = "lm-studio"
 base_url = "http://localhost:11434/v1"
 model = "qwen3:8b"
 api_key = "ollama"
+
+# Embeddings for semantic memory recall / auto-link (optional).
+#
+# When present and reachable, Nelke uses real dense embeddings here instead of
+# the built-in offline hashing — LM Studio is a great fit because it can serve
+# strong multilingual embedding models (BGE, E5, GTE, Jina, ...) locally.
+#
+# `model` is optional: leave it empty to auto-detect whichever embedding model
+# is currently loaded in LM Studio (scanning /v1/models for embedding-family
+# model ids). If the endpoint is down or no embedding model is loaded, Nelke
+# silently falls back to the offline embedder. Set NELKE_EMBEDDINGS_ENABLED=false
+# to disable real embeddings entirely.
+[embeddings]
+base_url = "http://localhost:1234/v1"
+api_key = "lm-studio"
+# model = "bge-m3"
+# timeout = 10.0

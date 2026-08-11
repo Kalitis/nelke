@@ -472,8 +472,10 @@ class CycleEngine:
             cycle_id=cycle_id, objective=objective, branch=branch,
             diff=final_diff, ai_verdict=verdict,
         )
-        self.db.create_review_request(cycle_id, "human", verdict="pending",
-                                      comments=f"AI: {verdict.verdict}\n{verdict.comments}".strip())
+        human_req_id = self.db.create_review_request(
+            cycle_id, "human", verdict="pending",
+            comments=f"AI: {verdict.verdict}\n{verdict.comments}".strip(),
+        )
         emit("awaiting_human", "cycle awaits human approval", branch=branch)
 
         if human_gate is None:
@@ -485,6 +487,7 @@ class CycleEngine:
         if inspect.isawaitable(decision):
             decision = await decision  # type: ignore[misc]
         if not decision:
+            self.db.resolve_review_request(human_req_id, "rejected")
             self.db.update_cycle(cycle_id, status="rejected", human_verdict="rejected", ended_at=_now())
             emit("human_rejected", "human rejected cycle", branch=branch)
             return self._result(cycle_id, objective, branch, "rejected", verdict, human="rejected", steps=step_no)
@@ -493,11 +496,13 @@ class CycleEngine:
         try:
             merge_cycle_branch(repo, branch, cycle_id=cycle_id)
         except GitError as exc:
+            self.db.resolve_review_request(human_req_id, "approved")
             self.db.update_cycle(cycle_id, status="merge-conflict", human_verdict="approved", ended_at=_now())
             emit("cycle_error", "merge failed", error=str(exc))
             return self._result(cycle_id, objective, branch, "merge-conflict", verdict,
                                 human="approved", steps=step_no, message=str(exc)[:500])
 
+        self.db.resolve_review_request(human_req_id, "approved")
         self.db.update_cycle(cycle_id, status="merged", human_verdict="approved", ended_at=_now())
         emit("merged", "cycle merged into main", branch=branch)
         return self._result(cycle_id, objective, branch, "merged", verdict,

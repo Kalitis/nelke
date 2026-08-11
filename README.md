@@ -41,14 +41,17 @@ cycle, and human review gate.
 ```bash
 nelke web [--host 127.0.0.1] [--port 8000]   # FastAPI + SSE chat/review UI
 nelke tui                                     # Textual terminal UI (chat/improve/memory)
-nelke bot                                     # Telegram bot (/chat /new /history /chats /open /improve /cancel /memory)
+nelke bot                                     # Telegram bot (plain text or /chat /new /history /chats /open /improve /review /cancel /memory)
 ```
 
 The web frontend streams tokens over SSE; the human gate is a `/review/<id>`
 page with approve/reject buttons. The TUI shows cycle events live and opens a
 review modal. The Telegram bot edits messages as the answer streams and sends
-inline ✅/❌ buttons for the human gate. All resolve the same `review_requests`
-row — the first frontend to resolve wins.
+inline ✅/❌ buttons for the human gate; plain text messages are treated as
+`/chat` (no prefix needed), and `/review approve|reject <id>` resolves a
+pending review by text — so a cycle parked on the gate can always be approved
+from Telegram even if the inline keyboard is gone. All resolve the same
+`review_requests` row — the first frontend to resolve wins.
 
 ### Web UI
 
@@ -102,8 +105,10 @@ its own persisted transcript (in SQLite `sessions`/`messages`, including tool
 calls) and its own per-chat memory store under `memory/chats/<session_id>/`.
 Opening a chat reloads its history so conversations continue across restarts.
 The Telegram bot does the same: each Telegram chat keeps a persistent session
-(`/chat` continues the conversation; `/new` starts a fresh chat, `/history`
-shows the transcript, `/chats`/`/open <id>` list and resume older chats).
+(typing a message — or `/chat <text>` — continues the conversation; `/new`
+starts a fresh chat, `/history` shows the transcript, `/chats`/`/open <id>`
+list and resume older chats). In group chats the bot only answers messages
+that mention it or reply to one of its own messages.
 Self-improvement **cycles** live in a separate view — the web `/cycles` page
 and the TUI "Improve" tab list every cycle with its steps, timeline events and
 review links.

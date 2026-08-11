@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -203,7 +204,9 @@ def create_app(state: AppState | None = None) -> FastAPI:
     # ---- JSON api ----------------------------------------------------------
     @app.get("/api/health")
     async def health() -> dict[str, Any]:
-        return {"ok": True}
+        from nelke import __version__
+
+        return {"ok": True, "version": __version__}
 
     @app.get("/api/profiles")
     async def api_profiles() -> list[dict[str, str]]:
@@ -742,7 +745,10 @@ def launch(host: str | None = None, port: int | None = None) -> None:
     """Run the web server (uvicorn). Host/port from env or args."""
     import uvicorn
 
+    from nelke import __version__
+
     host = host or os.environ.get("NELKE_WEB_HOST", "127.0.0.1")
     port = port or int(os.environ.get("NELKE_WEB_PORT", "8000"))
+    print(f"nelke v{__version__} — web UI at http://{host}:{port}", file=sys.stderr)
     app = create_app()
     uvicorn.run(app, host=host, port=port)

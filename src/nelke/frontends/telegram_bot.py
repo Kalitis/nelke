@@ -2,18 +2,28 @@
 
 Commands:
   /start            greeting + help
-  /chat <text>      ack immediately, run the agent, edit the message as the
-                    answer streams in (throttled), then post usage. Each
-                    Telegram chat keeps a persistent session, so conversations
-                    continue across messages (same as web/TUI).
+  /chat <text>      same as just typing the text — ack immediately, run the
+                    agent, edit the message as the answer streams in
+                    (throttled), then post usage. Each Telegram chat keeps a
+                    persistent session, so conversations continue across
+                    messages (same as web/TUI).
   /new              start a brand-new chat (fresh session; memory is global).
   /history          show the current chat's persisted transcript.
   /chats            list this Telegram chat's conversations.
   /open <id>        resume an old conversation (/chats shows the ids).
   /improve <obj>    ack, run a self-improvement cycle; the human gate sends an
                     inline ✅/❌ keyboard and awaits the button press.
+  /review           list open human reviews.
+  /review approve <id> | /review reject <id>
+                    approve/reject a pending review from text — works even if
+                    the inline keyboard is gone (e.g. the bot restarted while a
+                    cycle was parked on the human gate).
   /cancel           cancel the running task/cycle for this chat.
   /memory [query]   list memory files, or recall hits for a query.
+
+Plain text messages are treated as `/chat <text>` (no prefix needed). In
+group/supergroup chats the bot only answers messages that mention it or reply
+to one of its own messages.
 
 The bot token is read from ``NELKE_TELEGRAM_TOKEN`` via the shared
 ``load_env_files()`` path (same as ``OPENAI_API_KEY``). Handlers are methods
@@ -25,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -129,6 +140,8 @@ class BotState:
     gate_futures: dict[str, asyncio.Future[bool]] = field(default_factory=dict)
     # cycle_id -> (chat_id, message_id) to edit when the gate resolves
     gate_messages: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # bot's @username, fetched lazily (used to detect mentions in group chats)
+    bot_username: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -156,20 +169,25 @@ class NelkeBot:
         self.router.message.register(self.on_chats, Command("chats"))
         self.router.message.register(self.on_open, Command("open"))
         self.router.message.register(self.on_improve, Command("improve"))
+        self.router.message.register(self.on_review, Command("review"))
         self.router.message.register(self.on_cancel, Command("cancel"))
         self.router.message.register(self.on_memory, Command("memory"))
         self.router.callback_query.register(self.on_review_callback, F.data.startswith("review:"))
+        # Catch-all: plain text = /chat. Registered last so command handlers
+        # win; messages that begin with "/" (e.g. unknown commands) are ignored.
+        self.router.message.register(self.on_user_message, F.text)
 
     # ---- /start -------------------------------------------------------------
     async def on_start(self, message: Message) -> None:
         await message.answer(
             "Nelke bot.\n"
-            "/chat <text> — ask Nelke (conversation history is kept)\n"
+            "just type a message and Nelke answers (no /chat prefix needed)\n"
             "/new — start a new chat\n"
             "/history — show this chat's transcript\n"
             "/chats — list your chats\n"
             "/open <id> — continue an old chat\n"
             "/improve <objective> — self-improvement cycle\n"
+            "/review — list / approve / reject pending reviews\n"
             "/cancel — stop the running task\n"
             "/memory [query] — list memory or recall hits",
         )
@@ -233,6 +251,20 @@ class NelkeBot:
         if not text:
             await message.answer("Usage: /chat <text>")
             return
+        await self._dispatch_chat(message, text)
+
+    async def on_user_message(self, message: Message) -> None:
+        """Plain text = /chat (no prefix needed). See module docstring."""
+        text = (message.text or "").strip()
+        if not text or text.startswith("/"):
+            return  # commands are routed to their own handlers
+        # In groups, only answer messages addressed to the bot, so we never
+        # reply to every message in a shared chat.
+        if getattr(message.chat, "type", "private") != "private" and not await self._addressed_to_bot(message):
+            return
+        await self._dispatch_chat(message, text)
+
+    async def _dispatch_chat(self, message: Message, text: str) -> None:
         chat_id = message.chat.id
         running = self.state.tasks.get(chat_id)
         if running is not None and not running.done():
@@ -242,6 +274,32 @@ class NelkeBot:
         ack = await message.answer(_ACK_CHAT)
         task = asyncio.create_task(self._run_chat(chat_id, ack.message_id, text, session_id))
         self.state.tasks[chat_id] = task
+
+    async def _ensure_bot_username(self) -> str | None:
+        """The bot's @username, cached after the first ``get_me()`` call."""
+        if self.state.bot_username is None:
+            me_call = getattr(self.bot, "get_me", None)
+            if me_call is None:
+                self.state.bot_username = ""
+            else:
+                try:
+                    me = await me_call()
+                    self.state.bot_username = (getattr(me, "username", None) or "").strip()
+                except Exception:  # noqa: BLE001 - mention detection is best-effort
+                    self.state.bot_username = ""
+        return self.state.bot_username or None
+
+    async def _addressed_to_bot(self, message: Message) -> bool:
+        """True when a group message is aimed at the bot (reply or @mention)."""
+        bot_id = getattr(self.bot, "id", None)
+        rto = getattr(message, "reply_to_message", None)
+        if bot_id is not None and rto is not None:
+            if getattr(getattr(rto, "from_user", None), "id", None) == bot_id:
+                return True
+        uname = await self._ensure_bot_username()
+        if uname and message.text and f"@{uname}".lower() in message.text.lower():
+            return True
+        return False
 
     async def _run_chat(self, chat_id: int, message_id: int, text: str, session_id: str) -> None:
         last_edit = 0.0
@@ -506,6 +564,85 @@ class NelkeBot:
         if chat_id is not None:
             await self.bot.edit_message_text(label, chat_id=chat_id, message_id=message_id)
 
+    # ---- /review (textual approval path) ------------------------------------
+    async def on_review(self, message: Message, command: CommandObject) -> None:
+        args = (command.args or "").strip().split()
+        if not args or args[0].lower() == "list":
+            await self._review_list(message)
+            return
+        action = args[0].lower()
+        if action in ("approve", "reject") and len(args) >= 2:
+            await self._review_resolve(message, action, args[1])
+            return
+        await message.answer("Usage: /review | /review list | /review approve <id> | /review reject <id>")
+
+    async def _review_list(self, message: Message) -> None:
+        db = services.open_db(self.state.settings)
+        open_reqs = [r for r in db.list_review_requests(open_only=True) if r["kind"] == "human"]
+        if not open_reqs:
+            await message.answer("no open human reviews")
+            return
+        lines = []
+        for req in open_reqs[-20:]:
+            cycle = db.get_cycle(req["cycle_id"])
+            obj = (cycle["objective"][:60] if cycle else req["cycle_id"])
+            branch = cycle["branch"] if cycle else ""
+            lines.append(
+                f"· {branch} {obj}\n  /review approve {req['id'][-12:]} · reject"
+            )
+        await message.answer("Open human reviews:\n" + "\n".join(lines)[:4000])
+
+    async def _review_resolve(self, message: Message, action: str, prefix: str) -> None:
+        approved = action == "approve"
+        db = services.open_db(self.state.settings)
+        matches = [
+            r for r in db.list_review_requests(open_only=True)
+            if r["kind"] == "human"
+            and (r["id"] == prefix or r["id"].startswith(prefix) or r["id"].endswith(prefix))
+        ]
+        if not matches:
+            await message.answer(f"no open review matches '{prefix}' — /review to list")
+            return
+        req = matches[0]
+        cycle_id: str = req["cycle_id"] or ""
+        # In-process: the cycle may be parked on this bot's in-memory gate —
+        # resolve the future and let the running engine finish (merge + DB
+        # update). Don't touch the DB here or the engine would merge twice.
+        future = self.state.gate_futures.get(cycle_id) if cycle_id else None
+        if future is not None and not future.done():
+            self.state.gate_futures.pop(cycle_id, None)
+            future.set_result(approved)
+            cid, mid = self.state.gate_messages.pop(cycle_id, (None, None))
+            if cid is not None:
+                label = "✅ approved — merging" if approved else "❌ rejected — keeping branch"
+                try:
+                    await self.bot.edit_message_text(label, chat_id=cid, message_id=mid)
+                except Exception:  # noqa: BLE001 - best-effort label edit
+                    pass
+            await message.answer("approved — merging…" if approved else "rejected — branch kept")
+            return
+        # Recovery path (bot restarted or no running gate): resolve straight
+        # from the DB. Skip cycles that already finished to avoid double-merges.
+        if cycle_id:
+            cycle = db.get_cycle(cycle_id)
+            if cycle is not None and cycle["status"] in ("merged", "rejected", "merge-conflict"):
+                await message.answer(f"already resolved: {cycle['status']}")
+                return
+        try:
+            result = services.resolve_review(
+                self.state.settings, req["id"], "approved" if approved else "rejected",
+                repo_path=self.state.repo_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface resolution failures cleanly
+            await message.answer(f"error: {exc}"[:4000])
+            return
+        if result.error:
+            await message.answer(f"{'approved' if approved else 'rejected'} — {result.error}"[:4000])
+            return
+        await message.answer(
+            f"{'✅ approved' if approved else '❌ rejected'} — {result.status}"
+        )
+
     # ---- /cancel ------------------------------------------------------------
     async def on_cancel(self, message: Message) -> None:
         chat_id = message.chat.id
@@ -579,6 +716,8 @@ def launch() -> None:
     """
     from aiogram.client.session.aiohttp import AiohttpSession
 
+    from nelke import __version__
+
     token = os.environ.get("NELKE_TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError(
@@ -588,6 +727,7 @@ def launch() -> None:
     proxy = os.environ.get("NELKE_TELEGRAM_PROXY")
     session = AiohttpSession(proxy=proxy) if proxy else None
     bot = Bot(token, session=session)
+    print(f"nelke v{__version__} — Telegram bot (long polling)", file=sys.stderr)
     state = BotState(settings=Settings())
     nelke = NelkeBot(bot, state)
     dp = Dispatcher()

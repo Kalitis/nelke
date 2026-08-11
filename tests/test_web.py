@@ -114,9 +114,11 @@ def test_memory_page_lists_files(settings, tmp_repo):
 
 def test_health_endpoint(settings, tmp_repo):
     app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    from nelke import __version__
+
     with TestClient(app) as client:
         resp = client.get("/api/health")
-    assert resp.json() == {"ok": True}
+    assert resp.json() == {"ok": True, "version": __version__}
 
 
 # --------------------------------------------------------------------------- #

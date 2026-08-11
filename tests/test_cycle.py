@@ -56,6 +56,8 @@ async def test_cycle_merge_into_main(tmp_repo, db):
     # review requests recorded (AI + human)
     reqs = db.list_review_requests(cycle_id=result.cycle_id)
     assert {r["kind"] for r in reqs} == {"ai", "human"}
+    human = [r for r in reqs if r["kind"] == "human"][0]
+    assert human["verdict"] == "approved" and human["resolved_at"]
     assert db.get_cycle(result.cycle_id)["status"] == "merged"
 
 
@@ -98,6 +100,8 @@ async def test_cycle_human_reject_keeps_branch(tmp_repo, db):
     result = await engine.run("add a memory lesson")
     assert result.status == "rejected"
     assert db.get_cycle(result.cycle_id)["human_verdict"] == "rejected"
+    human = [r for r in db.list_review_requests(cycle_id=result.cycle_id) if r["kind"] == "human"][0]
+    assert human["verdict"] == "rejected" and human["resolved_at"]
     # branch kept, not merged: only initial commit on main
     main_log = tmp_repo._run("log", "--oneline", "main", "-10").stdout
     assert "add a memory lesson" not in main_log and "initial" in main_log

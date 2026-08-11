@@ -232,7 +232,7 @@ def _interactive_chat(profile: str | None) -> None:
 
 
 def _intro() -> None:
-    typer.echo(typer.style("Nelke chat — type your message (/exit to quit)", fg="green"))
+    typer.echo(typer.style(f"Nelke {__version__} — type your message (/exit to quit)", fg="green"))
 
 
 if __name__ == "__main__":

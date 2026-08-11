@@ -714,6 +714,9 @@ def db_cleanup() -> None:
 def doctor() -> None:
     settings = open_settings()
     console.print(Rule("[bold]Nelke doctor[/]"))
+    from nelke import __version__
+
+    console.print(f"nelke: {__version__}")
     console.print(f"python: {sys.version.split()[0]}")
     for tool in ("git", "uv"):
         console.print(f"{tool}: {shutil.which(tool) or 'NOT FOUND'}")

@@ -10,6 +10,7 @@ async ``ModalScreen``: ``CycleEngine``'s awaitable ``human_approve`` gate
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -572,4 +573,7 @@ class NelkeTUI(App):
 
 def launch() -> None:
     """Run the TUI."""
+    from nelke import __version__
+
+    print(f"nelke v{__version__} — TUI", file=sys.stderr)
     NelkeTUI().run()

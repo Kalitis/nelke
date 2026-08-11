@@ -31,6 +31,7 @@ class FakeBot:
         self.edits: list[dict[str, Any]] = []
         self.callback_answers: list[str] = []
         self._next_msg_id = 100
+        self.id = 111
 
     async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> NS:
         self.sends.append({"chat_id": chat_id, "text": text, **kwargs})
@@ -45,14 +46,29 @@ class FakeBot:
         self.callback_answers.append(text)
         return NS()
 
-    def make_message(self, text: str, chat_id: int = 1, message_id: int = 10) -> NS:
+    def make_message(
+        self,
+        text: str,
+        chat_id: int = 1,
+        message_id: int = 10,
+        chat_type: str = "private",
+        reply_to: Any = None,
+    ) -> NS:
         bot = self
 
         async def answer(body: str, **kwargs: Any) -> NS:
             await bot.send_message(chat_id, body, **kwargs)
             return NS(message_id=99, chat=NS(id=chat_id))
 
-        return NS(chat=NS(id=chat_id), text=text, message_id=message_id, answer=answer)
+        msg = NS(
+            chat=NS(id=chat_id, type=chat_type),
+            text=text,
+            message_id=message_id,
+            answer=answer,
+        )
+        if reply_to is not None:
+            msg.reply_to_message = reply_to
+        return msg
 
 
 def _cmd(args: str) -> NS:
@@ -172,6 +188,49 @@ async def test_chat_tags_session_as_telegram(settings, tmp_repo):
     db = services.open_db(settings)
     rows = db.connect().execute("SELECT frontend FROM sessions").fetchall()
     assert any(r["frontend"] == "telegram" for r in rows)
+
+
+# --------------------------------------------------------------------------- #
+# Plain-text messages (no /chat prefix)
+# --------------------------------------------------------------------------- #
+async def test_plain_text_runs_chat(settings, tmp_repo):
+    from nelke.core import services
+
+    factory = _scripted_llm_factory([final_response("plain answer")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_user_message(fake.make_message("Случилось что-то?"))
+    await _wait_for(state)
+    assert any("plain answer" in e["text"] for e in fake.edits)
+    db = services.open_db(settings)
+    rows = db.connect().execute("SELECT content FROM messages WHERE role='user'").fetchall()
+    assert any("Случилось что-то?" in r["content"] for r in rows)
+
+
+async def test_plain_text_command_like_ignored(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_user_message(fake.make_message("/unknown"))
+    assert state.tasks.get(1) is None
+    assert not fake.sends
+
+
+async def test_plain_text_group_without_address_ignored(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_user_message(fake.make_message("hello all", chat_type="group"))
+    assert state.tasks.get(1) is None
+    assert not fake.sends
+
+
+async def test_plain_text_group_reply_to_bot_runs(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("group answer")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    reply = NS(from_user=NS(id=fake.id))
+    await nelke.on_user_message(
+        fake.make_message("what do you think", chat_type="group", reply_to=reply)
+    )
+    await _wait_for(state)
+    assert any("group answer" in e["text"] for e in fake.edits)
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +375,108 @@ async def test_review_callback_already_resolved(settings, tmp_repo):
     state.gate_futures["c1"] = fut
     await nelke.on_review_callback(_callback(fake, "review:approve:c1"))
     assert "already" in fake.callback_answers[0]
+
+
+# --------------------------------------------------------------------------- #
+# /review (textual approval path)
+# --------------------------------------------------------------------------- #
+def _pending_human_review(tmp_repo, db, *, branch="improve/tg-review-1"):
+    """Create a cycle + pending human review request and a real branch to merge."""
+    cid = db.create_cycle("objective", branch)
+    db.create_review_request(cid, "human", verdict="pending")
+    tmp_repo.checkout_new_branch(branch, base="main")
+    (tmp_repo.repo / "f.txt").write_text("one\ntwo\n", encoding="utf-8")
+    tmp_repo.add_all()
+    tmp_repo.commit("improve f", "Nelke-Self-Improve: cycle c step 1")
+    tmp_repo.checkout("main")
+    req = db.list_review_requests(cycle_id=cid)[0]
+    return cid, req
+
+
+async def test_review_list_shows_open(settings, tmp_repo):
+    from nelke.core import services
+
+    db = services.open_db(settings)
+    _pending_human_review(tmp_repo, db)
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, _ = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_review(fake.make_message("/review"), _cmd(""))
+    joined = " ".join(s["text"] for s in fake.sends)
+    assert "Open human reviews" in joined
+    assert "improve/tg-review-1" in joined
+
+
+async def test_review_list_empty(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, _ = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_review(fake.make_message("/review"), _cmd(""))
+    assert any("no open human reviews" in s["text"] for s in fake.sends)
+
+
+async def test_review_approve_recovery_merges(settings, tmp_repo):
+    """No in-memory gate (e.g. bot restarted): approve resolves from the DB."""
+    from nelke.core import services
+
+    db = services.open_db(settings)
+    _, req = _pending_human_review(tmp_repo, db)
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, _ = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_review(fake.make_message("/review approve x"), _cmd(f"approve {req['id'][-12:]}"))
+    joined = " ".join(s["text"] for s in fake.sends)
+    assert "approved" in joined
+    assert tmp_repo.current_branch() == "main"
+    assert (tmp_repo.repo / "f.txt").read_text() == "one\ntwo\n"
+    assert db.list_review_requests(cycle_id=req["cycle_id"])[0]["verdict"] == "approved"
+
+
+async def test_review_reject_recovery_keeps_branch(settings, tmp_repo):
+    from nelke.core import services
+
+    db = services.open_db(settings)
+    _, req = _pending_human_review(tmp_repo, db)
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, _ = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_review(fake.make_message("/review reject x"), _cmd(f"reject {req['id'][-12:]}"))
+    joined = " ".join(s["text"] for s in fake.sends)
+    assert "rejected" in joined
+    # branch kept, nothing merged to main
+    assert tmp_repo.branch_exists("improve/tg-review-1")
+    assert not (tmp_repo.repo / "f.txt").exists()
+    assert db.list_review_requests(cycle_id=req["cycle_id"])[0]["verdict"] == "rejected"
+
+
+async def test_review_approve_resolves_in_process_future(settings, tmp_repo):
+    """A parked gate future is resolved (no DB double-merge)."""
+    from nelke.core import services
+
+    db = services.open_db(settings)
+    cid, req = _pending_human_review(tmp_repo, db, branch="improve/tg-gate-1")
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    fut: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+    state.gate_futures[cid] = fut
+    state.gate_messages[cid] = (1, 42)
+    await nelke.on_review(fake.make_message("/review approve x"), _cmd(f"approve {req['id'][-12:]}"))
+    assert fut.done() and fut.result() is True
+    assert cid not in state.gate_futures
+    joined = " ".join(s["text"] for s in fake.sends)
+    assert "approved" in joined
+    # no DB merge happened: branch was never merged by this path
+    assert db.list_review_requests(cycle_id=cid)[0]["verdict"] == "pending"
+
+
+async def test_review_unknown_prefix(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, _ = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_review(fake.make_message("/review approve deadbeef"), _cmd("approve deadbeef"))
+    assert any("no open review matches" in s["text"] for s in fake.sends)
+
+
+async def test_review_bad_usage(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, _ = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_review(fake.make_message("/review nonsense"), _cmd("nonsense"))
+    assert any("Usage: /review" in s["text"] for s in fake.sends)
 
 
 # --------------------------------------------------------------------------- #

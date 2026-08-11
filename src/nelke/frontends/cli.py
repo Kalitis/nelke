@@ -20,6 +20,7 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TaskID, TextColumn
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
@@ -208,6 +209,7 @@ def _build_session_agent(settings: Settings, profile: str | None, stream: Answer
         iteration_cap=settings.max_agent_iterations,
         code_timeout=settings.code_timeout,
         web_timeout=settings.web_timeout,
+        db=db,
     )
     return agent, db, session_id, memory
 
@@ -267,7 +269,11 @@ def _usage_line(usage: dict[str, int]) -> str:
 # Improve (self-improvement cycle)
 # --------------------------------------------------------------------------- #
 class ImproveStream:
-    """Streams cycle events into a live Rich panel with a collapsible gate block."""
+    """Streams cycle events into a live Rich panel with a collapsible gate block.
+
+    Also renders a live progress bar (steps vs total) and streams the cycle
+    worker's tool calls so the user sees exactly what is being edited.
+    """
 
     _LABELS = {
         "cycle_start": "[bold]Cycle started[/]",
@@ -290,15 +296,22 @@ class ImproveStream:
     }
     _STOP_KINDS = {"awaiting_human", "human_pending", "merged", "human_rejected", "cycle_error"}
 
-    def __init__(self, objective: str) -> None:
+    def __init__(self, objective: str, total_steps: int = 0) -> None:
         self.objective = objective
         self.rows: list[tuple[str, str]] = []
         self.gate_block: str = ""
+        self.tool_lines: list[str] = []
         self._live: Live | None = None
+        self._progress = Progress(TextColumn("[progress.description]{task.description}"),
+                                  BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"))
+        self._task_id: TaskID | None = None
+        self._total_steps = total_steps
 
     def start(self) -> None:
         self._live = Live(console=console, refresh_per_second=10, transient=False)
         self._live.start()
+        if self._total_steps:
+            self._task_id = self._progress.add_task("improve", total=self._total_steps)
         self._update()
 
     def __call__(self, event: Any) -> None:
@@ -306,6 +319,22 @@ class ImproveStream:
         self.rows.append((label, str(event.message or "")))
         if event.kind == "gate":
             self.gate_block = event.message
+        if event.kind in {"agent_tool", "agent_tool_result"}:
+            payload = event.data or {}
+            tool = payload.get("tool", "")
+            if event.kind == "agent_tool":
+                args = payload.get("args") or {}
+                args_txt = ", ".join(f"{k}={str(v)[:30]}" for k, v in list(args.items())[:2])
+                self.tool_lines.append(f"🔧 {tool}({args_txt})")
+                if "path" in args:
+                    self.tool_lines.append(f"   📄 {args['path']}")
+            else:
+                self.tool_lines.append(f"   ✔ {payload.get('snippet', '')[:120]}")
+            if len(self.tool_lines) > 8:
+                self.tool_lines = self.tool_lines[-8:]
+        prog = event.progress
+        if prog and self._task_id is not None:
+            self._progress.update(self._task_id, completed=prog[0], total=prog[1])
         if event.kind in self._STOP_KINDS:
             self.stop()
             return
@@ -329,6 +358,10 @@ class ImproveStream:
 
     def _render(self) -> Group:
         parts: list[Any] = [Text(f"objective: {self.objective[:80]}", style="bold")]
+        if self._total_steps:
+            parts.append(self._progress)
+        if self.tool_lines:
+            parts.append(Group(*[Text(line, overflow="ellipsis") for line in self.tool_lines]))
         recent = self.rows[-14:]
         if recent:
             parts.append(Group(*[Text(f"{label} {msg}", overflow="ellipsis") for label, msg in recent]))
@@ -359,7 +392,7 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
     db = open_db(settings)
     gov = Governance(git)
 
-    stream = ImproveStream(objective)
+    stream = ImproveStream(objective, total_steps=settings.max_cycle_steps)
     stream.start()
     drain = stream
 

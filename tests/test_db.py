@@ -16,8 +16,35 @@ def test_migrate_creates_all_tables(tmp_path):
             ).fetchall()
         }
     assert {
-        "sessions", "messages", "cycles", "cycle_steps", "review_requests", "tasks", "usage_events",
+        "sessions", "messages", "cycles", "cycle_steps", "review_requests", "tasks", "usage_events", "cycle_events",
     } <= tables
+
+
+def test_cycle_events_roundtrip(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    cid = db.create_cycle("improve docs", "improve/ev-more")
+
+    def _seqs(cid):
+        return [r["seq"] for r in db.list_cycle_events(cid)]
+
+    e1 = db.add_cycle_event(cid, "cycle_start", "started", {"cycle_id": cid})
+    e2 = db.add_cycle_event(cid, "agent_tool", "", {"tool": "self_write", "args": {"path": "x.py"}})
+    e3 = db.add_cycle_event(cid, "merged", "merged")
+    assert db.status()["cycle_events"] == 3
+    events = db.list_cycle_events(cid)
+    assert [r["kind"] for r in events] == ["cycle_start", "agent_tool", "merged"]
+    assert _seqs(cid) == [0, 1, 2]
+    # after_seq filters
+    after = db.list_cycle_events(cid, after_seq=0)
+    assert [r["kind"] for r in after] == ["agent_tool", "merged"]
+    # limit
+    lim = db.list_cycle_events(cid, limit=2)
+    assert len(lim) == 2
+    import json
+
+    payload = json.loads(events[1]["payload"])
+    assert payload["tool"] == "self_write"
+    assert e1 and e2 and e3
 
 
 def test_session_and_messages_roundtrip(tmp_path):

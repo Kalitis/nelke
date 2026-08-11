@@ -12,14 +12,25 @@
     <input id="chat-text" type="text" placeholder="Ask Nelke…" autocomplete="off" autofocus>
     <button type="submit">Send</button>
   </form>
-  <details class="improve">
+  <details class="improve" open>
     <summary>Self-improvement cycle</summary>
     <form id="improve-form">
       <input id="improve-objective" type="text" placeholder="Objective to improve…" autocomplete="off">
       <label><input id="improve-auto" type="checkbox"> auto-approve</label>
       <button type="submit">Improve</button>
     </form>
-    <pre id="improve-log" class="log"></pre>
+    <div id="cycle-card" class="cycle-card">
+      <div class="cycle-card-status">
+        <span id="cycle-status" class="cycle-status">idle</span>
+        <span id="cycle-objective" class="cycle-objective"></span>
+      </div>
+      <div class="progress-track"><div id="cycle-progress" class="progress-fill" style="width:0%"></div></div>
+      <div id="cycle-thought" class="cycle-thought" aria-label="agent live output"></div>
+      <pre id="improve-log" class="log"></pre>
+    </div>
   </details>
 </section>
+{% endblock %}
+{% block scripts %}
+<script src="/static/cycle.js"></script>
 {% endblock %}

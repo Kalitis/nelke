@@ -187,6 +187,34 @@ def test_improve_auto_approve_merges(settings, tmp_repo):
     assert tmp_repo.current_branch() == "main"
 
 
+def test_cycles_api_and_stream_report_progress(settings, tmp_repo):
+    """The web card reads the persisted trace via /api/cycles and /api/cycles/stream."""
+
+    # Run a full cycle (auto-approve) so events are persisted.
+    factory = _scripted_llm_factory(_good_fix_plan(), cycle_reviewer=_approved_reviewer())
+    app = create_app(AppState(
+        settings=settings, llm_factory=factory,
+        governance=FakeGovernance(), repo_path=tmp_repo.repo,
+    ))
+    TestClient(app).post("/api/improve", json={"objective": "add a memory lesson", "auto_approve": True})
+
+    with TestClient(app) as c:
+        r = c.get("/api/cycles")
+        assert r.status_code == 200
+        cycles = r.json()
+        assert cycles, "expected a cycle record"
+        kinds = {ev["kind"] for ev in cycles[-1]["events"]}
+        assert "agent_tool" in kinds
+        assert "merged" in kinds
+        # SSE stream replays the trace (replay_only makes the generator return
+        # after draining the persisted events so TestClient doesn't hang).
+        s = c.get("/api/cycles/stream?replay_only=1")
+        assert s.status_code == 200
+        body = s.text.replace("\r\n", "\n")
+        assert "cycle_event" in body
+        assert "self_write" in body
+
+
 def _wait_for_review(settings, timeout: float = 5.0) -> list[dict[str, Any]]:
     """Poll until the cycle reaches the human gate and creates a review request."""
     import time

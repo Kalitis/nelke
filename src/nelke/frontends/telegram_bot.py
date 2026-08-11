@@ -39,6 +39,45 @@ load_env_files()
 _ACK_CHAT = "🤔 working…"
 _ACK_IMPROVE = "🔧 cycle starting…"
 _EDIT_INTERVAL = 0.5  # throttle message edits while streaming
+_PROGRESS_REPORT_EVENTS = 12  # one TG progress report per this many cycle events
+
+
+def _cycle_progress_report(settings: Settings, cycle_id: str, *, repo_path: Any = None) -> str:
+    """Build a human-readable progress report from the persisted cycle trace."""
+    db = services.open_db(settings)
+    cycle = db.get_cycle(cycle_id)
+    if cycle is None:
+        return f"cycle {cycle_id}: unknown"
+    events = db.list_cycle_events(cycle_id, limit=60)
+    lines = [
+        f"🔧 cycle: {cycle_id[:16]}…  status={cycle['status']}",
+        f"objective: {cycle['objective'][:80]}",
+        f"branch: {cycle['branch']}",
+    ]
+    for ev in events:
+        kind = ev["kind"]
+        if kind == "agent_token":
+            continue
+        if kind in {"agent_tool", "agent_tool_result"}:
+            import json
+
+            payload = {}
+            try:
+                payload = json.loads(ev["payload"] or "{}")
+            except (ValueError, TypeError):
+                pass
+            tool = payload.get("tool", "")
+            if kind == "agent_tool":
+                args = payload.get("args") or {}
+                args_txt = ", ".join(
+                    f"{k}={str(v)[:25]}" for k, v in list(args.items())[:2]
+                )
+                lines.append(f"  · {tool}({args_txt})")
+            else:
+                lines.append(f"  · → {tool}: {payload.get('snippet', '')[:120]}")
+            continue
+        lines.append(f"  · {ev['kind']}: {(ev['message'] or '')[:160]}")
+    return "\n".join(lines[:60])
 
 
 # --------------------------------------------------------------------------- #
@@ -175,6 +214,27 @@ class NelkeBot:
         self.state.tasks[chat_id] = task
 
     async def _run_improve(self, chat_id: int, message_id: int, objective: str) -> None:
+        # Issue periodic progress reports so the user can see what the cycle did
+        # without polling the message (TL;DR: one report per N cycle events).
+        last_report_events = 0
+
+        async def maybe_report(cycle_id: str) -> None:
+            nonlocal last_report_events
+            db = services.open_db(self.state.settings)
+            try:
+                n_events = len(db.list_cycle_events(cycle_id))
+            except Exception:  # noqa: BLE001 - progress must never crash the cycle
+                n_events = 0
+            if n_events - last_report_events >= _PROGRESS_REPORT_EVENTS:
+                last_report_events = n_events
+                try:
+                    report = _cycle_progress_report(
+                        self.state.settings, cycle_id, repo_path=self.state.repo_path,
+                    )
+                    await self.bot.send_message(chat_id, report[:3500])
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+
         async def human_gate(req: Any) -> bool:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="✅ Approve", callback_data=f"review:approve:{req.cycle_id}"),
@@ -200,6 +260,7 @@ class NelkeBot:
                 repo_path=self.state.repo_path,
                 llm_factory=self.state.llm_factory or services._llm_factory_default,
                 governance=self.state.governance,
+                on_event=lambda ev: maybe_report(ev.cycle_id),
             )
             await self.bot.edit_message_text(
                 f"cycle {result.status}\nbranch: {result.branch}\nsteps: {result.steps}",

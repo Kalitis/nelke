@@ -93,6 +93,31 @@ async def test_memory_recall_and_index(tmp_path):
     assert "safety" in hits[0].snippet
 
 
+async def test_memory_list_and_show(tmp_path):
+    store = MemoryStore(tmp_path / "memory")
+    store.write("skills.md", "# Skills\n\nUse the tool loop for safety.\ntags: skills", overwrite=True)
+    store.write("facts/llm.md", "# LLMs\n\nLocal models may lack function calling.", overwrite=True)
+    listed = await mem_tools.MemoryListTool(store).execute()
+    assert {"skills.md", "facts/llm.md"} <= set(listed.output.splitlines())
+    shown = await mem_tools.MemoryShowTool(store).execute(path="skills.md")
+    assert shown.ok
+    assert "# Skills" in shown.output
+    assert "tool loop" in shown.output
+
+
+async def test_memory_show_missing_file(tmp_path):
+    store = MemoryStore(tmp_path / "memory")
+    r = await mem_tools.MemoryShowTool(store).execute(path="nope.md")
+    assert not r.ok
+    assert "nope.md" in r.error
+
+
+async def test_memory_show_refuses_escape(tmp_path):
+    store = MemoryStore(tmp_path / "memory")
+    r = await mem_tools.MemoryShowTool(store).execute(path="../evil.md")
+    assert not r.ok
+
+
 async def test_memory_write_tool_appends_and_rebuilds(tmp_path):
     store = MemoryStore(tmp_path / "memory")
     tool = mem_tools.MemoryWriteTool(store)

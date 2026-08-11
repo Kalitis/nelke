@@ -89,7 +89,10 @@ def _parse_sse(body: str) -> list[tuple[str, str]]:
 # --------------------------------------------------------------------------- #
 # Pages
 # --------------------------------------------------------------------------- #
-def test_index_page_returns_chat_ui(settings, tmp_repo):
+def test_index_page_returns_chat_ui(settings, tmp_repo, monkeypatch):
+    # Force the legacy Jinja2 UI: the SPA (if built under static/dist) takes
+    # over `/` by default, but the legacy page must remain reachable.
+    monkeypatch.setenv("NELKE_WEB_LEGACY", "1")
     app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
     with TestClient(app) as client:
         resp = client.get("/")
@@ -223,9 +226,10 @@ def test_chat_message_in_session_persists_history(settings, tmp_repo):
         roles = [m["role"] for m in det["messages"]]
         assert "user" in roles
         assert "assistant" in roles
-    # per-chat memory store created in the repo
-    chat_mem = tmp_repo.repo / "memory" / "chats" / cid / "INDEX.md"
-    assert chat_mem.exists()
+    # global memory store is shared by chats (no per-chat memory dir)
+    index = tmp_repo.repo / "memory" / "INDEX.md"
+    assert index.exists()
+    assert not (tmp_repo.repo / "memory" / "chats").exists()
 
 
 def test_chat_message_unknown_chat_returns_404(settings, tmp_repo):
@@ -403,3 +407,122 @@ def test_resolve_review_unknown_id_404(settings, tmp_repo):
     with client:
         r = client.post("/api/review/nonexistent", json={"decision": "approved"})
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Message tree endpoints (edit / regenerate / swipe / delete / tree)
+# --------------------------------------------------------------------------- #
+def _seed_chat_with_two_turns(settings, tmp_repo, factory):
+    """Create a chat with user→assistant→user→assistant history; return chat id."""
+    from nelke.core import services
+
+    cid = services.create_chat(settings, frontend="web")
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        client.post(f"/api/chats/{cid}/messages", json={"text": "first"})
+        client.post(f"/api/chats/{cid}/messages", json={"text": "second"})
+    return cid
+
+
+def test_tree_endpoint_returns_nodes(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("a1"), final_response("a2")])
+    cid = _seed_chat_with_two_turns(settings, tmp_repo, factory)
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        r = client.get(f"/api/chats/{cid}/tree")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["root_id"] is not None
+    # 4 nodes: 2 user + 2 assistant in a linear chain.
+    assert len(body["nodes"]) == 4
+    assert body["active_leaf_id"] is not None
+
+
+def test_edit_message_creates_sibling_and_sets_active(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("a1"), final_response("a2")])
+    cid = _seed_chat_with_two_turns(settings, tmp_repo, factory)
+    from nelke.core import services
+
+    db = services.open_db(settings)
+    # Find the first user message to edit.
+    first_user = next(
+        m for m in db.list_messages(cid, active_only=False) if m["role"] == "user"
+    )
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        r = client.patch(
+            f"/api/chats/{cid}/messages/{first_user['id']}",
+            json={"content": "edited first"},
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["parent_id"] is None  # root user message
+    new_id = body["message_id"]
+    # New sibling is active; old subtree soft-deleted.
+    new_row = db.get_message(new_id)
+    assert new_row["content"] == "edited first"
+    assert new_row["is_active"] == 1
+    assert db.get_message(first_user["id"])["is_deleted"] == 1
+
+
+def test_delete_message_soft_deletes_and_repairs_active_path(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("a1"), final_response("a2")])
+    cid = _seed_chat_with_two_turns(settings, tmp_repo, factory)
+    from nelke.core import services
+
+    db = services.open_db(settings)
+    messages = db.list_messages(cid, active_only=False)
+    leaf = messages[-1]  # last assistant message
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        r = client.delete(f"/api/chats/{cid}/messages/{leaf['id']}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["deleted_id"] == leaf["id"]
+    # Deleted leaf tombstoned; an earlier node becomes the active leaf.
+    assert db.get_message(leaf["id"])["is_deleted"] == 1
+    assert body["active_leaf_id"] is not None
+
+
+def test_swipe_activate_switches_active_path(settings, tmp_repo):
+    """Two assistant siblings under the same user → activate switches the leaf."""
+    from nelke.core import services
+
+    cid = services.create_chat(settings, frontend="web")
+    db = services.open_db(settings)
+    # Seed a user message with two assistant siblings directly in the DB.
+    user_id = db.add_message(cid, "user", "hi")
+    first_id = db.add_message(cid, "assistant", "answer one", parent_id=user_id,
+                              is_active=True, sibling_order=0)
+    second_id = db.add_message(cid, "assistant", "answer two", parent_id=user_id,
+                               is_active=False, sibling_order=1)
+    assert db.active_leaf(cid)["id"] == first_id
+
+    factory = _scripted_llm_factory([final_response("x")])
+    client = _client(settings, tmp_repo, factory)
+    with client:
+        r = client.post(f"/api/chats/{cid}/messages/{second_id}/activate")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active_leaf_id"] == second_id
+    # The second answer is now on the active path; the first is inactive.
+    assert db.get_message(second_id)["is_active"] == 1
+    assert db.get_message(first_id)["is_active"] == 0
+
+
+def test_spa_served_when_dist_built(settings, tmp_repo, monkeypatch):
+    """`/` returns the SPA entry when a build is present."""
+    from nelke.frontends import web as web_mod
+
+    # Pretend a build exists by stubbing the locator.
+    fake_dist = tmp_repo.repo / "static" / "dist"
+    fake_dist.mkdir(parents=True)
+    (fake_dist / "index.html").write_text("<!doctype html><html>SPA</html>")
+    (fake_dist / "assets").mkdir()  # the SPA mount expects an assets subdir
+    monkeypatch.setattr(web_mod, "_spa_dist_dir", lambda: fake_dist)
+    monkeypatch.delenv("NELKE_WEB_LEGACY", raising=False)
+    app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    with TestClient(app) as client:
+        r = client.get("/")
+    assert r.status_code == 200
+    assert "SPA" in r.text

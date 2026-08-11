@@ -41,6 +41,12 @@ packages = ["src/nelke"]
 "templates" = "nelke/templates"
 "static" = "nelke/static"
 
+# SPA build: the wheel ships whatever has been pre-built under static/dist.
+# Run `npm run build` in web-ui/ before building a release wheel (the Vite
+# config emits to ../static/dist). A reference hatch build hook lives at
+# src/nelke/_hatch_build.py; it can be enabled by packaging it as a separate
+# plugin and registering under [tool.hatch.build.hooks.<name>] when needed.
+
 [dependency-groups]
 dev = [
     "pytest>=8",

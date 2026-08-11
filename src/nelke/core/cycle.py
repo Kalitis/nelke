@@ -21,7 +21,7 @@ from nelke.core.governance import Governance
 from nelke.core.llm import ToolCallback
 from nelke.core.memory import MemoryStore
 from nelke.core.reviewer import Reviewer, ReviewVerdict
-from nelke.core.tools.memory import MemoryWriteTool, RecallTool
+from nelke.core.tools.memory import MemoryListTool, MemoryShowTool, MemoryWriteTool, RecallTool
 from nelke.core.tools.selfedit import (
     BootCheckTool,
     GitBranchInfoTool,
@@ -41,7 +41,8 @@ from nelke.core.tools.selfedit import (
 
 CYCLE_WORK_PROMPT = """You are Nelke operating on your OWN repository. Your job is to
 improve the repository to satisfy the user objective. You have self-edit tools scoped
-to the repo root, memory tools (recall/memory_write under memory/), and git tools.
+to the repo root, memory tools (recall/memory_show/memory_list/memory_write under
+memory/), and git tools.
 The gates (run_tests / run_lint / run_typecheck / boot_check) and commits are run by
 the cycle engine automatically after you finish — do not call them yourself.
 
@@ -193,6 +194,8 @@ class CycleEngine:
             SelfGlobTool(ctx),
             SelfGrepTool(ctx),
             RecallTool(memory),
+            MemoryShowTool(memory),
+            MemoryListTool(memory),
             MemoryWriteTool(memory),
             RunLintTool(ctx),
             RunTypecheckTool(ctx),
@@ -212,6 +215,7 @@ class CycleEngine:
             stream=True,
             on_token=self.on_token,
             memory_index=memory.index_text() or None,
+            memory_location=str(memory.memory_dir),
             temperature=self.agent_temperature,
         )
 

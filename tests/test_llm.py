@@ -7,8 +7,10 @@ from types import SimpleNamespace as NS
 from nelke.core.llm import (
     LLMClient,
     _fallback_tool_calls,
+    _usage_to_dict,
     parse_action_input,
     parse_react_actions,
+    usage_cache_pct,
 )
 
 
@@ -50,7 +52,7 @@ def test_parse_action_input_json_object():
 
 
 def test_parse_action_input_code_fenced_json():
-    schemas = []
+    schemas: list[dict] = []
     raw = '```json\n{"query": "x"}\n```'
     assert parse_action_input(raw, schemas, "any") == {"query": "x"}
 
@@ -96,6 +98,7 @@ def test_parse_native_tool_calls():
     out = cli._parse_non_stream(resp, tools=None)
     assert out.tool_calls[0].name == "read"
     assert out.tool_calls[0].arguments == {"path": "x"}
+    assert out.usage is not None
     assert out.usage["total_tokens"] == 3
 
 
@@ -173,3 +176,80 @@ async def test_stream_tool_call_accumulation():
     assert calls[0].name == "re"
     assert calls[0].arguments == {"path": "x"}
     assert finish == "tool_calls"
+
+
+# --------------------------------------------------------------------------- #
+# Usage normalization: prompt-cache metrics
+# --------------------------------------------------------------------------- #
+def test_usage_dict_captures_openai_cached_tokens():
+    usage = NS(
+        prompt_tokens=1500,
+        completion_tokens=50,
+        total_tokens=1550,
+        prompt_tokens_details=NS(cached_tokens=1000),
+    )
+    d = _usage_to_dict(usage)
+    assert d["prompt_tokens"] == 1500
+    assert d["total_tokens"] == 1550
+    assert d["cache_read_tokens"] == 1000
+    assert d["cache_write_tokens"] == 0
+
+
+def test_usage_dict_captures_deepseek_cache_tokens():
+    usage = NS(
+        prompt_tokens=1500,
+        completion_tokens=60,
+        total_tokens=1560,
+        prompt_cache_hit_tokens=1210,
+        prompt_cache_miss_tokens=290,
+    )
+    d = _usage_to_dict(usage)
+    assert d["cache_read_tokens"] == 1210
+    assert d["cache_write_tokens"] == 290
+
+
+def test_usage_dict_no_cache_fields_default_to_zero():
+    usage = NS(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    d = _usage_to_dict(usage)
+    assert d == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
+
+
+def test_usage_dict_openai_details_win_over_deepseek_fields():
+    usage = NS(
+        prompt_tokens=100,
+        completion_tokens=1,
+        total_tokens=101,
+        prompt_tokens_details=NS(cached_tokens=99),
+        prompt_cache_hit_tokens=50,
+    )
+    d = _usage_to_dict(usage)
+    assert d["cache_read_tokens"] == 99
+
+
+def test_usage_dict_empty_on_missing_attrs():
+    assert _usage_to_dict(NS()) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Cache-read percentage helper
+# --------------------------------------------------------------------------- #
+def test_usage_cache_pct_rounds_to_integer():
+    assert usage_cache_pct({"prompt_tokens": 3616, "cache_read_tokens": 3328}) == 92
+    assert usage_cache_pct({"prompt_tokens": 100, "cache_read_tokens": 50}) == 50
+
+
+def test_usage_cache_pct_zero_without_prompt():
+    assert usage_cache_pct({}) == 0
+    assert usage_cache_pct({"prompt_tokens": 0, "cache_read_tokens": 10}) == 0
+    assert usage_cache_pct({"prompt_tokens": 10, "cache_read_tokens": 0}) == 0
+
+
+def test_usage_cache_pct_full_and_partial():
+    assert usage_cache_pct({"prompt_tokens": 100, "cache_read_tokens": 100}) == 100
+    assert usage_cache_pct({"prompt_tokens": 3, "cache_read_tokens": 1}) == 33

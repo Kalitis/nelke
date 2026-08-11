@@ -59,6 +59,50 @@ TEMPLATES_DIR = _web_asset_dir("templates", "base.html")
 STATIC_DIR = _web_asset_dir("static", "app.js")
 
 
+def _spa_dist_dir() -> Path | None:
+    """Locate the built SPA bundle (``static/dist``) if it exists.
+
+    Searched in the same roots as the other assets. Returns ``None`` when no
+    build is present (dev checkout without Node, or ``NELKE_SKIP_WEB_BUILD``).
+    Honours ``NELKE_WEB_LEGACY=1`` to force the legacy Jinja2 UI (used by
+    tests and as an escape hatch when the SPA misbehaves).
+    """
+    if _legacy_forced():
+        return None
+    from nelke.core import services
+
+    for root in (services.find_repo(), Path.cwd(), _PKG_DIR.parent):
+        cand = root / "static" / "dist"
+        if (cand / "index.html").is_file():
+            return cand
+    return None
+
+
+def _spa_dev_mode() -> bool:
+    """True when the SPA should be served from the Vite dev server (:5173)."""
+    return os.environ.get("NELKE_WEB_DEV", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _legacy_forced() -> bool:
+    """True when the legacy Jinja2 UI should be served instead of the SPA."""
+    return os.environ.get("NELKE_WEB_LEGACY", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _spa_index_html() -> str:
+    """HTML for the SPA entry: dev-server redirect or the built bundle."""
+    if _spa_dev_mode():
+        # Redirect to the Vite dev server which serves the SPA with HMR.
+        return (
+            "<!doctype html><html><head>"
+            '<meta http-equiv="refresh" content="0; url=http://localhost:5173/">'
+            "<title>Nelke (dev)</title></head><body></body></html>"
+        )
+    dist = _spa_dist_dir()
+    if dist is None:
+        return ""
+    return (dist / "index.html").read_text(encoding="utf-8")
+
+
 # --------------------------------------------------------------------------- #
 # App state
 # --------------------------------------------------------------------------- #
@@ -114,9 +158,22 @@ def create_app(state: AppState | None = None) -> FastAPI:
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    # Serve the built SPA assets (Vite emits hashed bundles under /assets)
+    # when a build is available. The SPA entry itself is served by `/`.
+    spa_dist = _spa_dist_dir()
+    if spa_dist is not None and not _spa_dev_mode():
+        app.mount("/assets", StaticFiles(directory=str(spa_dist / "assets")), name="spa-assets")
+        # favicon + any other root-level static from the build.
+        app.mount("/favicon.svg", StaticFiles(directory=str(spa_dist), html=False), name="favicon")
+
     # ---- pages -------------------------------------------------------------
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
+        # Prefer the SPA when a build (or dev-mode redirect) is available;
+        # fall back to the legacy Jinja2 chat UI otherwise.
+        spa_html = _spa_index_html()
+        if spa_html:
+            return HTMLResponse(spa_html)
         profiles = _profile_rows()
         return templates.TemplateResponse(request, "index.html", {"profiles": profiles})
 
@@ -172,6 +229,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
                     "prompt_tokens": r["prompt_tokens"],
                     "completion_tokens": r["completion_tokens"],
                     "total_tokens": r["total_tokens"],
+                    "cache_read_tokens": r["cache_read_tokens"],
+                    "cache_read_pct": r["cache_read_pct"],
                     "created_at": r["created_at"],
                     "session_id": r["session_id"],
                     "cycle_id": r["cycle_id"],
@@ -301,7 +360,7 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
             async def runner() -> None:
                 try:
-                    result, cid = await services.run_chat_turn(
+                    result, cid, user_msg_id = await services.run_chat_turn(
                         text, state.settings, profile, chat_id,
                         frontend_name="web",
                         callbacks=Callbacks(on_token=on_token, on_tool=on_tool,
@@ -309,11 +368,20 @@ def create_app(state: AppState | None = None) -> FastAPI:
                                             on_usage=on_usage, stream=True),
                         repo=state.repo_path,
                         llm_factory=state.llm_factory,
+                        parent_message_id=payload.get("parent_message_id"),
                     )
+                    leaf_id = None
+                    leaf = services.open_db(state.settings).active_leaf(cid)
+                    if leaf is not None:
+                        leaf_id = leaf["id"]
                     await queue.put({
                         "event": "done",
-                        "data": json.dumps({"answer": result.answer, "usage": result.usage,
-                                            "chat_id": cid}),
+                        "data": json.dumps({
+                            "answer": result.answer, "usage": result.usage,
+                            "chat_id": cid,
+                            "user_message_id": user_msg_id,
+                            "assistant_message_id": leaf_id,
+                        }),
                     })
                 except Exception as exc:  # noqa: BLE001 - surface to the client
                     await queue.put({"event": "error", "data": json.dumps({"message": str(exc)})})
@@ -328,6 +396,121 @@ def create_app(state: AppState | None = None) -> FastAPI:
                 yield item
 
         return EventSourceResponse(stream())
+
+    # ---- message tree: edit / regenerate / branch (swipe) / delete ----------
+    @app.get("/api/chats/{chat_id}/tree")
+    async def api_chat_tree(chat_id: str) -> JSONResponse:
+        """Full non-deleted message tree of a chat (all branches)."""
+        db = services.open_db(state.settings)
+        if db.get_session(chat_id) is None:
+            return _error_response_not_found()
+        tree = services.build_message_tree(db, chat_id)
+        leaf = db.active_leaf(chat_id)
+        return JSONResponse({
+            "nodes": tree["nodes"], "children": tree["children"],
+            "root_id": tree["root_id"],
+            "active_leaf_id": leaf["id"] if leaf else None,
+        })
+
+    @app.patch("/api/chats/{chat_id}/messages/{message_id}")
+    async def api_edit_message(chat_id: str, message_id: str, payload: dict[str, Any]) -> JSONResponse:
+        """Edit a user message: soft-delete its subtree and create a sibling.
+
+        The frontend then POSTs ``/api/chats/{chat_id}/messages`` with the
+        returned ``message_id`` as ``parent_message_id`` to generate the new
+        assistant answer on the edited branch.
+        """
+        content = str(payload.get("content", "")).strip()
+        if not content:
+            return JSONResponse({"error": "empty content"}, status_code=400)
+        result = services.edit_message(state.settings, chat_id, message_id, content)
+        if result is None:
+            return JSONResponse({"error": "message not found or not editable"}, status_code=404)
+        return JSONResponse(result)
+
+    @app.post("/api/chats/{chat_id}/messages/{message_id}/regenerate")
+    async def api_regenerate_message(chat_id: str, message_id: str, payload: dict[str, Any]) -> Response:
+        """Stream a fresh assistant answer for an existing assistant message.
+
+        Soft-deletes the old assistant subtree and re-runs the parent turn,
+        streaming tokens/tools/usage exactly like ``/api/chats/{id}/messages``.
+        """
+        db = services.open_db(state.settings)
+        if db.get_session(chat_id) is None:
+            return _error_response_not_found()
+        row = db.get_message(message_id)
+        if row is None or row["session_id"] != chat_id or row["role"] != "assistant":
+            return JSONResponse({"error": "assistant message not found"}, status_code=404)
+        profile = payload.get("profile")
+
+        async def stream() -> AsyncIterator[dict[str, Any]]:
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            done = object()
+
+            def on_token(tok: str) -> None:
+                queue.put_nowait({"event": "token", "data": json.dumps({"text": tok})})
+
+            def on_tool(name: str, args: dict[str, Any]) -> None:
+                queue.put_nowait({"event": "tool", "data": json.dumps({"name": name, "args": _trim(args)})})
+
+            def on_tool_result(name: str, args: dict[str, Any], result: str) -> None:
+                queue.put_nowait({
+                    "event": "tool_result",
+                    "data": json.dumps({"name": name, "snippet": result[:200]}),
+                })
+
+            def on_usage(usage: dict[str, Any]) -> None:
+                queue.put_nowait({"event": "usage", "data": json.dumps(usage)})
+
+            async def runner() -> None:
+                try:
+                    result, cid, _ = await services.regenerate_response(
+                        state.settings, profile, chat_id, message_id,
+                        frontend_name="web",
+                        callbacks=Callbacks(on_token=on_token, on_tool=on_tool,
+                                            on_tool_result=on_tool_result,
+                                            on_usage=on_usage, stream=True),
+                        repo=state.repo_path,
+                        llm_factory=state.llm_factory,
+                    )
+                    leaf = services.open_db(state.settings).active_leaf(cid)
+                    leaf_id = leaf["id"] if leaf else None
+                    await queue.put({
+                        "event": "done",
+                        "data": json.dumps({
+                            "answer": result.answer, "usage": result.usage,
+                            "chat_id": cid, "assistant_message_id": leaf_id,
+                        }),
+                    })
+                except Exception as exc:  # noqa: BLE001 - surface to the client
+                    await queue.put({"event": "error", "data": json.dumps({"message": str(exc)})})
+                finally:
+                    await queue.put(done)  # type: ignore[arg-type]
+
+            asyncio.create_task(runner())
+            while True:
+                item = await queue.get()
+                if item is done:
+                    break
+                yield item
+
+        return EventSourceResponse(stream())
+
+    @app.delete("/api/chats/{chat_id}/messages/{message_id}")
+    async def api_delete_message(chat_id: str, message_id: str) -> JSONResponse:
+        """Soft-delete a message and its subtree; returns the new active leaf."""
+        result = services.delete_message(state.settings, chat_id, message_id)
+        if result is None:
+            return JSONResponse({"error": "message not found"}, status_code=404)
+        return JSONResponse(result)
+
+    @app.post("/api/chats/{chat_id}/messages/{message_id}/activate")
+    async def api_activate_message(chat_id: str, message_id: str) -> JSONResponse:
+        """Switch the visible branch (swipe) to the one through ``message_id``."""
+        result = services.set_active_message(state.settings, chat_id, message_id)
+        if result is None:
+            return JSONResponse({"error": "message not found"}, status_code=404)
+        return JSONResponse(result)
 
     @app.post("/api/improve")
     async def api_improve(payload: dict[str, Any]) -> JSONResponse:
@@ -500,6 +683,21 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "branch": outcome.branch, "error": outcome.error,
         })
 
+    # ---- SPA catch-all -----------------------------------------------------
+    # Any non-API GET that no explicit route matched falls back to the SPA
+    # entry (client-side router takes over). When no SPA build exists we 404
+    # rather than shadow the JSON error path. The response type is deliberately
+    # ``Response``: API/static misses return JSON, everything else returns HTML.
+    @app.get("/{path:path}")
+    async def spa_fallback(path: str) -> Response:
+        if path.startswith("api/") or path.startswith("static/") or path.startswith("assets/"):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        # Legacy pages render server-side; if they matched we never reach here.
+        spa_html = _spa_index_html()
+        if spa_html:
+            return HTMLResponse(spa_html)
+        return JSONResponse({"error": "not found"}, status_code=404)
+
     return app
 
 
@@ -519,10 +717,16 @@ def _profile_rows() -> list[dict[str, str]]:
 
 
 def _trim(args: dict[str, Any]) -> dict[str, Any]:
+    """Trim tool-call args for the streaming UI.
+
+    Frontend renders each call as a collapsed block; a few keys with a generous
+    truncation give enough context to identify the call without leaking whole
+    file bodies into the SSE stream.
+    """
     out: dict[str, Any] = {}
-    for k, v in list(args.items())[:2]:
+    for k, v in list(args.items())[:4]:
         text = str(v)
-        out[k] = text[:60] + "..." if len(text) > 60 else text
+        out[k] = text[:200] + "..." if len(text) > 200 else text
     return out
 
 

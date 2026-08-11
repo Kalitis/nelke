@@ -26,6 +26,7 @@ from rich.table import Table
 from rich.text import Text
 
 from nelke.config import ProfileError, Settings, get_profile, load_env_files, load_profiles
+from nelke.core.llm import usage_cache_pct
 
 for _stream in (sys.stdout, sys.stderr):
     _reconfigure = getattr(_stream, "reconfigure", None)
@@ -99,7 +100,10 @@ class AnswerStream:
         self.buffer: list[str] = []
         self.tools: list[str] = []
         self.results: list[str] = []
-        self.usage_total: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        self.usage_total: dict[str, int] = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cache_read_tokens": 0, "calls": 0,
+        }
         self._live: Live | None = None
 
     def start(self) -> None:
@@ -131,6 +135,7 @@ class AnswerStream:
     def on_usage(self, usage: dict[str, Any]) -> None:
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             self.usage_total[key] += int(usage.get(key, 0) or 0)
+        self.usage_total["cache_read_tokens"] += int(usage.get("cache_read_tokens", 0) or 0)
         self.usage_total["calls"] += 1
         self._update()
 
@@ -141,6 +146,7 @@ class AnswerStream:
             parts.append(
                 Text(
                     f"tokens: {usage['total_tokens']}"
+                    f" (cache {usage_cache_pct(usage)}% of prompt)"
                     f" ({usage['calls']} call{'s' if usage['calls'] != 1 else ''})",
                     style="dim",
                 )
@@ -291,9 +297,11 @@ def run_task(text: str, *, profile: str | None = None, interactive: bool = False
 
 def _usage_line(usage: dict[str, int]) -> str:
     calls = int(usage.get("calls", 0))
+    pct = int(usage.get("cache_read_pct") or usage_cache_pct(usage))
     return (
         f"[dim]tokens: {usage.get('total_tokens', 0)} "
-        f"(prompt {usage.get('prompt_tokens', 0)} + completion {usage.get('completion_tokens', 0)}) - "
+        f"(prompt {usage.get('prompt_tokens', 0)} + completion {usage.get('completion_tokens', 0)}"
+        f", cache {pct}%) - "
         f"{calls} LLM call{'s' if calls != 1 else ''}[/]"
     )
 
@@ -334,7 +342,10 @@ class ImproveStream:
         self.rows: list[tuple[str, str]] = []
         self.gate_block: str = ""
         self.tool_lines: list[str] = []
-        self.usage_total: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        self.usage_total: dict[str, int] = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cache_read_tokens": 0, "calls": 0,
+        }
         self._live: Live | None = None
         self._progress = Progress(TextColumn("[progress.description]{task.description}"),
                                   BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"))
@@ -353,6 +364,7 @@ class ImproveStream:
             payload = event.data or {}
             for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 self.usage_total[key] += int(payload.get(key, 0) or 0)
+            self.usage_total["cache_read_tokens"] += int(payload.get("cache_read_tokens", 0) or 0)
             self.usage_total["calls"] += 1
             self._update()
             return
@@ -406,7 +418,7 @@ class ImproveStream:
             parts.append(
                 Text(
                     f"tokens: {usage['total_tokens']} (prompt {usage['prompt_tokens']} "
-                    f"+ completion {usage['completion_tokens']}) · "
+                    f"+ completion {usage['completion_tokens']}, cache {usage_cache_pct(usage)}%) · "
                     f"{usage['calls']} call{'s' if usage['calls'] != 1 else ''}",
                     style="dim",
                 )
@@ -475,7 +487,8 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
     usage = db.usage_totals(cycle_id=result.cycle_id)
     usage_text = (
         f"tokens: {usage['total_tokens']} (prompt {usage['prompt_tokens']} + "
-        f"completion {usage['completion_tokens']})  -  {usage['calls']} LLM calls"
+        f"completion {usage['completion_tokens']}, cache {usage.get('cache_read_pct', 0)}%)  -  "
+        f"{usage['calls']} LLM calls"
     )
     console.print(Panel(
         f"cycle: [bold]{result.cycle_id}[/]\nbranch: {result.branch}\nstatus: [bold]{result.status}[/]\n"

@@ -34,6 +34,53 @@ class RecallTool(BaseTool):
         return ToolResult.success("\n".join(lines))
 
 
+class MemoryListTool(BaseTool):
+    name = "memory_list"
+    description = (
+        "List every markdown file in the persistent memory store (short names "
+        "like 'skills.md', 'facts/llms.md')."
+    )
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self, store: MemoryStore) -> None:
+        self.store = store
+
+    async def execute(self, **kwargs) -> ToolResult:
+        files = self.store.files()
+        if not files:
+            return ToolResult.success("memory store is empty")
+        return ToolResult.success("\n".join(f.as_posix() for f in files))
+
+
+class MemoryShowTool(BaseTool):
+    name = "memory_show"
+    description = (
+        "Return the full text of a file in the persistent memory store by short "
+        "name (e.g. 'skills.md' or 'facts/llms.md'). Short names come from `recall` "
+        "results and `memory_list`. Use after `recall` to read the whole source."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File under memory/, e.g. 'skills.md' or 'facts/llms.md'"},
+        },
+        "required": ["path"],
+    }
+
+    def __init__(self, store: MemoryStore) -> None:
+        self.store = store
+
+    async def execute(self, **kwargs) -> ToolResult:
+        path = str(kwargs.get("path", ""))
+        try:
+            content = self.store.read(path)
+        except (ToolError, FileNotFoundError, OSError) as exc:
+            return ToolResult.failure(f"memory_show failed: {exc}")
+        if len(content) > 60_000:
+            content = content[:60_000] + "\n...[truncated]"
+        return ToolResult.success(content)
+
+
 class MemoryWriteTool(BaseTool):
     name = "memory_write"
     description = (

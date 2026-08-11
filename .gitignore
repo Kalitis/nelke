@@ -25,5 +25,9 @@ Thumbs.db
 gui-test-screenshots/
 node_modules/
 
+# Frontend build artifacts (web-ui SPA → static/dist at build time)
+web-ui/dist/
+static/dist/
+
 # Per-chat memory (session-scoped, not durable repo knowledge)
 memory/chats/

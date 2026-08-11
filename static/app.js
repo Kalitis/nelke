@@ -87,7 +87,16 @@
       } else if (m.role === "assistant") {
         var a = document.createElement("div");
         a.className = "answer";
-        a.textContent = m.content || "(no answer)";
+        if (m.content) {
+          a.textContent = m.content;
+        } else if (m.tool_calls && m.tool_calls.length) {
+          a.className = "tool";
+          a.textContent = "→ tools: " + m.tool_calls.map(function (t) {
+            return (t.function && t.function.name) || "?";
+          }).join(", ");
+        } else {
+          a.textContent = "(no answer)";
+        }
         transcript.appendChild(a);
       }
     });
@@ -101,7 +110,7 @@
     panel.hidden = false;
     var h = document.createElement("div");
     h.className = "memory-head";
-    h.textContent = "Chat memory (" + files.length + " file" + (files.length === 1 ? "" : "s") + ")";
+    h.textContent = "Memory (" + files.length + " file" + (files.length === 1 ? "" : "s") + ")";
     panel.appendChild(h);
     files.forEach(function (f) {
       var li = document.createElement("div");

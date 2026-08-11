@@ -6,6 +6,6 @@ tags: facts, llm, providers
 - Profiles live in `~/.nelke/config.toml`; secrets come from env vars via `api_key_ref`.
 - LM Studio: http://localhost:1234/v1 ; Ollama: http://localhost:11434/v1 ; keys can be dummy.
 
-## Prompt caching (why Nelke used ~10x more tokens)
-- OpenAI-compatible providers (OpenAI, OpenRouter, many proxies) enable **automatic prompt caching** only when `temperature=0`. Any non-zero temperature disables prefix caching, so every agent-loop call re-bills the whole growing prompt (~10x cost on long tool loops).
-- Nelke now defaults `agent_temperature` to `0.0` (Settings, `NELKE_AGENT_TEMPERATURE`) and threads it to the agent, subagents, cycle-worker and reviewer so caching actually engages. #facts llm caching temperature cost
+## Prompt caching
+- Automatic prompt caching engages on identical, long prefixes — **not gated by temperature**. Verified on dslab 2026-08-11: a repeated ~3600-token prefix reads ~92% from cache (`cache_read_tokens`) at both T=1.0 and T=0.0.
+- Nelke defaults `agent_temperature` to `1.0` (Settings, `NELKE_AGENT_TEMPERATURE`) and threads it to agent, subagents, cycle-worker and reviewer. Cache is tracked in usage as `cache_read_tokens` / `cache_read_pct` (percent of prompt served from cache) and surfaced across CLI/TUI/Telegram/API. #facts llm caching temperature cost

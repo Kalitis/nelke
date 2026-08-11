@@ -8,6 +8,10 @@
 - [Nelke Development Vector (2026-08-11)](chats/20260811054228-2ada9b87/development/roadmap.md) — Tags: roadmap, development, self-improvement, vector #roadmap development self-improvement vector
 - [О пользователе](chats/20260811070422-6ed4ba1d/about-user.md) — - **Имя:** Игорь Калитис
 - [Проект Nelke](chats/20260811070422-6ed4ba1d/projects/nelke.md) — - Входит в серию N4: Nelke, Nagelkraut, Nachtschatten, Nieswurz.
+- [Циклы самоулучшения](chats/20260811105752-37bb9979/cycles/notes.md) — Начало нового цикла. Задача: определить недостатки в возможностях (агента Nelke) и предложить/реализовать улучшения.
+- [Наблюдения](chats/20260811105752-37bb9979/notes/workspace.md) — - bash-инструмент работает через cmd (Windows). Доступны: dir, type, и т.п. (не ls/pwd/head).
+- [Цикл улучшения 20260811121107-6f0a032f](chats/20260811121107-6f0a032f/cycles/notes.md) — Статус: идёт. Начало — разминка выполнена (рекурсивный скрипт + скачивание файла).
+- [Рабочий каталог 20260811121107-6f0a032f](chats/20260811121107-6f0a032f/notes/workspace.md) — - Задача: определить недостатки возможностей Nelke и реализовать улучшения.
 
 ## facts
 - [LLM providers](facts/llms.md) — - Nelke talks to any OpenAI-compatible endpoint via the `openai` library. #facts llm providers

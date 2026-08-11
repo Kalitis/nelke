@@ -61,12 +61,12 @@ class Settings(BaseSettings):
     recall_top_k: int = 8
     index_max_tokens: int = 2000
 
-    # Sampling temperature for agent/tool/subagent calls. Defaults to 0 so
-    # OpenAI-compatible providers' *automatic* prompt caching actually engages
-    # (a non-zero temperature disables prompt caching and roughly a 10x cost
-    # increase on long agent loops). Raise it per-profile only if you need
-    # more creative sampling on a provider that charges the same either way.
-    agent_temperature: float = 0.0
+    # Sampling temperature for agent/tool/subagent calls. Defaults to 1 (the
+    # OpenAI-compatible default) for natural responses. Prompt caching is NOT
+    # gated by temperature on the main dslab profile, so a non-zero default is
+    # safe — verified: identical long prefixes hit the cache at T=1.0 and T=0.0
+    # alike. Lower it per-profile only if you want more deterministic sampling.
+    agent_temperature: float = 1.0
 
     @field_validator("agent_temperature", mode="before")
     @classmethod

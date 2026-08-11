@@ -312,17 +312,17 @@ def test_open_db_migrates(settings):
 
 
 # --------------------------------------------------------------------------- #
-# Chats: multiple conversations with history + per-chat memory
+# Chats: multiple conversations with history (shared global memory)
 # --------------------------------------------------------------------------- #
-def test_chat_crud_and_titles(settings):
+def test_chat_crud_and_titles(settings, tmp_repo):
     cid = services.create_chat(settings, title="First")
     chats = services.list_chats(settings, frontend="web")
     assert any(c["id"] == cid and c["title"] == "First" for c in chats)
 
     assert services.rename_chat(settings, cid, "Renamed")
-    assert services.get_chat(settings, cid)["title"] == "Renamed"
+    assert services.get_chat(settings, cid, repo=tmp_repo.repo)["title"] == "Renamed"
 
-    chat = services.get_chat(settings, cid)
+    chat = services.get_chat(settings, cid, repo=tmp_repo.repo)
     assert chat["messages"] == []
     assert chat["memory"] == []
 
@@ -368,7 +368,7 @@ def _chat_llm_factory(responses):
 async def test_run_chat_turn_persists_transcript(settings, tmp_repo):
     factory, _ = _chat_llm_factory([final_response("first")])
     cid = services.create_chat(settings, frontend="tui")
-    result, chat_id = await services.run_chat_turn(
+    result, chat_id, _msg_id = await services.run_chat_turn(
         "first msg", settings, None, cid,
         frontend_name="tui", repo=tmp_repo.repo, llm_factory=factory,
     )
@@ -391,15 +391,15 @@ async def test_run_chat_turn_reloads_history_across_calls(settings, tmp_repo):
     assert seen[1].count("user") >= 2  # the reloaded history was passed to the LLM
 
 
-async def test_run_chat_turn_scopes_memory_per_chat(settings, tmp_repo):
+async def test_run_chat_turn_uses_global_memory(settings, tmp_repo):
     factory, _ = _chat_llm_factory([final_response("ok")])
     cid = services.create_chat(settings, frontend="web")
     await services.run_chat_turn("hi", settings, None, cid,
                                  frontend_name="web", repo=tmp_repo.repo, llm_factory=factory)
-    # per-chat memory store built inside memory/chats/<session_id>/
-    index = tmp_repo.repo / "memory" / "chats" / cid / "INDEX.md"
+    # The chat uses the shared global store (repo/memory), not per-chat memory.
+    index = tmp_repo.repo / "memory" / "INDEX.md"
     assert index.exists()
-    assert services.list_chat_memory(settings, cid, repo=tmp_repo.repo) == []
+    assert not (tmp_repo.repo / "memory" / "chats").exists()
 
 
 # --------------------------------------------------------------------------- #

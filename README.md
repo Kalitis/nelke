@@ -50,18 +50,63 @@ review modal. The Telegram bot edits messages as the answer streams and sends
 inline ✅/❌ buttons for the human gate. All resolve the same `review_requests`
 row — the first frontend to resolve wins.
 
+### Web UI
+
+The chat UI is a **Vite + React + TypeScript** SPA (Tailwind CSS + Headless UI)
+with a minimal dark theme, served by FastAPI. Features:
+
+- **Streaming** responses over SSE with token-by-token rendering, markdown,
+  and syntax-highlighted code blocks (copy button on each snippet).
+- **Branching / swipes**: every assistant turn tracks its alternatives. Use the
+  `‹ 2/3 ›` navigator under a message to switch between sibling answers.
+- **Edit message**: edit any past user message — the old subtree is soft-deleted
+  and a fresh answer is generated on the new branch.
+- **Regenerate**: re-run an assistant answer from its parent user message.
+- **Delete message**: remove a message and its descendants (soft delete keeps
+  the history reachable for audit).
+- Collapsible **tool-call** blocks show each tool invocation and its result.
+
+The built bundle lives in `static/dist/`. When it is present, `/` serves the
+SPA and unknown GET paths fall back to `index.html` for client-side routing.
+Set `NELKE_WEB_LEGACY=1` to force the legacy Jinja2 chat UI instead.
+
+#### Web UI development
+
+For frontend development with hot-module reload, run the Vite dev server
+alongside the API:
+
+```bash
+cd web-ui
+npm install
+npm run dev                 # Vite on http://localhost:5173 (proxies /api → :8000)
+NELKE_WEB_DEV=1 uv run nelke web   # in another shell; UI redirects to :5173
+```
+
+Build the SPA for production (emits into `../static/dist`):
+
+```bash
+cd web-ui && npm run build
+# or: python scripts/build_web_ui.py
+```
+
+Type-check and run the frontend unit tests:
+
+```bash
+cd web-ui && npm run typecheck && npm test
+```
+
 ### Chats and cycles history
 
 Both the web and TUI frontends manage **multiple named chats**: each chat keeps
 its own persisted transcript (in SQLite `sessions`/`messages`, including tool
-calls) and its own per-chat memory store (`memory/chats/<session_id>/`) that the
-agent reads via `recall`/writes via `memory_write`. Opening a chat reloads its
-history so conversations continue across restarts. The Telegram bot does the
-same: each Telegram chat keeps a persistent session (`/chat` continues the
-conversation; `/new` starts a fresh chat, `/history` shows the transcript,
-`/chats`/`/open <id>` list and resume older chats). Self-improvement **cycles**
-live in a separate view — the web `/cycles` page and the TUI "Improve" tab list
-every cycle with its steps, timeline events and review links.
+calls) and its own per-chat memory store under `memory/chats/<session_id>/`.
+Opening a chat reloads its history so conversations continue across restarts.
+The Telegram bot does the same: each Telegram chat keeps a persistent session
+(`/chat` continues the conversation; `/new` starts a fresh chat, `/history`
+shows the transcript, `/chats`/`/open <id>` list and resume older chats).
+Self-improvement **cycles** live in a separate view — the web `/cycles` page
+and the TUI "Improve" tab list every cycle with its steps, timeline events and
+review links.
 
 Telegram needs `NELKE_TELEGRAM_TOKEN` in `~/.nelke/.env` (see `.env.example`);
 web host/port come from `NELKE_WEB_HOST`/`NELKE_WEB_PORT`. If api.telegram.org
@@ -81,17 +126,19 @@ src/nelke/
 │   ├── memory.py      # markdown memory + INDEX + recall
 │   ├── reviewer.py    # read-only AI reviewer
 │   ├── cycle.py       # self-improvement cycle engine
-│   ├── services.py    # shared frontend wiring (chat/cycle/review helpers)
+│   ├── services.py    # shared frontend wiring (chat/cycle/review/branch helpers)
 │   ├── governance.py  # tests/lint/typecheck gate + boot check
 │   ├── gitops.py      # git wrappers (subprocess)
-│   └── db.py          # SQLite: sessions, cycles, steps, review_requests
+│   └── db.py          # SQLite: sessions, cycles, steps, review_requests, message tree
 ├── frontends/
 │   ├── cli.py          # CLI (Typer + Rich)
-│   ├── web.py          # FastAPI + Jinja2 + SSE
+│   ├── web.py          # FastAPI + SSE (serves the SPA build + REST/SSE API)
 │   ├── tui.py          # Textual TUI
 │   └── telegram_bot.py # aiogram Telegram bot
-├── templates/          # Jinja2 templates (web) — single source of truth
-└── static/             # CSS/JS (web)
+├── templates/          # Jinja2 templates (legacy web UI + cycles/memory/review pages)
+└── static/             # legacy CSS/JS + built SPA (static/dist/)
+web-ui/                 # Vite + React + TS SPA source (builds into static/dist)
+scripts/                # build_web_ui.py (SPA build), spa_smoke.mjs (playwright check)
 ```
 
 ## Self-improvement cycle

@@ -1,0 +1,72 @@
+@import "highlight.js/styles/github-dark.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-canvas text-zinc-100 antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  /* Slim scrollbars to match the dark minimal aesthetic. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #272c38 transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-edge;
+  }
+}
+
+@layer components {
+  /* Prose tweaks for rendered assistant markdown. */
+  .prose-nelke {
+    @apply leading-relaxed;
+  }
+  .prose-nelke p {
+    @apply my-3;
+  }
+  .prose-nelke h1,
+  .prose-nelke h2,
+  .prose-nelke h3 {
+    @apply mb-2 mt-4 font-semibold;
+  }
+  .prose-nelke ul {
+    @apply my-3 list-disc pl-6;
+  }
+  .prose-nelke ol {
+    @apply my-3 list-decimal pl-6;
+  }
+  .prose-nelke code {
+    @apply rounded bg-panel2 px-1.5 py-0.5 font-mono text-[0.85em] text-zinc-200;
+  }
+  .prose-nelke pre {
+    @apply my-3 overflow-x-auto rounded-lg border border-edge bg-panel2 p-3;
+  }
+  .prose-nelke pre code {
+    @apply bg-transparent p-0 text-[0.85em];
+  }
+  .prose-nelke a {
+    @apply text-accent underline underline-offset-2;
+  }
+  .prose-nelke blockquote {
+    @apply my-3 border-l-2 border-edge pl-4 text-zinc-400;
+  }
+  .prose-nelke table {
+    @apply my-3 w-full border-collapse text-sm;
+  }
+  .prose-nelke th,
+  .prose-nelke td {
+    @apply border border-edge px-3 py-1.5 text-left;
+  }
+}

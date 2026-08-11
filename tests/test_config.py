@@ -24,16 +24,16 @@ def test_settings_defaults(monkeypatch):
     s = Settings()
     assert s.nelke_home == Path.home() / ".nelke"
     assert s.max_cycle_steps == 30
-    # agent temperature defaults to 0 so provider prompt caching engages
-    assert s.agent_temperature == 0.0
+    # agent temperature defaults to 1 (OpenAI-compatible standard); caching on
+    # the dslab profile is not gated by temperature, so a natural default is safe
+    assert s.agent_temperature == 1.0
 
 
 def test_agent_temperature_env_and_clamp(monkeypatch, tmp_path):
     monkeypatch.setenv("NELKE_NELKE_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("NELKE_AGENT_TEMPERATURE", "1.2")
     assert Settings().agent_temperature == 1.2
-    # out-of-range / invalid values are clamped to a safe range (never >2,
-    # because a temperature>0 is what disables prompt caching on some providers)
+    # out-of-range / invalid values are clamped to a safe range [0, 2]
     monkeypatch.setenv("NELKE_AGENT_TEMPERATURE", "9")
     assert Settings().agent_temperature == 2.0
     monkeypatch.setenv("NELKE_AGENT_TEMPERATURE", "not-a-number")

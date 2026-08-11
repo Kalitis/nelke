@@ -99,3 +99,32 @@ def test_usage_events_and_totals(tmp_path):
     cyc = db.usage_totals(cycle_id=cid)
     assert cyc["total_tokens"] == 10
     assert len(db.list_usage(cycle_id=cid)) == 1
+
+
+def test_usage_persists_cache_metrics(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    sid = db.create_session("cli")
+    db.add_usage({
+        "prompt_tokens": 400, "completion_tokens": 10, "total_tokens": 410,
+        "cache_read_tokens": 350,
+    }, session_id=sid)
+    db.add_usage({
+        "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+        "cache_read_tokens": 50,
+    }, session_id=sid)
+    rows = db.list_usage(session_id=sid)
+    assert [r["cache_read_tokens"] for r in rows] == [350, 50]
+    assert all(r["cache_read_pct"] == expected for r, expected in
+               zip(rows, (88, 50), strict=True))
+    totals = db.usage_totals(session_id=sid)
+    assert totals["cache_read_tokens"] == 400
+    assert totals["cache_read_pct"] == 80  # 400 of 500 prompt tokens
+
+
+def test_usage_totals_omit_cache_when_absent(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    sid = db.create_session("cli")
+    db.add_usage({"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}, session_id=sid)
+    totals = db.usage_totals(session_id=sid)
+    assert totals["cache_read_tokens"] == 0
+    assert totals["cache_read_pct"] == 0

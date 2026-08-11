@@ -11,6 +11,7 @@ import ast
 import asyncio
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -361,13 +362,56 @@ class LLMClient:
 
 def _usage_to_dict(usage: Any) -> dict[str, Any]:
     try:
-        return {
+        result = {
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
         }
     except AttributeError:
         return {}
+    result["cache_read_tokens"] = _cache_read_tokens(usage)
+    result["cache_write_tokens"] = _cache_write_tokens(usage)
+    return result
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cache_read_tokens(usage: Any) -> int:
+    """Prompt tokens served from cache.
+
+    Supports OpenAI-style ``prompt_tokens_details.cached_tokens`` and
+    DeepSeek-style ``prompt_cache_hit_tokens``.
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        hit = _as_int(getattr(details, "cached_tokens", None))
+        if hit:
+            return hit
+    return _as_int(getattr(usage, "prompt_cache_hit_tokens", None))
+
+
+def _cache_write_tokens(usage: Any) -> int:
+    """Prompt tokens written to cache (DeepSeek ``prompt_cache_miss_tokens``)."""
+    return _as_int(getattr(usage, "prompt_cache_miss_tokens", None))
+
+
+def usage_cache_pct(usage: Mapping[str, Any]) -> int:
+    """Percent of prompt tokens served from cache (0-100).
+
+    ``0`` when there is no cache data or no prompt tokens were billed. Works on
+    both per-call usage dicts and on aggregated totals (as long as they carry
+    ``cache_read_tokens`` alongside ``prompt_tokens``).
+    """
+    prompt = int(usage.get("prompt_tokens", 0) or 0)
+    read = int(usage.get("cache_read_tokens", 0) or 0)
+    if prompt <= 0:
+        return 0
+    return round(100 * read / prompt)
 
 
 class StubLLM:

@@ -34,6 +34,7 @@ from textual.widgets import (
 
 from nelke.config import Settings, load_env_files
 from nelke.core import services
+from nelke.core.llm import usage_cache_pct
 from nelke.core.services import Callbacks
 
 load_env_files()
@@ -120,12 +121,14 @@ class StreamSink:
     @property
     def usage_total(self) -> dict[str, int]:
         totals: dict[str, int] = {
-            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": len(self.usages),
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cache_read_tokens": 0,
+            "calls": len(self.usages),
         }
         for u in self.usages:
             totals["prompt_tokens"] += int(u.get("prompt_tokens", 0) or 0)
             totals["completion_tokens"] += int(u.get("completion_tokens", 0) or 0)
             totals["total_tokens"] += int(u.get("total_tokens", 0) or 0)
+            totals["cache_read_tokens"] += int(u.get("cache_read_tokens", 0) or 0)
         return totals
 
     @property
@@ -137,7 +140,8 @@ def _usage_text(total: dict[str, int]) -> str:
     calls = int(total.get("calls", 0))
     return (
         f"tokens: {total.get('total_tokens', 0)} "
-        f"(prompt {total.get('prompt_tokens', 0)} + completion {total.get('completion_tokens', 0)})"
+        f"(prompt {total.get('prompt_tokens', 0)} + completion {total.get('completion_tokens', 0)}"
+        f", cache {usage_cache_pct(total)}%)"
         f" · {calls} call{'s' if calls != 1 else ''}"
     )
 
@@ -314,7 +318,7 @@ class NelkeTUI(App):
             return
         log.write(f"[bold]chat:[/] {chat['title']}  [dim]{chat['id']}[/]")
         if chat.get("memory"):
-            log.write(f"[dim]chat memory: {', '.join(m['name'] for m in chat['memory'][:8])}[/]")
+            log.write(f"[dim]memory: {', '.join(m['name'] for m in chat['memory'][:8])}[/]")
         self._render_chat_history(chat["messages"], clear=False)
 
     def _render_chat_history(self, messages: list[dict[str, Any]], clear: bool = True) -> None:
@@ -327,7 +331,16 @@ class NelkeTUI(App):
             if role == "user":
                 log.write(f"[bold cyan]you:[/] {content}")
             elif role == "assistant":
-                log.write(f"[green]nelke:[/] {content or '(no answer)'}")
+                tool_calls = m.get("tool_calls") or []
+                if content:
+                    log.write(f"[green]nelke:[/] {content}")
+                elif tool_calls:
+                    names = ", ".join(
+                        (t.get("function") or {}).get("name", "?") for t in tool_calls
+                    )
+                    log.write(f"[dim]nelke: → tools: {names}[/]")
+                else:
+                    log.write(f"[green]nelke:[/] {content or '(no answer)'}")
             elif role == "tool":
                 log.write(f"[dim]  ↳ tool: {content[:120]}[/]")
         if not messages:
@@ -362,7 +375,7 @@ class NelkeTUI(App):
 
         callbacks.on_usage = on_usage
         try:
-            result, _chat_id = await services.run_chat_turn(
+            result, _chat_id, _msg_id = await services.run_chat_turn(
                 text, self.state.settings, self.state.profile, chat_id,
                 frontend_name="tui",
                 callbacks=callbacks,

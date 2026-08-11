@@ -1,10 +1,11 @@
 # Nelke provider profiles. Copy to ~/.nelke/config.toml and edit.
 
-# Samling temperature for agent/tool/subagent/reviewer calls. Keep 0 (default)
-# so OpenAI-compatible providers' automatic prompt caching engages: a non-zero
-# temperature disables prompt caching and can make long agent loops ~10x more
-# expensive. Raise it only if a provider bills the same either way.
-# NELKE_AGENT_TEMPERATURE=0.0
+# Sampling temperature for agent/tool/subagent/reviewer calls. Defaults to 1
+# (the OpenAI-compatible standard). Prompt caching is NOT gated by temperature
+# on the dslab profile — identical long prefixes hit the cache at T=1.0 and
+# T=0.0 alike (verified 2026-08-11). Lower it per-profile only for more
+# deterministic sampling.
+# NELKE_AGENT_TEMPERATURE=1.0
 
 [profiles.openai]
 base_url = "https://api.openai.com/v1"

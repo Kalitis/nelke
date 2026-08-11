@@ -175,7 +175,35 @@ async def test_usage_is_accumulated(tmp_path):
     (tmp_path / "x.txt").write_text("hi", encoding="utf-8")
     agent = _agent(tmp_path, UsageLLM())
     result = await agent.run("go")
-    assert result.usage == {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11, "calls": 2}
+    assert result.usage == {
+        "prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11,
+        "calls": 2, "cache_read_tokens": 0, "cache_read_pct": 0,
+    }
+
+
+async def test_usage_cache_read_accumulated_as_percent(tmp_path):
+    """cache_read_tokens are summed and surfaced as a % of billed prompt tokens."""
+
+    class UsageLLM:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def chat(self, messages, *, tools=None, model=None, temperature=None,
+                       max_tokens=None, stream=False, on_token=None):
+            self.n += 1
+            if self.n == 1:
+                return LLMResponse(content="", tool_calls=[ToolCall("call_1", "read", {"path": "x.txt"})],
+                                   usage={"prompt_tokens": 500, "completion_tokens": 5, "total_tokens": 505,
+                                          "cache_read_tokens": 400})
+            return LLMResponse(content="done", usage={"prompt_tokens": 500, "completion_tokens": 5, "total_tokens": 505,
+                                                      "cache_read_tokens": 500})
+
+    (tmp_path / "x.txt").write_text("hi", encoding="utf-8")
+    agent = _agent(tmp_path, UsageLLM())
+    result = await agent.run("go")
+    assert result.usage["cache_read_tokens"] == 900
+    assert result.usage["cache_read_pct"] == 90  # 900 of 1000 prompt tokens
+    assert result.usage["prompt_tokens"] == 1000
 
 
 async def test_on_usage_reports_each_call_in_real_time(tmp_path):

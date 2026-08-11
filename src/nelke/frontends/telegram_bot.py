@@ -6,7 +6,7 @@ Commands:
                     answer streams in (throttled), then post usage. Each
                     Telegram chat keeps a persistent session, so conversations
                     continue across messages (same as web/TUI).
-  /new              start a brand-new chat (fresh session + per-chat memory).
+  /new              start a brand-new chat (fresh session; memory is global).
   /history          show the current chat's persisted transcript.
   /chats            list this Telegram chat's conversations.
   /open <id>        resume an old conversation (/chats shows the ids).
@@ -39,6 +39,7 @@ from aiogram.types import (
 
 from nelke.config import Settings, load_env_files
 from nelke.core import services
+from nelke.core.llm import usage_cache_pct
 from nelke.core.services import Callbacks
 
 load_env_files()
@@ -122,7 +123,7 @@ class BotState:
     repo_path: Any = None
     # chat_id -> running asyncio.Task (for /cancel)
     tasks: dict[int, asyncio.Task[Any]] = field(default_factory=dict)
-    # chat_id -> current persistent session id (chat history / per-chat memory)
+    # chat_id -> current persistent session id (chat history)
     current_sessions: dict[int, str] = field(default_factory=dict)
     # cycle_id -> Future[bool] parked on the human gate
     gate_futures: dict[str, asyncio.Future[bool]] = field(default_factory=dict)
@@ -244,7 +245,10 @@ class NelkeBot:
 
     async def _run_chat(self, chat_id: int, message_id: int, text: str, session_id: str) -> None:
         last_edit = 0.0
-        live_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        live_usage: dict[str, int] = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cache_read_tokens": 0, "calls": 0,
+        }
 
         async def edit(answer: str, usage: dict[str, Any] | None = None) -> None:
             nonlocal last_edit
@@ -255,7 +259,7 @@ class NelkeBot:
             body = answer or "…"
             usage = usage or live_usage
             if usage.get("total_tokens"):
-                body += f"\n\ntokens: {usage['total_tokens']}"
+                body += f"\n\ntokens: {usage['total_tokens']} (cache {usage_cache_pct(usage)}% of prompt)"
             try:
                 await self.bot.edit_message_text(body[:4000], chat_id=chat_id, message_id=message_id)
             except Exception:  # noqa: BLE001 - "message is not modified" etc. are harmless
@@ -277,10 +281,11 @@ class NelkeBot:
         def on_usage(usage: dict[str, Any]) -> None:
             for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 live_usage[key] += int(usage.get(key, 0) or 0)
+            live_usage["cache_read_tokens"] += int(usage.get("cache_read_tokens", 0) or 0)
             live_usage["calls"] += 1
 
         try:
-            result, _sid = await services.run_chat_turn(
+            result, _sid, _msg_id = await services.run_chat_turn(
                 text, self.state.settings, self.state.profile, session_id,
                 frontend_name="telegram",
                 callbacks=Callbacks(on_token=on_token, on_usage=on_usage, stream=True),
@@ -434,7 +439,10 @@ class NelkeBot:
             return await future
 
         report_tasks: set[asyncio.Task[Any]] = set()
-        cycle_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        cycle_usage: dict[str, int] = {
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cache_read_tokens": 0, "calls": 0,
+        }
 
         def on_event(ev: Any) -> None:
             # schedule the progress report as a task: CycleEngine._emit calls
@@ -448,6 +456,7 @@ class NelkeBot:
         def on_usage(usage: dict[str, Any]) -> None:
             for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 cycle_usage[key] += int(usage.get(key, 0) or 0)
+            cycle_usage["cache_read_tokens"] += int(usage.get("cache_read_tokens", 0) or 0)
             cycle_usage["calls"] += 1
 
         try:
@@ -464,7 +473,8 @@ class NelkeBot:
                 await asyncio.gather(*report_tasks, return_exceptions=True)
             final = f"cycle {result.status}\nbranch: {result.branch}\nsteps: {result.steps}"
             if cycle_usage["total_tokens"]:
-                final += f"\ntokens: {cycle_usage['total_tokens']} ({cycle_usage['calls']} calls)"
+                pct = usage_cache_pct(cycle_usage)
+                final += f"\ntokens: {cycle_usage['total_tokens']} ({cycle_usage['calls']} calls, cache {pct}%)"
             await self.bot.edit_message_text(
                 final,
                 chat_id=chat_id, message_id=message_id,

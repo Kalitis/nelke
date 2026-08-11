@@ -11,6 +11,7 @@ library.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -142,7 +143,7 @@ def build_chat_session(
     llm_factory: LLMFactory = _llm_factory_default,
     session_id: str | None = None,
     title: str | None = None,
-    chat_memory: bool = False,
+    parent_message_id: str | None = None,
 ) -> ChatSession:
     """Wire a normal-mode agent for a one-off or multi-turn conversation.
 
@@ -151,10 +152,16 @@ def build_chat_session(
     the supplied streaming callbacks. The returned agent keeps its own
     message history, so call ``agent.run(text, reset=False)`` for continuity.
 
-    ``session_id``: when given and present in the db, the existing chat is
-    resumed — its persisted history (user/assistant/tool messages) is reloaded
-    into the agent so the model continues the same conversation, and (with
-    ``chat_memory=True``) its per-chat memory store is used.
+    The agent always uses the *global* memory store (``<repo>/memory``, a
+    git-tracked store shared by every chat/cycle) — chats no longer have their
+    own private memory. ``session_id``: when given and present in the db, the
+    existing chat is resumed — its persisted history (user/assistant/tool
+    messages) is reloaded into the agent so the model continues the same
+    conversation.
+
+    ``parent_message_id``: when resuming, truncate the reloaded history to the
+    root→``parent_message_id`` chain. Used by edit/regenerate to run a new turn
+    from an earlier point of the conversation tree without the discarded tail.
     """
     from nelke.core.agent import make_agent
 
@@ -167,7 +174,7 @@ def build_chat_session(
         session_id = str(session_id)
     else:
         session_id = db.create_session(frontend_name, meta={"title": title} if title else {})
-    memory = open_chat_memory(repo, session_id) if chat_memory else open_memory(repo)
+    memory = open_memory(repo)
     memory_index = memory.build_index(max_tokens=settings.index_max_tokens)
     workspace = settings.workspaces_dir / session_id
     workspace.mkdir(parents=True, exist_ok=True)
@@ -212,6 +219,8 @@ def build_chat_session(
     )
     if existing:
         history = db.list_messages(session_id)
+        if history:
+            history = _truncate_to_parent(history, parent_message_id)
         if history:
             agent._messages = [{"role": "system", "content": agent.system_content()}] + _rows_to_messages(history)
     return ChatSession(agent=agent, db=db, session_id=session_id, memory=memory)
@@ -427,31 +436,6 @@ def recall_memory(repo: Path, query: str, top_k: int = 8) -> list[MemoryHit]:
 _DEFAULT_CHAT_TITLE = "New chat"
 
 
-def chat_memory_dir(repo: Path, session_id: str) -> Path:
-    """Per-chat memory lives under ``memory/chats/<session_id>/``."""
-    return repo / "memory" / "chats" / session_id
-
-
-def open_chat_memory(repo: Path, session_id: str) -> MemoryStore:
-    return MemoryStore(chat_memory_dir(repo, session_id))
-
-
-def list_chat_memory(
-    settings: Settings | None = None, session_id: str | None = None, repo: Path | None = None,
-) -> list[dict[str, Any]]:
-    """Memory files (name + size) scoped to one chat."""
-    if not session_id:
-        return []
-    repo = repo or find_repo(settings)
-    store = open_chat_memory(repo, session_id)
-    out: list[dict[str, Any]] = []
-    for rel in store.files():
-        path = store.memory_dir / rel
-        size = path.stat().st_size if path.exists() else 0
-        out.append({"name": rel.as_posix(), "size": size})
-    return out
-
-
 def create_chat(
     settings: Settings | None = None,
     *,
@@ -494,7 +478,7 @@ def get_chat(
     *,
     repo: Path | None = None,
 ) -> dict[str, Any] | None:
-    """A single chat: metadata + full message history + per-chat memory."""
+    """A single chat: metadata + active transcript + tree + global memory."""
     if not session_id:
         return None
     db = open_db(settings)
@@ -503,6 +487,9 @@ def get_chat(
         return None
     messages = get_chat_messages(settings, session_id)
     title = _session_meta(row).get("title") or _title_from_messages(messages)
+    tree = build_message_tree(db, session_id)
+    active_leaf = db.active_leaf(session_id)
+    repo = repo or find_repo(settings)
     return {
         "id": row["id"],
         "title": title,
@@ -511,7 +498,9 @@ def get_chat(
         "ended_at": row["ended_at"],
         "message_count": len(messages),
         "messages": messages,
-        "memory": list_chat_memory(settings, session_id, repo=repo),
+        "tree": tree,
+        "active_leaf_id": active_leaf["id"] if active_leaf else None,
+        "memory": memory_overview(repo),
     }
 
 
@@ -558,6 +547,191 @@ def delete_chat(settings: Settings | None = None, session_id: str | None = None)
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Message tree: branching / swipes / edit / regenerate / delete (soft)
+# --------------------------------------------------------------------------- #
+def _row_to_message_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "role": row["role"],
+        "content": row["content"] or "",
+        "tool_calls": _safe_json(row["tool_calls"] or "[]", []),
+        "tool_call_id": row["tool_call_id"] or "",
+        "parent_id": row["parent_id"],
+        "is_active": bool(row["is_active"]),
+        "is_deleted": bool(row["is_deleted"]),
+        "sibling_order": int(row["sibling_order"]),
+        "created_at": row["created_at"],
+    }
+
+
+def build_message_tree(db: Database, session_id: str) -> dict[str, Any]:
+    """Render the full non-deleted message tree of a chat for the UI.
+
+    Returns ``{"root_id": str | None, "nodes": {id: msg}, "children": {id: [msg]}}``
+    where ``children`` maps each parent id to its non-deleted children (root
+    messages hang under the synthetic key ``None``).
+    """
+    rows = db.list_message_tree(session_id)
+    nodes: dict[str, dict[str, Any]] = {}
+    children: dict[str | None, list[dict[str, Any]]] = {}
+    root_id: str | None = None
+    for row in rows:
+        msg = _row_to_message_dict(row)
+        nodes[msg["id"]] = msg
+        children.setdefault(msg["parent_id"], []).append(msg)
+        if msg["parent_id"] is None and root_id is None:
+            root_id = msg["id"]
+    return {"root_id": root_id, "nodes": nodes, "children": children}
+
+
+def edit_message(
+    settings: Settings | None = None,
+    session_id: str | None = None,
+    message_id: str | None = None,
+    content: str | None = None,
+) -> dict[str, Any] | None:
+    """Soft-delete a user message's subtree and create an edited sibling.
+
+    The edited message becomes the new active leaf (its old subtree and any
+    prior sibling answers are deactivated/deleted). The frontend then calls
+    ``run_chat_turn`` with the returned ``message_id`` as ``parent_message_id``
+    to generate the assistant response on the new branch.
+    """
+    if not session_id or not message_id or content is None:
+        return None
+    db = open_db(settings)
+    row = db.get_message(message_id)
+    if row is None or row["session_id"] != session_id:
+        return None
+    if row["role"] != "user":
+        return None
+    parent_id = row["parent_id"]
+    db.soft_delete_message(message_id)
+    sibling_order = db.next_sibling_order(parent_id, session_id)
+    new_id = db.add_message(
+        session_id, "user", content, parent_id=parent_id,
+        is_active=True, sibling_order=sibling_order,
+    )
+    db.set_active_path(new_id)
+    return {"message_id": new_id, "parent_id": parent_id}
+
+
+async def regenerate_response(
+    settings: Settings,
+    profile: str | None,
+    chat_id: str,
+    assistant_message_id: str,
+    *,
+    frontend_name: str,
+    callbacks: Callbacks | None = None,
+    repo: Path | None = None,
+    llm_factory: LLMFactory = _llm_factory_default,
+) -> tuple[AgentResult, str, str | None]:
+    """Re-run an assistant turn from its parent, branching off the old answer.
+
+    Soft-deletes the assistant message and its subtree, then re-runs the agent
+    as if the user were sending the parent user message again — but without
+    duplicating it. Returns ``(result, chat_id, assistant_message_id)``.
+    """
+    db = open_db(settings)
+    row = db.get_message(assistant_message_id)
+    if row is None or row["session_id"] != chat_id:
+        raise RuntimeError(f"assistant message not found: {assistant_message_id}")
+    if row["role"] != "assistant":
+        raise RuntimeError(f"message {assistant_message_id} is not an assistant message")
+    parent_id = row["parent_id"]
+    parent = db.get_message(parent_id) if parent_id else None
+    if parent is None or parent["role"] != "user":
+        raise RuntimeError("cannot regenerate: parent user message missing")
+    user_text = parent["content"]
+    # Drop the old assistant answer and everything under it from the active view.
+    db.soft_delete_message(assistant_message_id)
+
+    callbacks = callbacks or Callbacks()
+    session = build_chat_session(
+        settings, profile, frontend_name=frontend_name, callbacks=callbacks,
+        repo=repo, llm_factory=llm_factory,
+        session_id=chat_id, parent_message_id=parent_id,
+    )
+    # Re-parent the assistant's *existing* user message rather than duplicating
+    # it: feed it straight to the agent and persist only the new assistant/
+    # tool turns that come back.
+    before = len(session.agent._messages)
+    try:
+        result = await session.agent.run(user_text, reset=False)
+    finally:
+        session.db.end_session(session.session_id)
+    _persist_new_messages(
+        session.db, session.session_id, session.agent._messages[before:],
+        parent_message_id=parent_id,
+    )
+    new_leaf = session.db.active_leaf(chat_id)
+    return result, chat_id, (new_leaf["id"] if new_leaf else None)
+
+
+def delete_message(
+    settings: Settings | None = None,
+    session_id: str | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Soft-delete a message and its subtree, then repair the active path.
+
+    If the deleted branch was on the active path, the nearest surviving sibling
+    of the message (or its parent's nearest surviving sibling) becomes the new
+    active leaf — mirroring how ChatGPT keeps the conversation usable after a
+    delete. Returns ``{"deleted_id", "active_leaf_id"}`` or ``None`` on miss.
+    """
+    if not session_id or not message_id:
+        return None
+    db = open_db(settings)
+    row = db.get_message(message_id)
+    if row is None or row["session_id"] != session_id:
+        return None
+    parent_id = row["parent_id"]
+    was_active = bool(row["is_active"])
+    db.soft_delete_message(message_id)
+    # Pick a replacement active leaf: prefer a surviving sibling, else the parent.
+    new_leaf_id: str | None = None
+    siblings = db.get_children(parent_id) if parent_id else list(
+        r for r in db.list_messages(session_id, active_only=False) if r["parent_id"] is None
+    )
+    if siblings:
+        new_leaf_id = siblings[-1]["id"]
+    elif parent_id:
+        parent_row = db.get_message(parent_id)
+        if parent_row is not None and not parent_row["is_deleted"]:
+            new_leaf_id = parent_id
+    if new_leaf_id and was_active:
+        db.set_active_path(new_leaf_id)
+    return {"deleted_id": message_id, "active_leaf_id": new_leaf_id}
+
+
+def set_active_message(
+    settings: Settings | None = None,
+    session_id: str | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Switch the visible branch to the one passing through ``message_id``.
+
+    Used by the swipe UI to flip between sibling answers. Returns the updated
+    tree + active_leaf_id so the client can re-render.
+    """
+    if not session_id or not message_id:
+        return None
+    db = open_db(settings)
+    row = db.get_message(message_id)
+    if row is None or row["session_id"] != session_id:
+        return None
+    db.set_active_path(message_id)
+    leaf = db.active_leaf(session_id)
+    return {
+        "active_leaf_id": leaf["id"] if leaf else None,
+        "tree": build_message_tree(db, session_id),
+        "messages": get_chat_messages(settings, session_id),
+    }
+
+
 async def run_chat_turn(
     text: str,
     settings: Settings,
@@ -568,26 +742,35 @@ async def run_chat_turn(
     callbacks: Callbacks | None = None,
     repo: Path | None = None,
     llm_factory: LLMFactory = _llm_factory_default,
-) -> tuple[AgentResult, str]:
+    parent_message_id: str | None = None,
+) -> tuple[AgentResult, str, str | None]:
     """Run one user turn inside an existing chat, persisting the new transcript.
 
     The chat's history (including tool messages) is reloaded into the agent so
     it continues the same conversation; every new user/assistant/tool message
     is written to ``messages`` so the transcript survives a process restart.
+
+    ``parent_message_id``: branch point. The history is truncated to the
+    root→``parent_message_id`` chain before the new user turn runs, and the
+    new messages are persisted as children of ``parent_message_id`` instead
+    of appending to the previous leaf. Returns ``(result, chat_id, user_message_id)``.
     """
     callbacks = callbacks or Callbacks()
     session = build_chat_session(
         settings, profile, frontend_name=frontend_name, callbacks=callbacks,
         repo=repo, llm_factory=llm_factory,
-        session_id=chat_id, chat_memory=True,
+        session_id=chat_id, parent_message_id=parent_message_id,
     )
     before = len(session.agent._messages)
     try:
         result = await session.agent.run(text, reset=False)
     finally:
         session.db.end_session(session.session_id)
-    _persist_new_messages(session.db, session.session_id, session.agent._messages[before:])
-    return result, session.session_id
+    user_message_id = _persist_new_messages(
+        session.db, session.session_id, session.agent._messages[before:],
+        parent_message_id=parent_message_id,
+    )
+    return result, session.session_id, user_message_id
 
 
 def _title_from_first_user(db: Database, session_id: str) -> str:
@@ -653,18 +836,83 @@ def _rows_to_messages(rows: list[Any]) -> list[dict[str, Any]]:
     return messages
 
 
-def _persist_new_messages(db: Database, session_id: str, messages: list[dict[str, Any]]) -> None:
-    """Persist newly produced messages (skipping the synthetic system message)."""
+def _truncate_to_parent(
+    rows: list[sqlite3.Row] | list[Any], parent_message_id: str | None
+) -> list[Any]:
+    """Keep only the root→``parent_message_id`` chain from a flat row list.
+
+    Rows are walked by ``parent_id`` starting from ``parent_message_id`` back
+    to the root; everything outside that chain is dropped so the agent only
+    sees the chosen branch's history. When ``parent_message_id`` is ``None``
+    (or absent from the chain) the rows are returned unchanged — the legacy
+    linear-history behaviour.
+    """
+    if not parent_message_id or not rows:
+        return list(rows)
+    by_id: dict[str, Any] = {}
+    for r in rows:
+        try:
+            by_id[r["id"]] = r
+        except (KeyError, IndexError, TypeError):
+            return list(rows)  # not db rows — leave untouched
+    if parent_message_id not in by_id:
+        return list(rows)
+    chain: list[Any] = []
+    current: str | None = parent_message_id
+    seen: set[str] = set()
+    while current and current not in seen and current in by_id:
+        seen.add(current)
+        chain.append(by_id[current])
+        current = by_id[current]["parent_id"]
+    chain.reverse()
+    return chain
+
+
+def _persist_new_messages(
+    db: Database,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    *,
+    parent_message_id: str | None = None,
+) -> str | None:
+    """Persist newly produced messages (skipping the synthetic system message).
+
+    Each persisted row links to the previous one via ``parent_id`` so the new
+    turn forms a chain hanging off ``parent_message_id``. When
+    ``parent_message_id`` is ``None`` (the legacy linear-chat path) the chain
+    attaches to the chat's current active leaf — so a resumed multi-turn chat
+    keeps growing one branch instead of sprouting parallel roots. Returns the
+    id of the first persisted user message, if any.
+    """
+    # Anchor the new chain: explicit branch point, else the live leaf, else a
+    # new root (first message in an empty chat).
+    previous_id = parent_message_id
+    if previous_id is None:
+        leaf = db.active_leaf(session_id)
+        if leaf is not None:
+            previous_id = leaf["id"]
+    first_user_id: str | None = None
     for m in messages:
         if m.get("role") == "system":
             continue
-        db.add_message(
+        sibling_order = db.next_sibling_order(previous_id, session_id)
+        mid = db.add_message(
             session_id,
             str(m.get("role") or ""),
             str(m.get("content") or ""),
             tool_calls=m.get("tool_calls"),
             tool_call_id=m.get("tool_call_id"),
+            parent_id=previous_id,
+            is_active=True,
+            sibling_order=sibling_order,
         )
+        # Activate the newly appended leaf path; any prior siblings of this
+        # node are deactivated while ancestors stay live.
+        db.set_active_path(mid)
+        if first_user_id is None:
+            first_user_id = mid
+        previous_id = mid
+    return first_user_id
 
 
 # --------------------------------------------------------------------------- #

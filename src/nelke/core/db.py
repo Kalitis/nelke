@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from nelke.core.llm import usage_cache_pct
+
 _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS sessions (
@@ -52,6 +54,8 @@ _SCHEMA = [
     CREATE TABLE IF NOT EXISTS usage_events (
         id TEXT PRIMARY KEY, session_id TEXT, cycle_id TEXT,
         prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
+        cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_pct INTEGER NOT NULL DEFAULT 0,
         created_at TEXT
     )
     """,
@@ -67,6 +71,17 @@ _SCHEMA = [
 # older versions). Each is wrapped in a try/except so re-running is safe.
 _MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN tool_call_id TEXT",
+    # Message tree: branching / swipes / soft delete. Defaults keep legacy
+    # behaviour intact (linear active chain, nothing deleted, no parent).
+    "ALTER TABLE messages ADD COLUMN parent_id TEXT",
+    "ALTER TABLE messages ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE messages ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN sibling_order INTEGER NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_messages_session_active "
+    "ON messages(session_id) WHERE is_active = 1 AND is_deleted = 0",
+    "CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id)",
+    "ALTER TABLE usage_events ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE usage_events ADD COLUMN cache_read_pct INTEGER NOT NULL DEFAULT 0",
 ]
 
 
@@ -98,7 +113,38 @@ class Database:
                 except sqlite3.OperationalError:
                     # column already exists (older DB re-migrated)
                     pass
+            self._backfill_message_tree(conn)
             conn.commit()
+
+    @staticmethod
+    def _backfill_message_tree(conn: sqlite3.Connection) -> None:
+        """Link legacy rows into a linear active chain.
+
+        Pre-tree databases have ``parent_id IS NULL`` on every message. For
+        each session we order rows by ``created_at`` and chain each message to
+        its predecessor so the existing transcript becomes a single active
+        branch (the default view for both legacy and tree-aware callers).
+        Idempotent: rows that already carry a non-null ``parent_id`` (or whose
+        predecessor already has one) are left alone.
+        """
+        cur = conn.execute(
+            "SELECT DISTINCT session_id FROM messages WHERE parent_id IS NULL "
+            "ORDER BY session_id"
+        )
+        session_ids = [r["session_id"] for r in cur.fetchall()]
+        for session_id in session_ids:
+            rows = conn.execute(
+                "SELECT id FROM messages WHERE session_id=? "
+                "ORDER BY created_at, rowid",
+                (session_id,),
+            ).fetchall()
+            prev_id: str | None = None
+            for row in rows:
+                conn.execute(
+                    "UPDATE messages SET parent_id=? WHERE id=? AND parent_id IS NULL",
+                    (prev_id, row["id"]),
+                )
+                prev_id = row["id"]
 
     def _prepare(self) -> None:
         if not self.path.exists():
@@ -186,22 +232,56 @@ class Database:
         content: str,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
+        *,
+        parent_id: str | None = None,
+        is_active: bool = True,
+        sibling_order: int = 0,
     ) -> str:
         self._prepare()
         mid = new_id()
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (mid, session_id, role, content, json.dumps(tool_calls or []), tool_call_id, _now()),
+                "INSERT INTO messages "
+                "(id, session_id, role, content, tool_calls, tool_call_id, created_at, "
+                " parent_id, is_active, is_deleted, sibling_order) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    mid,
+                    session_id,
+                    role,
+                    content,
+                    json.dumps(tool_calls or []),
+                    tool_call_id,
+                    _now(),
+                    parent_id,
+                    1 if is_active else 0,
+                    0,
+                    sibling_order,
+                ),
             )
         return mid
 
-    def list_messages(self, session_id: str) -> list[sqlite3.Row]:
+    def list_messages(
+        self, session_id: str, *, active_only: bool = True, include_deleted: bool = False
+    ) -> list[sqlite3.Row]:
+        """Persisted message rows for a session, ordered chronologically.
+
+        By default returns the currently visible transcript: the single active
+        path with soft-deleted rows filtered out — that matches the legacy
+        contract used everywhere outside the branching UI. Pass
+        ``active_only=False`` to receive every node (for tree rendering) and
+        ``include_deleted=True`` to keep tombstones as well.
+        """
+        conds = ["session_id=?"]
+        if active_only:
+            conds.append("is_active=1")
+        if not include_deleted:
+            conds.append("is_deleted=0")
+        where = " AND ".join(conds)
         with self.connect() as conn:
             return list(
                 conn.execute(
-                    "SELECT * FROM messages WHERE session_id=? ORDER BY created_at",
+                    f"SELECT * FROM messages WHERE {where} ORDER BY created_at, rowid",
                     (session_id,),
                 )
             )
@@ -214,6 +294,150 @@ class Database:
                 "ORDER BY created_at LIMIT 1",
                 (session_id,),
             ).fetchone()
+
+    # ---- message tree (branching / swipes) ----------------------------------
+    def get_message(self, message_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM messages WHERE id=?", (message_id,)
+            ).fetchone()
+
+    def list_message_tree(self, session_id: str) -> list[sqlite3.Row]:
+        """Every non-deleted message node in a session (all branches)."""
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM messages WHERE session_id=? AND is_deleted=0 "
+                    "ORDER BY sibling_order, created_at, rowid",
+                    (session_id,),
+                )
+            )
+
+    def get_children(self, parent_id: str) -> list[sqlite3.Row]:
+        """Direct children of a node — the swipe alternatives for that turn."""
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM messages WHERE parent_id=? AND is_deleted=0 "
+                    "ORDER BY sibling_order, created_at, rowid",
+                    (parent_id,),
+                )
+            )
+
+    def next_sibling_order(self, parent_id: str | None, session_id: str) -> int:
+        """Next ``sibling_order`` value for a new child of ``parent_id``."""
+        with self.connect() as conn:
+            if parent_id is None:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(sibling_order), -1) AS m FROM messages "
+                    "WHERE session_id=? AND parent_id IS NULL",
+                    (session_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(sibling_order), -1) AS m FROM messages "
+                    "WHERE parent_id=?",
+                    (parent_id,),
+                ).fetchone()
+            return int(row["m"]) + 1
+
+    def update_message_content(self, message_id: str, content: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE messages SET content=? WHERE id=?", (content, message_id)
+            )
+
+    def soft_delete_message(self, message_id: str) -> list[str]:
+        """Mark a message and its descendants as deleted.
+
+        Returns the ids of every row that was tombstoned, in deletion order
+        (target first, then its subtree). Useful for callers that want to
+        report what was removed.
+        """
+        deleted: list[str] = []
+        with self.connect() as conn:
+            stack = [message_id]
+            while stack:
+                current = stack.pop()
+                conn.execute(
+                    "UPDATE messages SET is_deleted=1, is_active=0 WHERE id=?",
+                    (current,),
+                )
+                deleted.append(current)
+                child_rows = conn.execute(
+                    "SELECT id FROM messages WHERE parent_id=?", (current,)
+                ).fetchall()
+                stack.extend(r["id"] for r in child_rows)
+        return deleted
+
+    def set_message_active(self, message_id: str, is_active: bool) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE messages SET is_active=? WHERE id=?",
+                (1 if is_active else 0, message_id),
+            )
+
+    def set_active_path(self, message_id: str) -> list[str]:
+        """Activate the root→leaf path through ``message_id``.
+
+        For every node on the path, its siblings (other children of the same
+        parent) are deactivated so only one branch per level is live. Scope is
+        the message's own session — activating a branch in one chat never
+        disturbs another. Returns the activated message ids in root→leaf order.
+        """
+        # Walk from the target up to its root, collecting the chain.
+        chain: list[str] = []
+        session_id: str | None = None
+        current: str | None = message_id
+        with self.connect() as conn:
+            seen: set[str] = set()
+            while current and current not in seen:
+                seen.add(current)
+                chain.append(current)
+                row = conn.execute(
+                    "SELECT parent_id, session_id FROM messages WHERE id=?", (current,)
+                ).fetchone()
+                if row and session_id is None:
+                    session_id = row["session_id"]
+                current = row["parent_id"] if row else None
+            chain.reverse()  # root → leaf
+
+            # At every level: deactivate this node's siblings, then mark this
+            # node active. Siblings share the node's parent_id, so deactivating
+            # them isolates the chosen branch within the session.
+            for node_id in chain:
+                row = conn.execute(
+                    "SELECT parent_id FROM messages WHERE id=?", (node_id,)
+                ).fetchone()
+                parent = row["parent_id"] if row else None
+                conn.execute(
+                    "UPDATE messages SET is_active=0 "
+                    "WHERE session_id=? AND parent_id IS ? AND id<>? AND is_deleted=0",
+                    (session_id, parent, node_id),
+                )
+                conn.execute(
+                    "UPDATE messages SET is_active=1 WHERE id=?", (node_id,)
+                )
+        return chain
+
+    def active_leaf(self, session_id: str) -> sqlite3.Row | None:
+        """The last active message in the session (deepest active node).
+
+        Active nodes with no active children are leaves of the current path.
+        Returns ``None`` for an empty chat.
+        """
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT m.* FROM messages m "
+                "WHERE m.session_id=? AND m.is_active=1 AND m.is_deleted=0 "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM messages c "
+                "  WHERE c.parent_id=m.id AND c.is_active=1 AND c.is_deleted=0"
+                ") "
+                "ORDER BY m.created_at DESC LIMIT 1",
+                (session_id,),
+            ).fetchall()
+            return rows[0] if rows else None
 
     # ---- cycles / steps ------------------------------------------------------
     def create_cycle(self, objective: str, branch: str, cycle_id: str | None = None) -> str:
@@ -396,11 +620,13 @@ class Database:
     ) -> str:
         self._prepare()
         uid = new_id()
+        cache_read = int(usage.get("cache_read_tokens", 0) or 0)
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO usage_events "
-                "(id, session_id, cycle_id, prompt_tokens, completion_tokens, total_tokens, created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "(id, session_id, cycle_id, prompt_tokens, completion_tokens, total_tokens, "
+                " cache_read_tokens, cache_read_pct, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (
                     uid,
                     session_id,
@@ -408,6 +634,8 @@ class Database:
                     int(usage.get("prompt_tokens", 0) or 0),
                     int(usage.get("completion_tokens", 0) or 0),
                     int(usage.get("total_tokens", 0) or 0),
+                    cache_read,
+                    int(usage.get("cache_read_pct", usage_cache_pct(usage)) or 0),
                     _now(),
                 ),
             )
@@ -435,9 +663,17 @@ class Database:
         self, *, session_id: str | None = None, cycle_id: str | None = None
     ) -> dict[str, int]:
         rows = self.list_usage(session_id=session_id, cycle_id=cycle_id)
-        totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": len(rows)}
+        totals = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_tokens": 0,
+            "calls": len(rows),
+        }
         for row in rows:
             totals["prompt_tokens"] += row["prompt_tokens"]
             totals["completion_tokens"] += row["completion_tokens"]
             totals["total_tokens"] += row["total_tokens"]
+            totals["cache_read_tokens"] += int(row["cache_read_tokens"] or 0)
+        totals["cache_read_pct"] = usage_cache_pct(totals)
         return totals

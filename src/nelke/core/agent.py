@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from nelke.core.llm import LLMResponse, ToolCall
+from nelke.core.llm import LLMResponse, ToolCall, usage_cache_pct
 from nelke.core.session_analyzer import DegradationReport, analyze_degradation
 from nelke.core.tools.base import BaseTool, ToolResult
 from nelke.core.tools.registry import ToolRegistry
@@ -22,7 +22,14 @@ ToolResultHandler = Callable[[str, dict[str, Any], str], Any] | None
 UsageHandler = Callable[[dict[str, Any]], Any] | None
 DegradedHandler = Callable[[DegradationReport], Any] | None
 
-_EMPTY_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+_EMPTY_USAGE = {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "calls": 0,
+    "cache_read_tokens": 0,
+    "cache_read_pct": 0,
+}
 
 
 @dataclass
@@ -54,6 +61,7 @@ class Agent:
         degrade_error_threshold: int = 3,
         temperature: float | None = None,
         memory_index: str | None = None,
+        memory_location: str | None = None,
         plan_first: bool = False,
     ) -> None:
         self.name = name
@@ -69,6 +77,7 @@ class Agent:
         self.degrade_error_threshold = degrade_error_threshold
         self.temperature = temperature
         self.memory_index = memory_index
+        self.memory_location = memory_location
         self.plan_first = plan_first
         self.registry = ToolRegistry.from_list(tools)
         self._messages: list[dict[str, Any]] = []
@@ -76,8 +85,20 @@ class Agent:
 
     def system_content(self) -> str:
         content = self.system_prompt
+        if self.memory_location:
+            content += (
+                "\n\n# Persistent memory\n"
+                "Your durable memory is a git-tracked markdown store at:\n"
+                f"    {self.memory_location}\n"
+                "Use `recall <query>` to search it, `memory_list` to see what files "
+                "exist, `memory_show <name>` to read a full memory file (short names "
+                "come from recall results and memory_list), and `memory_write` to add "
+                "to it. Read it before acting on questions about Nelke, the repo, or "
+                "past lessons. Reach memory files by short name through these tools, "
+                "not by hand."
+            )
         if self.memory_index:
-            content += "\n\n# Persistent memory\n" + self.memory_index
+            content += "\n\n# Memory index (summary)\n" + self.memory_index
         return content
 
     def reset(self) -> None:
@@ -121,6 +142,7 @@ class Agent:
             if not resp.tool_calls:
                 msgs.append({"role": "assistant", "content": resp.content or ""})
                 answer = (resp.content or "").strip()
+                self._finalize_usage()
                 result = AgentResult(
                     answer=answer, iterations=i + 1, tool_calls=tool_calls_total,
                     tool_errors=self._tool_errors, messages=msgs, usage=self._usage,
@@ -132,6 +154,7 @@ class Agent:
                 tool_calls_total += 1
                 tool_result = await self._execute_tool(tc)
                 msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result.render()})
+        self._finalize_usage()
         result = AgentResult(
             answer="", iterations=self.iteration_cap, tool_calls=tool_calls_total,
             tool_errors=self._tool_errors, messages=msgs, stopped="max_iterations",
@@ -153,6 +176,11 @@ class Agent:
             return
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             self._usage[key] += int(usage.get(key, 0) or 0)
+        self._usage["cache_read_tokens"] += int(usage.get("cache_read_tokens", 0) or 0)
+
+    def _finalize_usage(self) -> None:
+        """Stamp the share of prompt tokens served from cache onto the totals."""
+        self._usage["cache_read_pct"] = usage_cache_pct(self._usage)
 
     def _notify_usage(self, usage: dict[str, Any] | None) -> None:
         """Report a single LLM call's usage as soon as it is available."""
@@ -217,6 +245,7 @@ def make_agent(
     system_prompt: str | None = None,
     memory: Any = None,
     memory_index: str | None = None,
+    memory_location: str | None = None,
     task_factory: Callable[[list[str] | None], "Agent"] | None = None,
     on_token: TokenHandler = None,
     on_tool: ToolHandler = None,
@@ -249,7 +278,7 @@ def make_agent(
         ReadFileTool,
         WriteFileTool,
     )
-    from nelke.core.tools.memory import MemoryWriteTool, RecallTool
+    from nelke.core.tools.memory import MemoryListTool, MemoryShowTool, MemoryWriteTool, RecallTool
     from nelke.core.tools.shell import BashTool, PythonRunTool
     from nelke.core.tools.subagent import TaskTool
     from nelke.core.tools.web import WebFetchTool, WebSearchTool
@@ -267,7 +296,10 @@ def make_agent(
     if include_web:
         tools += [WebFetchTool(web_timeout), WebSearchTool(web_timeout)]
     if memory is not None:
-        tools += [RecallTool(memory), MemoryWriteTool(memory)]
+        tools += [RecallTool(memory), MemoryShowTool(memory), MemoryListTool(memory), MemoryWriteTool(memory)]
+        if memory_location is None:
+            memory_location = getattr(memory, "memory_dir", None)
+            memory_location = str(memory_location) if memory_location else None
     if task_factory is not None:
         tools += [TaskTool(task_factory)]
     if db is not None:
@@ -286,5 +318,6 @@ def make_agent(
         on_degraded=on_degraded,
         degrade_error_threshold=degrade_error_threshold,
         memory_index=memory_index,
+        memory_location=memory_location,
         temperature=temperature,
     )

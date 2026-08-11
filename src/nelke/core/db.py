@@ -195,7 +195,10 @@ class Database:
             args.append(frontend)
         if conds:
             q += " WHERE " + " AND ".join(conds)
-        q += " ORDER BY COALESCE(last_message_at, s.started_at) DESC, s.started_at DESC"
+        q += (
+            " ORDER BY COALESCE(last_message_at, s.started_at) DESC, "
+            "(message_count > 0) DESC, s.started_at DESC, rowid DESC"
+        )
         if limit is not None:
             q += " LIMIT ?"
             args.append(str(limit))

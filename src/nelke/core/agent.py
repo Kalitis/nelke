@@ -82,6 +82,7 @@ class Agent:
         self.registry = ToolRegistry.from_list(tools)
         self._messages: list[dict[str, Any]] = []
         self._tool_errors = 0
+        self.last_usage: dict[str, Any] | None = None
 
     def system_content(self) -> str:
         content = self.system_prompt
@@ -115,6 +116,7 @@ class Agent:
             {"role": "user", "content": prompt + "\n\nTask: " + task},
         ]
         resp: LLMResponse = await self.llm.chat(msgs, stream=False)
+        self.last_usage = resp.usage if resp else None
         return (resp.content or "").strip()
 
     async def run(
@@ -129,6 +131,37 @@ class Agent:
         self._usage = dict(_EMPTY_USAGE)
         self._tool_errors = 0
         tool_calls_total = 0
+
+        # Optional plan-first: sketch a plan (a single non-tool LLM call) and
+        # feed it back so the tool loop starts from an explicit roadmap. This
+        # saves iterations and tool errors on multi-step research/programming.
+        # A planning failure must never crash the run — it degrades gracefully
+        # to a normal tool loop without a plan. The plan is only generated once:
+        # on a continuation (``reset=False``) turn whose context already holds a
+        # plan we skip re-planning to avoid per-turn overhead.
+        already_planned = any(
+            m.get("role") == "assistant"
+            and isinstance(m.get("content"), str)
+            and m["content"].startswith("Plan:")
+            for m in msgs
+        )
+        if self.plan_first and not already_planned:
+            try:
+                plan_text = await self.plan(task)
+            except Exception:  # noqa: BLE001 - planning is best-effort
+                plan_text = ""
+                self._tool_errors += 1
+            # Always count the planning LLM call even when it reports no usage.
+            self._merge_usage(self.last_usage)
+            self._notify_usage(self.last_usage)
+            if plan_text:
+                msgs.append(
+                    {
+                        "role": "assistant",
+                        "content": "Plan:\n" + plan_text,
+                    }
+                )
+
         for i in range(self.iteration_cap):
             resp = await self.llm.chat(
                 msgs,
@@ -137,6 +170,7 @@ class Agent:
                 on_token=self.on_token,
                 temperature=self.temperature,
             )
+            self.last_usage = resp.usage
             self._merge_usage(resp.usage)
             self._notify_usage(resp.usage)
             if not resp.tool_calls:
@@ -261,6 +295,7 @@ def make_agent(
     include_shell: bool = True,
     db: Any = None,
     temperature: float | None = None,
+    plan_first: bool = False,
 ) -> Agent:
     """Build a normal-mode agent (workspace-scoped tools).
 
@@ -320,4 +355,5 @@ def make_agent(
         memory_index=memory_index,
         memory_location=memory_location,
         temperature=temperature,
+        plan_first=plan_first,
     )

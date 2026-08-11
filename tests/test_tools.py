@@ -80,6 +80,127 @@ async def test_python_run_executes_math(workspace):
     assert "42" in r.output
 
 
+async def test_python_run_utf8_output(workspace):
+    """Unicode outside cp1251 (emoji/cyrillic) must round-trip via UTF-8 env."""
+    workspace.mkdir()
+    r = await shell_tools.PythonRunTool(workspace).execute(
+        script="print('привет ✅ мир')"
+    )
+    assert r.ok
+    assert "привет ✅ мир" in r.output
+
+
+async def test_bash_utf8_output(workspace):
+    """bash output is decoded from raw bytes with UTF-8 first, cp1251 fallback."""
+    workspace.mkdir()
+    # Windows cmd's `echo` mangles non-ASCII; route through a python one-liner
+    # that emits UTF-8 (forced via PYTHONUTF8) to exercise byte decoding.
+    cmd = "python -c \"import sys; sys.stdout.write('привет ✅')\""
+    r = await shell_tools.BashTool(workspace).execute(command=cmd)
+    assert r.ok
+    assert "привет ✅" in r.output
+
+
+async def test_web_fetch_content_type_guard(monkeypatch):
+    """web_fetch refuses to parse non-HTML content-types (anti-bot PDF/image walls)."""
+    from nelke.core.tools import web as web_mod
+
+    captured = {}
+
+    class FakeResp:
+        headers = {"content-type": "application/pdf"}
+        status_code = 200
+
+        @property
+        def request(self):
+            return None
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            captured["url"] = url
+            return FakeResp()
+
+    monkeypatch.setattr(web_mod.httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    tool = web_mod.WebFetchTool(timeout=5)
+    r = await tool.execute(url="https://example.com/doc.pdf")
+    assert not r.ok
+    assert "content-type" in r.error.lower()
+
+
+async def test_web_fetch_wikipedia_fallback(monkeypatch):
+    """web_fetch falls back to a mirror/plain-text when the primary 403s."""
+    from nelke.core.tools import web as web_mod
+
+    urls_hit = []
+
+    class FakeResp:
+        headers = {"content-type": "text/plain; charset=utf-8"}
+        status_code = 200
+        content = b"# Article\n\nbody text"
+
+        @property
+        def request(self):
+            return None
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            urls_hit.append(url)
+            if "api/rest_v1/page/plain/" not in url:
+                resp = FakeResp()
+                resp.status_code = 403
+                return resp
+            return FakeResp()
+
+    monkeypatch.setattr(web_mod.httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    tool = web_mod.WebFetchTool(timeout=5)
+    r = await tool.execute(url="https://en.wikipedia.org/wiki/Nelke")
+    assert r.ok, r.error
+    assert "Article" in r.output
+    # primary + at least one fallback was attempted
+    assert len(urls_hit) >= 2
+    assert urls_hit[0] == "https://en.wikipedia.org/wiki/Nelke"
+
+
+async def test_web_fetch_strips_boilerplate():
+    """HTML→markdown drops scripts/styles/nav so the result is clean content."""
+    from nelke.core.tools import web as web_mod
+
+    html = (
+        "<html><head><script>var x = 1;</script><style>.a{}</style></head>"
+        "<body><nav><a href='/x'>Home</a></nav>"
+        "<h1>Title</h1><p>Body text</p>"
+        "<footer>© 2026</footer></body></html>"
+    )
+    md = web_mod._html_to_markdown(html)
+    assert "Title" in md
+    assert "Body text" in md
+    assert "var x" not in md
+    assert ".a{" not in md
+    assert "nav" not in md.lower() or "Home" not in md
+
+
+async def test_rewrite_wikiwand_keeps_lang():
+    """wikiwand fallback maps <lang>.wikiwand.com/<title> → www/<lang>/<title>."""
+    from nelke.core.tools import web as web_mod
+
+    out = web_mod._rewrite_wikiwand("https://ru.wikiwand.com/Nelke")
+    assert out == "https://www.wikiwand.com/ru/Nelke"
+    # www canonical form is a no-op (already canonical)
+    assert web_mod._rewrite_wikiwand("https://www.wikiwand.com/en/Nelke") == "https://www.wikiwand.com/en/Nelke"
+
+
 async def test_memory_recall_and_index(tmp_path):
     store = MemoryStore(tmp_path / "memory")
     store.write("skills.md", "# Skills\n\nUse the tool loop for safety.", overwrite=True)

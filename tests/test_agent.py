@@ -20,6 +20,87 @@ def _agent(tmp_path, llm, tools=None, **kw):
     )
 
 
+async def test_plan_first_prepends_plan(tmp_path):
+    """With plan_first, the agent runs a plan call before the tool loop and the
+    plan text lands in the conversation context."""
+    plan_llm = llm_with_script([
+        final_response("1. read x.txt\n2. summarize"),
+    ])
+    agent = _agent(tmp_path, plan_llm, plan_first=True)
+    result = await agent.run("summarize x.txt")
+    assert result.answer == "1. read x.txt\n2. summarize"
+    # The plan (from the first call) is present as an assistant message before
+    # the final answer.
+    assert result.iterations == 1
+    assistant_contents = [m["content"] for m in result.messages if m["role"] == "assistant"]
+    assert any(c and c.startswith("Plan:") for c in assistant_contents)
+
+
+async def test_plan_first_counts_plan_llm_call(tmp_path):
+    """The plan-first planning call's usage is merged into the run totals."""
+
+    class PlanLLM:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def chat(self, messages, **kw):
+            self.n += 1
+            if self.n == 1:
+                return final_response("plan step")
+            return final_response("done")
+
+    agent = _agent(tmp_path, PlanLLM(), plan_first=True)
+    result = await agent.run("go")
+    assert result.answer == "done"
+    assert result.usage["calls"] == 2
+
+
+async def test_plan_first_does_not_replan_later_turns(tmp_path):
+    """With reset=False, plan-first runs only once per conversation, not per turn."""
+    calls: list[int] = []
+
+    class PlanLLM:
+        def __init__(self) -> None:
+            self.plan_made = False
+
+        async def chat(self, messages, **kw):
+            calls.append(len(messages))
+            if not self.plan_made:
+                self.plan_made = True
+                return final_response("1. do the thing")
+            return final_response("final")
+
+    agent = _agent(tmp_path, PlanLLM(), plan_first=True)
+    r1 = await agent.run("first", reset=True)
+    r2 = await agent.run("second", reset=False)
+    # Turn 1: the first call produces the plan, the second call the final answer
+    # (r1.answer == "final"). Turn 2 must NOT re-plan — its only call is the
+    # answer itself. 3 calls total = plan + answer + answer(no re-plan).
+    assert r1.answer == "final"
+    assert r2.answer == "final"
+    assert len(calls) == 3
+
+
+async def test_plan_first_survives_plan_error(tmp_path):
+    """A planning exception must degrade to a normal tool loop, not crash."""
+
+    class BrokenPlanLLM:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def chat(self, messages, **kw):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("plan backend down")
+            return final_response("recovered without plan")
+
+    agent = _agent(tmp_path, BrokenPlanLLM(), plan_first=True)
+    result = await agent.run("go")
+    assert result.answer == "recovered without plan"
+    # the plan failure is counted as a tool error but the run completes
+    assert result.tool_errors == 1
+
+
 async def test_tool_loop_read_then_answer(tmp_path):
     (tmp_path / "x.txt").write_text("hello world", encoding="utf-8")
     llm = llm_with_script([

@@ -94,12 +94,14 @@ class Reviewer:
         system_prompt: str | None = None,
         base: str = "main",
         iteration_cap: int = 10,
+        temperature: float = 0.0,
     ) -> None:
         self.repo = repo
         self.llm = llm
         self.name = name
         self.base = base
         self.iteration_cap = iteration_cap
+        self.temperature = temperature
         ctx = SelfEditContext(
             repo=repo, governance=Governance(repo), repo_root=repo.repo, state={}
         )
@@ -116,6 +118,7 @@ class Reviewer:
             llm=llm,
             iteration_cap=iteration_cap,
             stream=False,
+            temperature=temperature,
         )
         self.last_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
 

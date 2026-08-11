@@ -61,6 +61,22 @@ class Settings(BaseSettings):
     recall_top_k: int = 8
     index_max_tokens: int = 2000
 
+    # Sampling temperature for agent/tool/subagent calls. Defaults to 0 so
+    # OpenAI-compatible providers' *automatic* prompt caching actually engages
+    # (a non-zero temperature disables prompt caching and roughly a 10x cost
+    # increase on long agent loops). Raise it per-profile only if you need
+    # more creative sampling on a provider that charges the same either way.
+    agent_temperature: float = 0.0
+
+    @field_validator("agent_temperature", mode="before")
+    @classmethod
+    def _clamp_temperature(cls, value: object) -> object:
+        """Keep temperature in [0, 2] so invalid values can't disable caching or break sampling."""
+        try:
+            return max(0.0, min(2.0, float(str(value))))
+        except (TypeError, ValueError):
+            return 0.0
+
     @field_validator("nelke_home", mode="before")
     @classmethod
     def _expand_tilde(cls, value: object) -> object:

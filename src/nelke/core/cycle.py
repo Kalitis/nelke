@@ -143,6 +143,7 @@ class CycleEngine:
         max_review_rounds: int = 3,
         on_token: ToolCallback = None,
         on_usage: Callable[[dict[str, Any]], Any] | None = None,
+        agent_temperature: float = 0.0,
     ) -> None:
         self.repo = repo
         self.db = db
@@ -155,6 +156,7 @@ class CycleEngine:
         self.max_review_rounds = max_review_rounds
         self.on_token = on_token
         self.on_usage = on_usage
+        self.agent_temperature = agent_temperature
         self._synced = False
 
     def _emit(self, kind: str, message: str = "", **data: Any) -> None:
@@ -210,6 +212,7 @@ class CycleEngine:
             stream=True,
             on_token=self.on_token,
             memory_index=memory.index_text() or None,
+            temperature=self.agent_temperature,
         )
 
     def _result(
@@ -429,7 +432,8 @@ class CycleEngine:
             review_feedback_pending = False
             while True:
                 rounds += 1
-                reviewer = Reviewer(repo, self.llm, base="main")
+                reviewer = Reviewer(repo, self.llm, base="main",
+                                    temperature=self.agent_temperature)
                 verdict = await reviewer.review(objective, final_diff)
                 self.db.add_usage(reviewer.last_usage, cycle_id=cycle_id)
                 self.db.create_review_request(cycle_id, "ai", verdict=verdict.verdict, comments=verdict.comments)

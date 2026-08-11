@@ -231,6 +231,7 @@ def make_agent(
     include_web: bool = True,
     include_shell: bool = True,
     db: Any = None,
+    temperature: float | None = None,
 ) -> Agent:
     """Build a normal-mode agent (workspace-scoped tools).
 
@@ -285,4 +286,5 @@ def make_agent(
         on_degraded=on_degraded,
         degrade_error_threshold=degrade_error_threshold,
         memory_index=memory_index,
+        temperature=temperature,
     )

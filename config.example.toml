@@ -1,5 +1,11 @@
 # Nelke provider profiles. Copy to ~/.nelke/config.toml and edit.
 
+# Samling temperature for agent/tool/subagent/reviewer calls. Keep 0 (default)
+# so OpenAI-compatible providers' automatic prompt caching engages: a non-zero
+# temperature disables prompt caching and can make long agent loops ~10x more
+# expensive. Raise it only if a provider bills the same either way.
+# NELKE_AGENT_TEMPERATURE=0.0
+
 [profiles.openai]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"

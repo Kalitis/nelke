@@ -17,6 +17,27 @@ from nelke.core.tools.base import BaseTool, ToolResult, resolve_within
 
 DEFAULT_ENCODING = "utf-8"
 MAX_SELF_OUTPUT = 60_000
+MAX_GLOB_RESULTS = 400
+
+# Directories/files that must never be globbed/grepped: vendor stacks and caches
+# balloon every tool result (and thus every following LLM prompt), make the cycle
+# slow/stall-prone and defeat prompt caching. Anything here is irrelevant to
+# improving the repo's own source.
+_SKIP_DIR_PARTS = {
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "__pycache__",
+    "node_modules", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".cache", ".tox", ".eggs", "dist", "build", "target", "site-packages",
+}
+_SKIP_FILE_SUFFIXES = {".pyc", ".pyo"}
+
+
+def _is_ignored(rel: Path) -> bool:
+    parts = rel.parts
+    if any(p in _SKIP_DIR_PARTS for p in parts):
+        return True
+    if rel.suffix in _SKIP_FILE_SUFFIXES:
+        return True
+    return bool(parts and parts[-1].endswith(".egg-info"))
 
 
 @dataclass
@@ -133,7 +154,15 @@ class SelfGlobTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         root = self.ctx.repo_root.resolve()
-        matches = sorted(p.relative_to(root).as_posix() for p in root.glob(str(kwargs.get("pattern", ""))))
+        matches = sorted(
+            p.relative_to(root).as_posix()
+            for p in root.glob(str(kwargs.get("pattern", "")))
+            if not _is_ignored(p.relative_to(root))
+        )
+        if len(matches) > MAX_GLOB_RESULTS:
+            body = "\n".join(matches[:MAX_GLOB_RESULTS])
+            body += f"\n...[truncated {len(matches) - MAX_GLOB_RESULTS} more matches]"
+            return ToolResult.success(body)
         return ToolResult.success("\n".join(matches) if matches else "no matches")
 
 
@@ -164,12 +193,13 @@ class SelfGrepTool(BaseTool):
         root = self.ctx.repo_root.resolve()
         hits: list[str] = []
         for p in root.glob(include):
-            if not p.is_file():
+            rel = p.relative_to(root)
+            if not p.is_file() or _is_ignored(rel):
                 continue
             try:
                 for lineno, line in enumerate(p.read_text(encoding=DEFAULT_ENCODING, errors="replace").splitlines(), 1):
                     if regex.search(line):
-                        hits.append(f"{p.relative_to(root).as_posix()}:{lineno}: {line[:200]}")
+                        hits.append(f"{rel.as_posix()}:{lineno}: {line[:200]}")
                         if len(hits) >= 200:
                             return ToolResult.success("\n".join(hits) + "\n...[truncated]")
             except OSError:

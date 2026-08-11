@@ -175,6 +175,99 @@ async def test_chat_tags_session_as_telegram(settings, tmp_repo):
 
 
 # --------------------------------------------------------------------------- #
+# Chat history + multi-chat management
+# --------------------------------------------------------------------------- #
+async def test_chat_persists_transcript_across_turns(settings, tmp_repo):
+    """A second /chat continues the same session and appends to history."""
+    from nelke.core import services
+
+    factory = _scripted_llm_factory([final_response("first answer"), final_response("second answer")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_chat(fake.make_message("/chat hello"), _cmd("hello"))
+    await _wait_for(state)
+    sid = state.current_sessions[1]
+    await nelke.on_chat(fake.make_message("/chat again"), _cmd("again"))
+    await _wait_for(state)
+    assert state.current_sessions[1] == sid
+    db = services.open_db(settings)
+    roles = [r["role"] for r in db.list_messages(sid)]
+    assert roles.count("user") == 2
+    assert roles.count("assistant") == 2
+
+
+async def test_new_chat_creates_fresh_session(settings, tmp_repo):
+    from nelke.core import services
+
+    factory = _scripted_llm_factory([final_response("a"), final_response("b"), final_response("c")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_chat(fake.make_message("/chat one"), _cmd("one"))
+    await _wait_for(state)
+    sid1 = state.current_sessions[1]
+    await nelke.on_new_chat(fake.make_message("/new"))
+    sid2 = state.current_sessions[1]
+    assert sid1 != sid2
+    await nelke.on_chat(fake.make_message("/chat two"), _cmd("two"))
+    await _wait_for(state)
+    db = services.open_db(settings)
+    assert db.get_session(sid1) is not None
+    assert db.get_session(sid2) is not None
+    assert len(db.list_messages(sid1)) == 2
+    assert len(db.list_messages(sid2)) == 2
+
+
+async def test_history_prints_transcript(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("the answer is 42")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_chat(fake.make_message("/chat what is 6x7"), _cmd("what is 6x7"))
+    await _wait_for(state)
+    await nelke.on_history(fake.make_message("/history"), _cmd(""))
+    joined = " ".join(s["text"] for s in fake.sends)
+    assert "the answer is 42" in joined
+    assert "You:" in joined
+
+
+async def test_history_before_any_chat(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_history(fake.make_message("/history"), _cmd(""))
+    assert any("No chat yet" in s["text"] for s in fake.sends)
+
+
+async def test_chats_lists_and_open_switches(settings, tmp_repo):
+    factory = _scripted_llm_factory([
+        final_response("one"), final_response("two"), final_response("three"),
+    ])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_chat(fake.make_message("/chat first"), _cmd("first"))
+    await _wait_for(state)
+    sid1 = state.current_sessions[1]
+    await nelke.on_chat(fake.make_message("/chat second"), _cmd("second"))
+    await _wait_for(state)
+    sid2 = state.current_sessions[1]
+    await nelke.on_new_chat(fake.make_message("/new"))
+    await nelke.on_chat(fake.make_message("/chat third"), _cmd("third"))
+    await _wait_for(state)
+    sid3 = state.current_sessions[1]
+    assert sid1 == sid2 != sid3
+
+    await nelke.on_chats(fake.make_message("/chats"))
+    joined = " ".join(s["text"] for s in fake.sends)
+    assert f"{sid1[-8:]} first" in joined
+    assert f"{sid3[-8:]} third" in joined
+    assert "4 msgs" in joined and "2 msgs" in joined
+
+    await nelke.on_open(fake.make_message(f"/open {sid1[-8:]}"), _cmd(sid1[-8:]))
+    assert state.current_sessions[1] == sid1
+
+
+async def test_open_unknown_chat(settings, tmp_repo):
+    factory = _scripted_llm_factory([final_response("x")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+    await nelke.on_open(fake.make_message("/open deadbeef"), _cmd("deadbeef"))
+    assert any("not found" in s["text"] for s in fake.sends)
+
+
+# --------------------------------------------------------------------------- #
 # /improve + inline review
 # --------------------------------------------------------------------------- #
 def _callback(fake: FakeBot, data: str) -> NS:

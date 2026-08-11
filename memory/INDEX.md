@@ -4,5 +4,10 @@
 - [Lessons](lessons.md) — - A self-improvement commit that cannot import/boot must be reverted — the boot check is the rollback gate. #lessons governance
 - [Skills](skills.md) — - Use the tool-calling loop: read/glob/grep before editing; write minimal diffs. #skills agent tools
 
+## chats
+- [Nelke Development Vector (2026-08-11)](chats/20260811054228-2ada9b87/development/roadmap.md) — Tags: roadmap, development, self-improvement, vector #roadmap development self-improvement vector
+- [О пользователе](chats/20260811070422-6ed4ba1d/about-user.md) — - **Имя:** Игорь Калитис
+- [Проект Nelke](chats/20260811070422-6ed4ba1d/projects/nelke.md) — - Входит в серию N4: Nelke, Nagelkraut, Nachtschatten, Nieswurz.
+
 ## facts
 - [LLM providers](facts/llms.md) — - Nelke talks to any OpenAI-compatible endpoint via the `openai` library. #facts llm providers

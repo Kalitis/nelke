@@ -260,7 +260,24 @@ class CycleEngine:
         repo.checkout_new_branch(branch, base="main")
         self._synced = False
         self.db.create_cycle(objective, branch, cycle_id=cycle_id)
+        try:
+            return await self._run_impl(repo, objective, branch, cycle_id, human_gate)
+        except Exception:  # noqa: BLE001 - never leave a cycle stuck as `running`
+            try:
+                self.db.update_cycle(cycle_id, status="error", ended_at=_now())
+                self._emit("cycle_error", "cycle crashed", cycle_id=cycle_id, branch=branch)
+            except Exception:  # noqa: BLE001 - persistence must never mask the crash
+                pass
+            raise
 
+    async def _run_impl(
+        self,
+        repo: GitRepo,
+        objective: str,
+        branch: str,
+        cycle_id: str,
+        human_gate: Callable[[HumanReviewRequest], bool | Awaitable[bool]] | None,
+    ) -> CycleResult:
         state: dict[str, Any] = {"propose_complete": False}
         step_no = 0
         ctx = SelfEditContext(

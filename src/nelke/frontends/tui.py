@@ -402,7 +402,7 @@ class NelkeTUI(App):
         status = self.query_one("#improve-status", Static)
         usage_widget = self.query_one("#improve-usage", Static)
         cycle_usage: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
-        self._ui(progress.update, 0)
+        self._ui(progress.update, progress=0)
         self._ui(usage_widget.update, "tokens: 0")
 
         def on_event(event: Any) -> None:
@@ -415,7 +415,7 @@ class NelkeTUI(App):
             self._ui(log.write, f"[dim]{event.kind}:[/] {event.message}")
             if event.kind in {"commit", "gate"} and event.step is not None and event.data.get("total_steps"):
                 pct = min(100, int(event.step / event.data["total_steps"] * 100))
-                self._ui(progress.update, pct)
+                self._ui(progress.update, progress=pct)
                 self._ui(status.update, f"step {event.step}/{event.data['total_steps']}")
             if event.kind == "agent_tool":
                 tool = event.data.get("tool", "")

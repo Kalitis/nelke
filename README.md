@@ -41,7 +41,7 @@ cycle, and human review gate.
 ```bash
 nelke web [--host 127.0.0.1] [--port 8000]   # FastAPI + SSE chat/review UI
 nelke tui                                     # Textual terminal UI (chat/improve/memory)
-nelke bot                                     # Telegram bot (/chat /improve /cancel /memory)
+nelke bot                                     # Telegram bot (/chat /new /history /chats /open /improve /cancel /memory)
 ```
 
 The web frontend streams tokens over SSE; the human gate is a `/review/<id>`
@@ -56,7 +56,10 @@ Both the web and TUI frontends manage **multiple named chats**: each chat keeps
 its own persisted transcript (in SQLite `sessions`/`messages`, including tool
 calls) and its own per-chat memory store (`memory/chats/<session_id>/`) that the
 agent reads via `recall`/writes via `memory_write`. Opening a chat reloads its
-history so conversations continue across restarts. Self-improvement **cycles**
+history so conversations continue across restarts. The Telegram bot does the
+same: each Telegram chat keeps a persistent session (`/chat` continues the
+conversation; `/new` starts a fresh chat, `/history` shows the transcript,
+`/chats`/`/open <id>` list and resume older chats). Self-improvement **cycles**
 live in a separate view — the web `/cycles` page and the TUI "Improve" tab list
 every cycle with its steps, timeline events and review links.
 

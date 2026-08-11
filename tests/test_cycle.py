@@ -285,6 +285,26 @@ async def test_cycle_refuses_dirty_main(tmp_repo, db):
     assert db.list_cycles() == []  # nothing recorded, nothing touched
 
 
+async def test_cycle_marks_error_on_crash(tmp_repo, db):
+    """A crashing worker must not leave the cycle stuck as `running`."""
+    from conftest import FakeLLM
+
+    class BoomLLM(FakeLLM):
+        async def chat(self, messages, *, tools=None, model=None, temperature=None,
+                       max_tokens=None, stream=False, on_token=None):
+            raise RuntimeError("simulated provider stall")
+
+    engine = _engine(tmp_repo, db, FakeGovernance(), BoomLLM())
+    import pytest
+
+    with pytest.raises(RuntimeError, match="simulated provider stall"):
+        await engine.run("improve something")
+    # the cycle was recorded and marked as failed, not left running
+    rows = db.list_cycles()
+    assert rows and rows[0]["status"] == "error"
+    assert rows[0]["ended_at"] is not None
+
+
 async def test_deps_sync_once_on_pyproject_change(tmp_repo, db):
     class RecordingRunner:
         def __init__(self) -> None:

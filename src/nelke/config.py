@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     web_timeout: int = 30
     recall_top_k: int = 8
     index_max_tokens: int = 2000
+    # Use real (dense, multilingual) embeddings from an OpenAI-compatible
+    # endpoint (`[embeddings]` in ~/.nelke/config.toml, e.g. LM Studio) for
+    # memory recall/auto-link. When off — or when the endpoint is unreachable /
+    # has no embedding model loaded — the local offline hashing embedder is used.
+    embeddings_enabled: bool = True
+    # Plan-first mode: sketch an explicit plan before the tool loop on every
+    # turn. Saves iterations/tool errors on multi-step tasks, at the cost of
+    # one extra (cheap, non-tool) LLM call per turn. Off by default.
+    plan_first: bool = False
 
     # Sampling temperature for agent/tool/subagent calls. Defaults to 1 (the
     # OpenAI-compatible default) for natural responses. Prompt caching is NOT

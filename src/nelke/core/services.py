@@ -216,6 +216,7 @@ def build_chat_session(
         web_timeout=settings.web_timeout,
         db=db,
         temperature=settings.agent_temperature,
+        plan_first=settings.plan_first,
     )
     if existing:
         history = db.list_messages(session_id)
@@ -266,6 +267,8 @@ async def run_cycle(
     governance: Any = None,
     on_token: Any = None,
     on_usage: UsageHandler = None,
+    mode: str = "single",
+    max_workers: int = 6,
 ) -> Any:
     """Run a self-improvement cycle. Returns the :class:`CycleResult`.
 
@@ -276,6 +279,13 @@ async def run_cycle(
     running lint/typecheck/tests subprocesses. ``on_token`` streams raw
     cycle-worker tokens if provided; ``on_usage`` receives each LLM call's
     usage in real time (persisted to the cycle's usage rows by the engine).
+
+    ``mode`` selects the execution model:
+    * ``"single"`` (default, used by CLI/TUI/Telegram): one legacy worker
+      agent commits per step. Backward-compatible with all existing callers.
+    * ``"parallel"`` (web UI): a planner splits the objective into up to
+      ``max_workers`` slices that run concurrently against the shared tree;
+      the combined diff is gated, committed once, then reviewed/merged.
     """
     from nelke.core.cycle import CycleEngine
 
@@ -295,6 +305,8 @@ async def run_cycle(
         on_token=on_token,
         on_usage=on_usage,
         agent_temperature=settings.agent_temperature,
+        mode=mode,  # type: ignore[arg-type]
+        max_workers=max_workers,
     )
     return await engine.run(objective)
 
@@ -424,6 +436,24 @@ def memory_overview(repo: Path) -> list[dict[str, Any]]:
         size = path.stat().st_size if path.exists() else 0
         out.append({"name": rel.as_posix(), "size": size})
     return out
+
+
+def memory_file_content(repo: Path, name: str) -> str | None:
+    """Contents of a single memory file, or ``None`` if it does not exist.
+
+    ``name`` must match a known memory file (relative path with ``.md``). This
+    is the safe lookup for the web viewer: it refuses anything outside the
+    memory dir or without the ``.md`` extension, so a crafted ``name`` cannot
+    escape to arbitrary files.
+    """
+    store = open_memory(repo)
+    rels = {rel.as_posix() for rel in store.files()}
+    if name not in rels:
+        return None
+    try:
+        return store.read(name)
+    except (FileNotFoundError, OSError):
+        return None
 
 
 def recall_memory(repo: Path, query: str, top_k: int = 8) -> list[MemoryHit]:
@@ -964,6 +994,7 @@ def _cycle_summary(db: Database, row: Any) -> dict[str, Any]:
     human_reqs = [r for r in db.list_review_requests(cycle_id=row["id"], open_only=False)
                   if r["kind"] == "human"]
     open_human = [r for r in human_reqs if r["verdict"] == "pending"]
+    workers = _cycle_workers(db, row["id"])
     return {
         "id": row["id"],
         "objective": row["objective"],
@@ -980,11 +1011,34 @@ def _cycle_summary(db: Database, row: Any) -> dict[str, Any]:
             }
             for s in steps
         ],
+        # Parallel cycles populate one row per planner slice; single-worker
+        # cycles leave this empty so the UI falls back to the step timeline.
+        "workers": workers,
         "human_review_id": (open_human[0]["id"] if open_human else human_reqs[-1]["id"]
                             if human_reqs else None),
         "reviews": [],
         "events": [],
     }
+
+
+def _cycle_workers(db: Database, cycle_id: str) -> list[dict[str, Any]]:
+    """Serialise ``cycle_workers`` rows for the cycle summary/detail DTOs."""
+    try:
+        rows = db.list_cycle_workers(cycle_id)
+    except Exception:  # noqa: BLE001 - older DBs without the table degrade to []
+        return []
+    out: list[dict[str, Any]] = []
+    for w in rows:
+        out.append({
+            "id": w["id"],
+            "worker_index": w["worker_index"],
+            "title": w["title"],
+            "detail": w["detail"],
+            "status": w["status"],
+            "started_at": w["started_at"],
+            "ended_at": w["ended_at"],
+        })
+    return out
 
 
 def reconcile_stale_cycles(

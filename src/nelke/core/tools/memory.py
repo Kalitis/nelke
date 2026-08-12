@@ -25,7 +25,7 @@ class RecallTool(BaseTool):
     async def execute(self, **kwargs) -> ToolResult:
         query = str(kwargs.get("query", ""))
         top_k = int(kwargs.get("top_k") or self.default_top_k)
-        hits = self.store.recall(query, top_k)
+        hits = await self.store.arecall(query, top_k)
         if not hits:
             return ToolResult.success("no memory matches")
         lines = []
@@ -106,7 +106,11 @@ class MemoryWriteTool(BaseTool):
         overwrite = bool(kwargs.get("overwrite", False))
         try:
             self.store.write(path, content, overwrite=overwrite)
+            linked = await self.store.auto_link_async()
             index_len = len(self.store.build_index())
         except (ToolError, FileNotFoundError, OSError) as exc:
             return ToolResult.failure(f"memory_write failed: {exc}")
-        return ToolResult.success(f"wrote memory/{path}; INDEX.md rebuilt ({index_len} chars)")
+        link_note = f"; cross-linked {len(linked)} related file(s)" if linked else ""
+        return ToolResult.success(
+            f"wrote memory/{path}; INDEX.md rebuilt ({index_len} chars){link_note}"
+        )

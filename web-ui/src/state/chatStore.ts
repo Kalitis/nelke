@@ -8,8 +8,9 @@ import type {
   Profile,
   StreamEvent,
 } from "@/state/types";
-import { activePath, findActiveLeaf } from "@/lib/tree";
+import { activePath, appendOptimistic, findActiveLeaf, removeOptimistic } from "@/lib/tree";
 import { pathToRoot } from "@/lib/tree";
+import { loadString, saveString } from "@/lib/storage";
 
 interface ChatState {
   chats: ChatSummary[];
@@ -20,6 +21,9 @@ interface ChatState {
   streaming: boolean;
   // transient streaming buffer surfaced to the UI while a turn is in flight
   streamBuffer: { content: string; tools: StreamToolEntry[] };
+  // id of the optimistic user message inserted before a turn; rolled back on
+  // error and replaced by the canonical tree on the `done` event.
+  optimisticMessageId: string | null;
   error: string | null;
 
   loadProfiles: () => Promise<void>;
@@ -55,12 +59,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   profile: null,
   streaming: false,
   streamBuffer: { content: "", tools: [] },
+  optimisticMessageId: null,
   error: null,
 
   loadProfiles: async () => {
     try {
       const profiles = await api.profiles();
-      set({ profiles, profile: get().profile ?? profiles[0]?.name ?? null });
+      // Prefer the previously chosen profile (persisted across reloads), then
+      // whatever is already in memory, then the first available profile.
+      const saved = loadString("profile");
+      const valid = (name: string | null): name is string =>
+        !!name && profiles.some((p) => p.name === name);
+      const profile = valid(get().profile)
+        ? get().profile
+        : valid(saved)
+          ? saved
+          : (profiles[0]?.name ?? null);
+      set({ profiles, profile });
     } catch (err) {
       set({ error: String(err) });
     }
@@ -76,7 +91,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   selectChat: async (id) => {
-    set({ activeChatId: id, error: null, streamBuffer: { content: "", tools: [] } });
+    set({ activeChatId: id, error: null, streamBuffer: { content: "", tools: [] }, optimisticMessageId: null });
     try {
       const chat = await api.getChat(id);
       set({ chat });
@@ -119,13 +134,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  setProfile: (name) => set({ profile: name }),
+  setProfile: (name) => {
+    saveString("profile", name);
+    set({ profile: name });
+  },
 
   sendMessage: async (text) => {
     const { activeChatId, profile, chat } = get();
     if (!activeChatId || !text.trim() || get().streaming) return;
     // Anchor the new turn to the current active leaf so branching keeps working.
     const parentId = chat ? findActiveLeaf(chat.tree) : null;
+    // Optimistically insert the user message so its bubble shows immediately;
+    // the canonical tree (with a server id) replaces it on the `done` event.
+    const optimisticId = `pending-${Date.now()}`;
+    const optimistic: Message = {
+      id: optimisticId,
+      role: "user",
+      content: text,
+      parent_id: parentId,
+      is_active: true,
+      is_deleted: false,
+      sibling_order: 0,
+    };
+    if (chat) {
+      set({
+        chat: { ...chat, tree: appendOptimistic(chat.tree, optimistic) },
+        optimisticMessageId: optimisticId,
+      });
+    }
     await runStream(
       set,
       () =>
@@ -134,6 +170,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           { text, profile, parent_message_id: parentId },
           makeHandlers(set),
         ),
+      optimisticId,
     );
   },
 
@@ -146,6 +183,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // assistant answer from the edited user message.
       const fresh = await api.getChat(activeChatId);
       set({ chat: fresh });
+      // Optimistic insert mirrors sendMessage: the edited prompt appears at
+      // once while the assistant streams beneath it.
+      const optimisticId = `pending-${Date.now()}`;
+      const optimistic: Message = {
+        id: optimisticId,
+        role: "user",
+        content,
+        parent_id: result.message_id,
+        is_active: true,
+        is_deleted: false,
+        sibling_order: 0,
+      };
+      set({
+        chat: { ...fresh, tree: appendOptimistic(fresh.tree, optimistic) },
+        optimisticMessageId: optimisticId,
+      });
       await runStream(
         set,
         () =>
@@ -154,6 +207,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             { text: content, profile: get().profile, parent_message_id: result.message_id },
             makeHandlers(set),
           ),
+        optimisticId,
       );
     } catch (err) {
       set({ error: String(err) });
@@ -231,9 +285,13 @@ function makeHandlers(
           break;
         case "error":
           set({ error: ev.data.message, streaming: false });
+          rollbackOptimistic();
           break;
         case "done":
           // Server has persisted the new messages; refresh the canonical view.
+          // The reload replaces the optimistic node with the canonical user
+          // message (different id), so clear the marker.
+          set({ optimisticMessageId: null });
           void useChatStore.getState().selectChat(useChatStore.getState().activeChatId!);
           void useChatStore.getState().loadChats();
           break;
@@ -241,17 +299,50 @@ function makeHandlers(
           break;
       }
     },
-    onError: (err) => set({ error: String(err), streaming: false }),
+    onError: (err) => {
+      set({ error: String(err), streaming: false });
+      rollbackOptimistic();
+    },
   };
+}
+
+/** Drop the optimistic user message if a turn failed before `done`. */
+function rollbackOptimistic(): void {
+  const { optimisticMessageId, chat } = useChatStore.getState();
+  if (!optimisticMessageId || !chat) {
+    setIfOptimistic(null);
+    return;
+  }
+  setIfOptimistic({
+    chat: { ...chat, tree: removeOptimistic(chat.tree, optimisticMessageId) },
+    optimisticMessageId: null,
+  });
+}
+
+function setIfOptimistic(patch: Partial<ChatState> | null): void {
+  if (patch) useChatStore.setState(patch);
 }
 
 async function runStream(
   set: (partial: Partial<ChatState>) => void,
   run: () => Promise<void>,
+  optimisticId?: string,
 ): Promise<void> {
   set({ streaming: true, error: null, streamBuffer: { content: "", tools: [] } });
   try {
     await run();
+  } catch (err) {
+    // Network/HTTP failure: roll back the optimistic bubble and surface error.
+    if (optimisticId) {
+      const { chat } = useChatStore.getState();
+      if (chat) {
+        useChatStore.setState({
+          chat: { ...chat, tree: removeOptimistic(chat.tree, optimisticId) },
+          optimisticMessageId: null,
+        });
+      }
+    }
+    set({ error: String(err) });
   } finally {
     set({ streaming: false });
   }

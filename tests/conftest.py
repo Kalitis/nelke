@@ -58,20 +58,41 @@ def llm_with_script(responses: list[LLMResponse]) -> FakeLLM:
 def driver_fake(
     worker: Callable[[list[dict], list[dict] | None], LLMResponse] | None = None,
     reviewer: Callable[[list[dict], list[dict] | None], LLMResponse] | None = None,
+    planner: Callable[[list[dict], list[dict] | None], LLMResponse] | None = None,
 ) -> FakeLLM:
-    """Runs a distinct responder for worker vs reviewer agents (detected by system prompt)."""
+    """Runs a distinct responder for worker vs reviewer vs planner agents.
+
+    Detected by system prompt: the planner's prompt contains "task planner",
+    the reviewer's contains "review gate", and everything else falls through
+    to the worker responder.
+    """
     reviewer = reviewer or (lambda messages, tools: final_response(
         "VERDICT: APPROVE\nSUMMARY: looks good\nCOMMENTS: none"
     ))
     worker = worker or scripted([final_response("done")])
+    # Default planner returns a single-task plan equal to the whole objective,
+    # so parallel cycles behave like the legacy single-worker path.
+    planner = planner or (lambda messages, tools: final_response(
+        '{"tasks":[{"title":"all","detail":"do everything"}]}'
+    ))
 
     def _respond(messages, tools):
         system = next((m["content"] for m in messages if m.get("role") == "system"), "")
+        if "task planner" in system:
+            return planner(messages, tools)
         if "review gate" in system or "AI review gate" in system:
             return reviewer(messages, tools)
         return worker(messages, tools)
 
     return FakeLLM(responder=_respond)
+
+
+def planner_returning(tasks: list[dict[str, str]]) -> Callable:
+    """A planner responder that returns the given task list as JSON."""
+    import json as _json
+
+    payload = _json.dumps({"tasks": tasks})
+    return lambda messages, tools: final_response(payload)
 
 
 # --------------------------------------------------------------------------- #

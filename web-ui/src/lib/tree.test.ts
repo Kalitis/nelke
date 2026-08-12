@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { activePath, childrenOf, countActive, findActiveLeaf, pathToRoot, siblingPosition } from "./tree";
+import {
+  activePath,
+  appendOptimistic,
+  childrenOf,
+  countActive,
+  findActiveLeaf,
+  pathToRoot,
+  removeOptimistic,
+  siblingPosition,
+} from "./tree";
 import type { Message, MessageTree } from "@/state/types";
 
 let n = 0;
@@ -81,5 +90,60 @@ describe("tree helpers", () => {
     const d = mk("user", null, { is_deleted: true });
     const tree = build([a, b, c, d]);
     expect(countActive(tree)).toBe(2);
+  });
+});
+
+describe("appendOptimistic / removeOptimistic", () => {
+  it("appendOptimistic adds a new leaf under the given parent and makes it the active leaf", () => {
+    const a = mk("user", null);
+    const b = mk("assistant", a.id);
+    const tree = build([a, b]);
+    const optimistic = mk("user", b.id);
+    optimistic.id = "pending-1";
+
+    const next = appendOptimistic(tree, optimistic);
+
+    // Original tree is untouched (immutability).
+    expect(tree.nodes).not.toHaveProperty("pending-1");
+    // New tree contains the node, parented correctly, and as a child of b.
+    expect(next.nodes).toHaveProperty("pending-1");
+    expect(next.nodes["pending-1"].parent_id).toBe(b.id);
+    expect(childrenOf(next, b.id).map((m) => m.id)).toContain("pending-1");
+    // New node becomes the active leaf so visibleTranscript surfaces it.
+    expect(findActiveLeaf(next)).toBe("pending-1");
+    expect(activePath(next).map((m) => m.id)).toEqual([a.id, b.id, "pending-1"]);
+  });
+
+  it("appendOptimistic on an empty tree sets it as the root", () => {
+    const empty: MessageTree = { root_id: null, nodes: {}, children: {} };
+    const optimistic = mk("user", null);
+    optimistic.id = "pending-1";
+
+    const next = appendOptimistic(empty, optimistic);
+
+    expect(next.root_id).toBe("pending-1");
+    expect(activePath(next).map((m) => m.id)).toEqual(["pending-1"]);
+  });
+
+  it("removeOptimistic drops the node and cleans up its parent's child list", () => {
+    const a = mk("user", null);
+    const b = mk("assistant", a.id);
+    const tree = build([a, b]);
+    const optimistic = mk("user", b.id);
+    optimistic.id = "pending-1";
+    const withOpt = appendOptimistic(tree, optimistic);
+
+    const after = removeOptimistic(withOpt, "pending-1");
+
+    expect(after.nodes).not.toHaveProperty("pending-1");
+    expect(childrenOf(after, b.id).map((m) => m.id)).toEqual([]);
+    // Original active leaf is restored.
+    expect(findActiveLeaf(after)).toBe(b.id);
+  });
+
+  it("removeOptimistic on a missing id is a no-op", () => {
+    const a = mk("user", null);
+    const tree = build([a]);
+    expect(removeOptimistic(tree, "nope")).toBe(tree);
   });
 });

@@ -3,27 +3,37 @@
 ``memory/*.md`` files are the durable, human-readable self-memory. ``INDEX.md`` is
 auto-generated (titles + one-line summaries + tags), kept under a token budget and
 injected into the agent system prompt. Session/task logs belong in SQLite, not here.
+
+Recall combines lexical term-frequency/fuzzy scoring with an embedding-similarity
+pass, so queries that share *meaning* but no exact words can still surface the
+right file. The async paths (``arecall`` / ``auto_link_async``) use a pluggable
+:class:`~nelke.core.embeddings.Embedder` — by default the offline hash embedder,
+switching automatically to dense multilingual embeddings from an OpenAI-compatible
+endpoint (LM Studio via ``[embeddings]``) when configured and reachable. Related
+memory files are auto-linked with relative ``[title](file.md)`` cross-references.
 """
 
 from __future__ import annotations
 
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from nelke.core.embeddings import (
+    Embedder,
+    _embed_similarity,  # noqa: F401  (re-exported for tests/back-compat)
+    _tokenize,
+    build_embedder,
+)
 from nelke.core.tools.base import ToolError, resolve_within
 
 _INDEX_NAME = "INDEX.md"
 _HEADING_RE = re.compile(r"^#\s+(.+)$")
 _TAGS_RE = re.compile(r"^tags\s*:\s*(.+)$", re.IGNORECASE)
-_WORD_SPLIT_RE = re.compile(r"[^\w]+")
-# Stopwords dropped from queries to avoid noise matches.
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
-    "is", "are", "been", "was", "were", "it", "its", "that", "this", "these",
-    "those", "from", "as", "by", "at", "be", "have", "has", "do", "does",
-}
+
+_EMBED_MIN_SIM = 0.35  # local threshold for "related" (sync recall / auto_link)
 
 
 @dataclass
@@ -50,10 +60,6 @@ def _summary(content: str) -> str:
             continue
         return s
     return ""
-
-
-def _tokenize(text: str) -> list[str]:
-    return [w for w in _WORD_SPLIT_RE.split(text.lower()) if w and w not in _STOPWORDS]
 
 
 def _score_terms(all_terms: list[str], query_terms: list[str]) -> tuple[int, int]:
@@ -115,8 +121,19 @@ def _recall_one(content: str, query_terms: list[str]) -> tuple[int, int]:
 
 
 class MemoryStore:
-    def __init__(self, memory_dir: Path) -> None:
+    def __init__(self, memory_dir: Path, embedder: Embedder | None = None) -> None:
         self.memory_dir = memory_dir.resolve()
+        # Explicit embedder (tests/DI) or lazily-built from config: local by
+        # default, dense (LM Studio-ish) when `[embeddings]` is configured.
+        self._embedder = embedder
+        self._resolved_embedder: Embedder | None = None
+
+    def _get_embedder(self) -> Embedder:
+        if self._embedder is not None:
+            return self._embedder
+        if self._resolved_embedder is None:
+            self._resolved_embedder = build_embedder()
+        return self._resolved_embedder
 
     def _resolve(self, name: str) -> Path:
         if not name.endswith(".md"):
@@ -202,11 +219,17 @@ class MemoryStore:
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def recall(self, query: str, top_k: int = 8) -> list[MemoryHit]:
-        """Relevance search over memory files.
+        """Synchronous relevance search using the *local* (offline) embedder.
 
         Scoring combines term-frequency ranking (with log dampening) over the raw
-        body, a stemmed fuzzy pass (so plurals/queries still match), and a boost
-        when the query terms appear in the file's INDEX entry (title/tags/summary).
+        body, a stemmed fuzzy pass (so plurals/queries still match), a boost when
+        the query terms appear in the file's INDEX entry (title/tags/summary), and
+        an embedding-similarity pass (word/stem hashing) that surfaces files
+        sharing *meaning* but no exact words — e.g. "how do I recover a deleted
+        branch" matching a file about ``git checkout``.
+
+        Prefer :meth:`arecall` from async callers: it uses dense multilingual
+        embeddings when an endpoint is configured, falling back to this path.
         """
         if not query.strip():
             return []
@@ -218,16 +241,125 @@ class MemoryStore:
         for rel in self.files():
             content = self.read(rel.as_posix())
             body_score, body_pos = _recall_one(content, query_terms)
-            if body_score == 0:
-                continue
+            # Semantic similarity — catches meaningful-but-lexically-distinct hits.
+            semantic = _embed_similarity(query, content)
+            if body_score == 0 and semantic < _EMBED_MIN_SIM:
+                continue  # no lexical nor semantic signal
             # boost by matching the INDEX entry (title+tags+summary)
             entry_score = _recall_one(_index_entry(index_text, rel.as_posix()), query_terms)[0]
-            score = body_score + entry_score
+            score = body_score + entry_score + int(round(semantic * 100))
             pos = body_pos if body_pos >= 0 else 0
             snippet = _snippet(content, pos)
             hits.append(MemoryHit(name=rel.as_posix(), score=score, snippet=snippet))
         hits.sort(key=lambda h: (-h.score, h.name))
         return hits[:top_k]
+
+    async def arecall(self, query: str, top_k: int = 8) -> list[MemoryHit]:
+        """Recall using the configured embedder (dense + multilingual when
+        available), with an automatic fallback to the local hashing path.
+
+        Any embedder failure (endpoint down, no embedding model loaded, timeout)
+        degrades cleanly to :meth:`recall` — memory recall is never blocked by a
+        network dependency.
+        """
+        if not query.strip():
+            return []
+        query_terms = _tokenize(query)
+        if not query_terms:
+            return []
+        embedder = self._get_embedder()
+        try:
+            if not await embedder.ensure_ready() or not embedder.available:
+                return self.recall(query, top_k)
+            rels = self.files()
+            bodies = {r.as_posix(): self.read(r.as_posix()) for r in rels}
+            vectors = await embedder.embed([query] + [bodies[r.as_posix()] for r in rels])
+            if vectors is None or len(vectors) != len(rels) + 1:
+                return self.recall(query, top_k)
+            qvec = vectors[0]
+            index_text = self._load_index()
+            hits: list[MemoryHit] = []
+            for rel, vec in zip(rels, vectors[1:], strict=True):
+                content = bodies[rel.as_posix()]
+                body_score, body_pos = _recall_one(content, query_terms)
+                semantic = embedder.similarity(qvec, vec)
+                if body_score == 0 and semantic < embedder.min_sim:
+                    continue  # no lexical nor semantic signal
+                entry_score = _recall_one(_index_entry(index_text, rel.as_posix()), query_terms)[0]
+                score = body_score + entry_score + int(round(semantic * 100))
+                pos = body_pos if body_pos >= 0 else 0
+                hits.append(MemoryHit(name=rel.as_posix(), score=score, snippet=_snippet(content, pos)))
+            hits.sort(key=lambda h: (-h.score, h.name))
+            return hits[:top_k]
+        except Exception:  # noqa: BLE001 - any embedder failure degrades to local
+            return self.recall(query, top_k)
+
+    def auto_link(self) -> list[str]:
+        """Synchronous cross-linking using the local (offline) embedder.
+
+        For every pair of memory files whose similarity clears the threshold, add
+        ``Related: [title](other.md)`` to each file (unless already present).
+        Returns the names of files updated. Idempotent and cheap enough to run
+        after ``write``. Prefer :meth:`auto_link_async` from async callers.
+        """
+        files = self.files()
+        bodies = {f.as_posix(): self.read(f.as_posix()) for f in files}
+        titles = {f.as_posix(): _titles(f.name, bodies[f.as_posix()]) for f in files}
+        return self._link_pairs(
+            files, bodies, titles,
+            lambda a, b: _embed_similarity(bodies[a], bodies[b]) >= _EMBED_MIN_SIM,
+        )
+
+    async def auto_link_async(self) -> list[str]:
+        """Dense-embedding cross-linking (multilingual when available).
+
+        Falls back to :meth:`auto_link` whenever the embedding backend is
+        unavailable or an embed call fails.
+        """
+        embedder = self._get_embedder()
+        try:
+            if not await embedder.ensure_ready() or not embedder.available:
+                return self.auto_link()
+            files = self.files()
+            if len(files) < 2:
+                return []
+            bodies = {f.as_posix(): self.read(f.as_posix()) for f in files}
+            vectors = await embedder.embed([bodies[f.as_posix()] for f in files])
+            if vectors is None or len(vectors) != len(files):
+                return self.auto_link()
+            titles = {f.as_posix(): _titles(f.name, bodies[f.as_posix()]) for f in files}
+            vs = {f.as_posix(): v for f, v in zip(files, vectors, strict=True)}
+            return self._link_pairs(
+                files, bodies, titles,
+                lambda a, b: embedder.similarity(vs[a], vs[b]) >= embedder.link_min_sim,
+            )
+        except Exception:  # noqa: BLE001 - any embedder failure degrades to local
+            return self.auto_link()
+
+    def _link_pairs(
+        self,
+        files: list[Path],
+        bodies: dict[str, str],
+        titles: dict[str, str],
+        should_link: Callable[[str, str], bool],
+    ) -> list[str]:
+        """Shared auto-link body: write ``Related:`` links between pairs that
+        satisfy ``should_link(a, b)``. Idempotent; returns updated names."""
+        updated: set[str] = set()
+        for i in range(len(files)):
+            for j in range(i + 1, len(files)):
+                a, b = files[i].as_posix(), files[j].as_posix()
+                if not should_link(a, b):
+                    continue
+                if _link_line(a, b, titles[b]) not in bodies[a]:
+                    bodies[a] = bodies[a].rstrip() + "\n\n" + _link_line(a, b, titles[b]) + "\n"
+                    updated.add(a)
+                if _link_line(b, a, titles[a]) not in bodies[b]:
+                    bodies[b] = bodies[b].rstrip() + "\n\n" + _link_line(b, a, titles[a]) + "\n"
+                    updated.add(b)
+        for name in updated:
+            self.write(name, bodies[name], overwrite=True)
+        return sorted(updated)
 
     def _load_index(self) -> str:
         try:
@@ -252,3 +384,8 @@ def _index_entry(index_text: str, rel_name: str) -> str:
         if f"({rel_name})" in line:
             return line
     return ""
+
+
+def _link_line(source: str, target: str, target_title: str) -> str:
+    """A ``Related: [title](target)`` markdown line for ``source``."""
+    return f"Related: [{target_title}]({target})"

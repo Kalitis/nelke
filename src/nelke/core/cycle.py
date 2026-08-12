@@ -8,11 +8,12 @@ Every transition is recorded in SQLite (``cycles``/``cycle_steps``/
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, cast
 
 from nelke.core.agent import Agent
 from nelke.core.db import Database, _now, new_id
@@ -20,6 +21,7 @@ from nelke.core.gitops import GitError, GitRepo
 from nelke.core.governance import Governance
 from nelke.core.llm import ToolCallback
 from nelke.core.memory import MemoryStore
+from nelke.core.planner import TaskSpec, plan_tasks
 from nelke.core.reviewer import Reviewer, ReviewVerdict
 from nelke.core.tools.memory import MemoryListTool, MemoryShowTool, MemoryWriteTool, RecallTool
 from nelke.core.tools.selfedit import (
@@ -56,6 +58,29 @@ Workflow:
    specific problems reported and try again with minimal changes.
 5. When the objective is fully achieved, call propose_cycle_complete.
 Avoid broken syntax/imports: any commit that crashes Nelke is reverted automatically."""
+
+
+CYCLE_WORKER_PROMPT = """You are one of several Nelke worker agents operating IN
+PARALLEL on the same repository to satisfy a slice of a larger objective. Other
+workers are editing DIFFERENT files at the same time — stay within your lane and
+do not touch files outside your assigned scope.
+
+You have self-edit tools scoped to the repo root (self_read/self_write/self_edit/
+self_glob/self_grep), memory tools (recall/memory_show/memory_list/memory_write
+under memory/), and read-only gates (run_lint/run_typecheck/run_tests/boot_check
+to validate your own edits). You DO NOT commit, revert or propose cycle
+completion — the cycle engine handles commits and gates centrally after all
+workers finish.
+
+Workflow:
+1. Read your assigned task (title + detail). Explore only the files in scope.
+2. Make focused edits toward the task. Keep existing tests green; add or adjust
+   tests for new behavior when relevant.
+3. Optionally run the gates to self-check your edits.
+4. When your slice is complete, stop and return a short summary of what you did.
+
+Do NOT loop infinitely. Do NOT edit files outside your task's scope. Other
+workers rely on the shared working tree staying consistent with your slice."""
 
 
 @dataclass
@@ -145,6 +170,9 @@ class CycleEngine:
         on_token: ToolCallback = None,
         on_usage: Callable[[dict[str, Any]], Any] | None = None,
         agent_temperature: float = 0.0,
+        mode: Literal["single", "parallel"] = "single",
+        max_workers: int = 6,
+        max_steps_per_worker: int | None = None,
     ) -> None:
         self.repo = repo
         self.db = db
@@ -158,6 +186,13 @@ class CycleEngine:
         self.on_token = on_token
         self.on_usage = on_usage
         self.agent_temperature = agent_temperature
+        self.mode = mode
+        self.max_workers = max(1, max_workers)
+        # Per-worker step cap. Default keeps the total roughly inside `max_steps`
+        # so a parallel cycle does not exceed the legacy single-worker budget.
+        self.max_steps_per_worker = max_steps_per_worker or max(
+            3, max_steps // self.max_workers
+        )
         self._synced = False
 
     def _emit(self, kind: str, message: str = "", **data: Any) -> None:
@@ -219,6 +254,57 @@ class CycleEngine:
             temperature=self.agent_temperature,
         )
 
+    def _build_worker_agent(
+        self,
+        ctx: SelfEditContext,
+        memory: MemoryStore,
+        worker_id: str,
+        task: TaskSpec,
+        on_token: ToolCallback | None,
+        on_usage: Callable[[dict[str, Any]], Any] | None,
+    ) -> Agent:
+        """Build one parallel worker agent for a single planner slice.
+
+        Unlike the legacy single worker, parallel workers do NOT get the git
+        commit/revert tools or ``propose_cycle_complete``: they only edit files
+        in their assigned scope. The engine commits the combined diff centrally
+        after all workers finish. A per-worker system prompt names the slice so
+        the model stays in its lane.
+        """
+        tools = [
+            SelfReadTool(ctx),
+            SelfWriteTool(ctx),
+            SelfEditTool(ctx),
+            SelfGlobTool(ctx),
+            SelfGrepTool(ctx),
+            RecallTool(memory),
+            MemoryShowTool(memory),
+            MemoryListTool(memory),
+            MemoryWriteTool(memory),
+            RunLintTool(ctx),
+            RunTypecheckTool(ctx),
+            RunTestsTool(ctx),
+            BootCheckTool(ctx),
+        ]
+        slice_prompt = (
+            f"{CYCLE_WORKER_PROMPT}\n\n"
+            f"Your assigned task:\nTitle: {task.title}\nDetail: {task.detail}\n"
+            f"Worker id: {worker_id}"
+        )
+        return Agent(
+            name=f"cycle-worker-{worker_id}",
+            system_prompt=slice_prompt,
+            tools=tools,
+            llm=self.llm,
+            iteration_cap=max(5, self.max_steps_per_worker * 2),
+            stream=True,
+            on_token=on_token,
+            on_usage=on_usage,
+            memory_index=memory.index_text() or None,
+            memory_location=str(memory.memory_dir),
+            temperature=self.agent_temperature,
+        )
+
     def _result(
         self,
         cycle_id: str,
@@ -268,6 +354,8 @@ class CycleEngine:
         self._synced = False
         self.db.create_cycle(objective, branch, cycle_id=cycle_id)
         try:
+            if self.mode == "parallel":
+                return await self._run_impl_parallel(repo, objective, branch, cycle_id, human_gate)
             return await self._run_impl(repo, objective, branch, cycle_id, human_gate)
         except Exception:  # noqa: BLE001 - never leave a cycle stuck as `running`
             try:
@@ -507,3 +595,305 @@ class CycleEngine:
         emit("merged", "cycle merged into main", branch=branch)
         return self._result(cycle_id, objective, branch, "merged", verdict,
                             human="approved", steps=step_no)
+
+    # ------------------------------------------------------------------ #
+    # Parallel mode: planner -> N workers in parallel -> central gate    #
+    # ------------------------------------------------------------------ #
+    async def _run_impl_parallel(
+        self,
+        repo: GitRepo,
+        objective: str,
+        branch: str,
+        cycle_id: str,
+        human_gate: Callable[[HumanReviewRequest], bool | Awaitable[bool]] | None,
+    ) -> CycleResult:
+        """Plan task slices, run worker agents in parallel, then gate+commit.
+
+        The planner splits the objective into ``<= max_workers`` slices. Each
+        slice is executed by its own agent in parallel against the shared
+        working tree (no per-worker commits). After all workers finish the
+        combined diff is gated, committed once, boot-checked, AI-reviewed and
+        handed to the human gate — exactly the same tail as the single-worker
+        ``_run_impl``.
+        """
+        memory = MemoryStore(repo.repo / "memory")
+
+        def emit(kind: str, message: str = "", **data: Any) -> None:
+            data.setdefault("cycle_id", cycle_id)
+            data.setdefault("total_steps", self.max_steps)
+            try:
+                self.db.add_cycle_event(cycle_id, kind, message, data)
+            except Exception:  # noqa: BLE001
+                pass
+            self._emit(kind, message, **data)
+
+        emit("cycle_start", f"branch {branch}", cycle_id=cycle_id, branch=branch, objective=objective)
+
+        # ---- PLAN ---------------------------------------------------------
+        try:
+            tasks = await plan_tasks(
+                self.llm, objective,
+                max_tasks=self.max_workers,
+                temperature=self.agent_temperature,
+            )
+        except Exception:  # noqa: BLE001 - planner must never abort the cycle
+            tasks = [TaskSpec(title="all", detail=objective)]
+        emit("planned", f"{len(tasks)} task(s)", cycle_id=cycle_id, task_count=len(tasks),
+             titles=[t.title for t in tasks])
+
+        # Persist each slice as a cycle_worker row; the worker_id is stable for
+        # the whole cycle so events/steps can reference it.
+        worker_specs: list[tuple[str, int, TaskSpec]] = []
+        for index, task in enumerate(tasks):
+            wid = self.db.create_cycle_worker(cycle_id, index, task.title, task.detail)
+            worker_specs.append((wid, index, task))
+
+        # ---- WORK (parallel) ---------------------------------------------
+        feedback = ""
+        verdict: ReviewVerdict | None = None
+        committed_any = False
+        round_no = 0
+
+        while True:
+            round_no += 1
+            # Snapshot the diff baseline so we can tell if workers produced
+            # anything new this round (clean state -> gate idle path).
+            had_changes_before = repo.has_changes()
+
+            # Build per-worker agents and run them concurrently. Each worker
+            # gets its own SelfEditContext.state so they do not stomp on each
+            # other's flags (e.g. propose_complete).
+            results = await asyncio.gather(
+                *[
+                    self._run_worker(worker_id, index, task, memory, cycle_id, emit, feedback)
+                    for worker_id, index, task in worker_specs
+                ],
+                return_exceptions=True,
+            )
+            worker_summaries = []
+            for (worker_id, _index, _task), result in zip(worker_specs, results, strict=True):
+                if isinstance(result, Exception):
+                    self.db.update_cycle_worker(worker_id, status="error", ended_at=_now())
+                    emit("worker_error", f"worker crashed: {result}", worker_id=worker_id,
+                         error=str(result)[:500])
+                    worker_summaries.append(f"{worker_id}: error")
+                    continue
+                # asyncio.gather(return_exceptions=True) types the item as
+                # dict | BaseException; the isinstance check above narrows the
+                # exception branch, so this cast is safe.
+                res: dict[str, Any] = cast("dict[str, Any]", result)
+                self.db.update_cycle_worker(worker_id, status="done", ended_at=_now())
+                emit("worker_done", f"worker finished: {res.get('answer', '')[:160]}",
+                     worker_id=worker_id, answer=res.get("answer", "")[:400])
+                worker_summaries.append(f"{worker_id}: {res.get('answer', '')[:80]}")
+
+            await self._sync_dependencies_if_changed()
+
+            # If no worker changed anything AND there was nothing pending from
+            # earlier rounds, the cycle has nothing to commit.
+            if not repo.has_changes():
+                if not had_changes_before:
+                    self.db.update_cycle(cycle_id, status="no-changes", ended_at=_now())
+                    emit("cycle_error", "no changes produced by any worker")
+                    return self._result(cycle_id, objective, branch, "no-changes",
+                                        ReviewVerdict("request_changes"),
+                                        steps=round_no,
+                                        message="workers made no changes")
+
+            # ---- GATE (one, central) -------------------------------------
+            gate = await self.governance.gate()
+            emit("gate", gate.describe(), passed=gate.passed)
+            if not gate.passed:
+                if round_no >= self.max_step_attempts:
+                    self.db.add_step(cycle_id, round_no, None, "failed-gate", gate.describe()[:500])
+                    self.db.update_cycle(cycle_id, status="failed-gate", ended_at=_now())
+                    emit("cycle_error", "gate could not be satisfied", feedback=gate.describe()[:2000])
+                    return self._result(cycle_id, objective, branch, "failed-gate",
+                                        ReviewVerdict("request_changes"),
+                                        steps=round_no, message=gate.describe()[:500])
+                # Send workers back to fix the gate failures with targeted feedback.
+                feedback = (
+                    "The governance gate rejected your combined changes:\n"
+                    + gate.describe()
+                    + "\nFix these exact problems with minimal changes."
+                )
+                emit("review_feedback", "workers retrying after gate failure",
+                     feedback=feedback[:500])
+                continue
+
+            # ---- COMMIT (single, combined) -------------------------------
+            repo.add_all()
+            sha = repo.commit(
+                f"Cycle {cycle_id} round {round_no}: {objective[:80]}",
+                f"Nelke-Self-Improve: cycle {cycle_id} round {round_no} (parallel)",
+            )
+            committed_any = True
+            summary = " | ".join(worker_summaries)[:500]
+            self.db.add_step(cycle_id, round_no, sha, "committed", summary)
+            emit("commit", f"committed {sha}", sha=sha, round=round_no, summary=summary)
+            feedback = ""
+
+            # ---- BOOT CHECK ----------------------------------------------
+            boot = await self.governance.boot_check()
+            if not boot.ok and not boot.skipped:
+                repo.revert_commit(sha)
+                self.db.add_step(cycle_id, round_no, sha, "failed-boot", boot.message[:500])
+                emit("boot_check_failed", f"reverted {sha}: {boot.message[:200]}", sha=sha)
+                if round_no >= self.max_step_attempts:
+                    self.db.update_cycle(cycle_id, status="failed-boot", ended_at=_now())
+                    return self._result(cycle_id, objective, branch, "failed-boot",
+                                        ReviewVerdict("request_changes"),
+                                        steps=round_no, message=boot.message[:500])
+                feedback = (
+                    "The combined commit broke the boot check and was reverted. "
+                    "Rework the change so it imports cleanly and passes nelke.boot_check()."
+                )
+                continue
+            self.db.add_step(cycle_id, round_no, sha, "ok", "boot check passed")
+            emit("step_ok", f"round {round_no} committed, boot-check passed", round=round_no)
+
+            # ---- AI REVIEW -----------------------------------------------
+            final_diff = repo.diff("main", branch)
+            reviewer = Reviewer(repo, self.llm, base="main",
+                                temperature=self.agent_temperature)
+            verdict = await reviewer.review(objective, final_diff)
+            self.db.add_usage(reviewer.last_usage, cycle_id=cycle_id)
+            self.db.create_review_request(cycle_id, "ai", verdict=verdict.verdict,
+                                          comments=verdict.comments)
+            self.db.update_cycle(cycle_id, ai_verdict=verdict.verdict)
+            emit("ai_review", f"AI: {verdict.verdict}", verdict=verdict.verdict,
+                 comments=verdict.comments[:800], round=round_no)
+            if verdict.approved:
+                break
+            if round_no < self.max_step_attempts:
+                feedback = "AI reviewer requested changes:\n" + verdict.comments
+                emit("review_feedback", "resuming work with reviewer feedback")
+                continue
+            self.db.update_cycle(cycle_id, status="request-changes", ended_at=_now())
+            emit("cycle_error", "reviewer still requests changes",
+                 comments=verdict.comments[:800])
+            return self._result(cycle_id, objective, branch, "request-changes", verdict,
+                                steps=round_no, message=verdict.comments[:500])
+
+        # ---- HUMAN GATE (identical tail to _run_impl) ---------------------
+        final_diff = repo.diff("main", branch)
+        if not committed_any and not final_diff.strip():
+            self.db.update_cycle(cycle_id, status="no-changes", ended_at=_now())
+            emit("cycle_error", "no changes produced")
+            return self._result(cycle_id, objective, branch, "no-changes",
+                                ReviewVerdict("request_changes"),
+                                steps=round_no, message="workers made no changes")
+        assert verdict is not None
+        human_request = HumanReviewRequest(
+            cycle_id=cycle_id, objective=objective, branch=branch,
+            diff=final_diff, ai_verdict=verdict,
+        )
+        human_req_id = self.db.create_review_request(
+            cycle_id, "human", verdict="pending",
+            comments=f"AI: {verdict.verdict}\n{verdict.comments}".strip(),
+        )
+        emit("awaiting_human", "cycle awaits human approval", branch=branch)
+
+        if human_gate is None:
+            self.db.update_cycle(cycle_id, status="awaiting-human", ended_at=_now())
+            emit("human_pending", "no human gate attached — leaving branch for review")
+            return self._result(cycle_id, objective, branch, "awaiting-human", verdict, steps=round_no)
+
+        decision = human_gate(human_request)
+        if inspect.isawaitable(decision):
+            decision = await decision  # type: ignore[misc]
+        if not decision:
+            self.db.resolve_review_request(human_req_id, "rejected")
+            self.db.update_cycle(cycle_id, status="rejected", human_verdict="rejected", ended_at=_now())
+            emit("human_rejected", "human rejected cycle", branch=branch)
+            return self._result(cycle_id, objective, branch, "rejected", verdict,
+                                human="rejected", steps=round_no)
+
+        try:
+            merge_cycle_branch(repo, branch, cycle_id=cycle_id)
+        except GitError as exc:
+            self.db.resolve_review_request(human_req_id, "approved")
+            self.db.update_cycle(cycle_id, status="merge-conflict", human_verdict="approved", ended_at=_now())
+            emit("cycle_error", "merge failed", error=str(exc))
+            return self._result(cycle_id, objective, branch, "merge-conflict", verdict,
+                                human="approved", steps=round_no, message=str(exc)[:500])
+
+        self.db.resolve_review_request(human_req_id, "approved")
+        self.db.update_cycle(cycle_id, status="merged", human_verdict="approved", ended_at=_now())
+        emit("merged", "cycle merged into main", branch=branch)
+        return self._result(cycle_id, objective, branch, "merged", verdict,
+                            human="approved", steps=round_no)
+
+    async def _run_worker(
+        self,
+        worker_id: str,
+        worker_index: int,
+        task: TaskSpec,
+        memory: MemoryStore,
+        cycle_id: str,
+        emit: Callable[..., None],
+        feedback: str,
+    ) -> dict[str, Any]:
+        """Run a single parallel worker to completion and emit its progress.
+
+        Returns a summary dict ``{worker_id, answer, error}`` suitable for the
+        combined commit message. All agent activity (tokens, tools, usage) is
+        forwarded to ``emit`` with ``worker_id`` so the UI can route it to the
+        right worker card.
+        """
+        # Each worker has its own SelfEditContext.state so per-worker flags do
+        # not collide; the worker has no propose_cycle_complete tool anyway.
+        state: dict[str, Any] = {"worker_index": worker_index}
+        ctx = SelfEditContext(
+            repo=self.repo,
+            governance=self.governance,
+            repo_root=self.repo.repo,
+            state=state,
+            cycle_id_provider=lambda: "",
+            step_provider=lambda: 0,
+        )
+        self.db.update_cycle_worker(worker_id, status="running", started_at=_now())
+        emit("worker_start", f"worker {worker_index} started",
+             worker_id=worker_id, worker_index=worker_index, title=task.title)
+
+        def on_worker_token(tok: str) -> None:
+            emit("agent_token", tok, worker_id=worker_id, token=tok)
+
+        def on_worker_tool(name: str, args: dict[str, Any]) -> None:
+            try:
+                emit("agent_tool", f"{name}", worker_id=worker_id, tool=name, args=args)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def on_worker_tool_result(name: str, args: dict[str, Any], result: str) -> None:
+            try:
+                emit("agent_tool_result", f"{name}", worker_id=worker_id, tool=name,
+                     snippet=(result or "")[:400])
+            except Exception:  # noqa: BLE001
+                pass
+
+        def on_worker_usage(usage: dict[str, Any]) -> None:
+            try:
+                self.db.add_usage(usage, cycle_id=cycle_id)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                emit("usage", "usage", worker_id=worker_id, usage=usage)
+            except Exception:  # noqa: BLE001
+                pass
+
+        agent = self._build_worker_agent(
+            ctx, memory, worker_id, task,
+            on_token=on_worker_token, on_usage=on_worker_usage,
+        )
+        agent.on_tool = on_worker_tool
+        agent.on_tool_result = on_worker_tool_result
+
+        prompt = task.as_prompt()
+        if feedback:
+            prompt = f"{prompt}\n\n[feedback]\n{feedback}"
+        try:
+            result = await agent.run(prompt, reset=True)
+        except Exception as exc:  # noqa: BLE001 - one worker crashing must not kill the cycle
+            return {"worker_id": worker_id, "answer": "", "error": str(exc)}
+        return {"worker_id": worker_id, "answer": result.answer, "error": ""}

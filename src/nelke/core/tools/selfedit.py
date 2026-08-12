@@ -97,12 +97,34 @@ class SelfWriteTool(BaseTool):
     async def execute(self, **kwargs: Any) -> ToolResult:
         path = resolve_within(self.ctx.repo_root, kwargs.get("path", ""))
         content = str(kwargs.get("content", ""))
+        # Write then, if the content is effectively empty, remove the scratch
+        # file so an accidental empty probe doesn't linger as a git ghost.
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding=DEFAULT_ENCODING)
+            if not content.strip():
+                _scrub_empty(path)
         except OSError as exc:
             return ToolResult.failure(f"self_write failed: {exc}")
         return ToolResult.success(f"wrote {path.relative_to(self.ctx.repo_root)}")
+
+
+def _scrub_empty(path: Path) -> None:
+    """Unlink a just-written empty file and any empty parents created for it.
+
+    Lets the agent "delete" a file by writing empty content: the inode vanishes
+    from the working tree (git sees only the file's prior committed state), so an
+    accidental empty scratch file created mid-cycle does not linger as a ghost in
+    the diff.
+    """
+    try:
+        path.unlink()
+        parent = path.parent
+        while parent != path.anchor and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+    except OSError:
+        pass  # best-effort: never let cleanup break a write
 
 
 class SelfEditTool(BaseTool):

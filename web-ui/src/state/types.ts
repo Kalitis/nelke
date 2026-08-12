@@ -53,6 +53,67 @@ export interface Profile {
   model: string;
 }
 
+export type CycleStatus = "running" | "merged" | "rejected" | "stuck" | string;
+
+export interface CycleStep {
+  step: number;
+  status: string;
+  commit_sha: string | null;
+  summary: string | null;
+}
+
+export interface CycleSummary {
+  id: string;
+  objective: string;
+  branch: string | null;
+  status: CycleStatus;
+  ai_verdict: string | null;
+  human_verdict: string | null;
+  started_at: string | null;
+  ended_at: string | null;
+  steps: CycleStep[];
+  // Parallel cycles fill one entry per planner slice; single-worker cycles
+  // (and older DBs) leave this empty and the UI falls back to the step list.
+  workers: CycleWorker[];
+  human_review_id: string | null;
+}
+
+export interface CycleWorker {
+  id: string;
+  worker_index: number;
+  title: string;
+  detail: string;
+  status: string;
+  started_at: string | null;
+  ended_at: string | null;
+}
+
+export interface CycleEvent {
+  id: number;
+  kind: string;
+  message: string;
+  payload: Record<string, unknown>;
+  seq: number;
+}
+
+export interface CycleReview {
+  id: string;
+  kind: string;
+  verdict: string;
+  comments: string;
+  resolved_at: string | null;
+}
+
+export interface CycleDetail extends CycleSummary {
+  events: CycleEvent[];
+  reviews: CycleReview[];
+}
+
+export interface MemoryFile {
+  name: string;
+  size: number;
+}
+
 export interface UsageTotals {
   prompt_tokens: number;
   completion_tokens: number;
@@ -60,7 +121,8 @@ export interface UsageTotals {
   calls: number;
 }
 
-// SSE events emitted by the chat / regenerate endpoints.
+// SSE events emitted by the chat / regenerate endpoints, plus the cycle live
+// stream (event names `cycle_event`/`cycle_result`/`ping` come from web.py).
 export type StreamEvent =
   | { event: "token"; data: { text: string } }
   | { event: "tool"; data: { name: string; args: Record<string, unknown> } }
@@ -76,4 +138,19 @@ export type StreamEvent =
         assistant_message_id?: string | null;
       };
     }
-  | { event: "error"; data: { message: string } };
+  | { event: "error"; data: { message: string } }
+  // ---- cycle live stream (web.py `/api/cycles/stream`) ----
+  | {
+      event: "cycle_event";
+      data: {
+        cycle_id: string;
+        kind: string;
+        message: string;
+        payload: Record<string, unknown>;
+      };
+    }
+  | {
+      event: "cycle_result";
+      data: { cycle_id: string; status: string; branch: string; steps: number };
+    }
+  | { event: "ping"; data: Record<string, unknown> };

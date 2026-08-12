@@ -22,14 +22,25 @@ from nelke.frontends.web import AppState, create_app
 def _scripted_llm_factory(responses: list[LLMResponse], cycle_reviewer=None):
     """Return an llm_factory closure backed by a scripted responder.
 
-    For cycle flows (worker vs reviewer), routes by system-prompt keyword.
+    For cycle flows (planner / worker / reviewer), routes by system-prompt
+    keyword so each agent role gets its own scripted responses. The planner
+    is served a single-task JSON plan (the legacy single-worker shape) so the
+    parallel cycle behaves like the old single-worker one for tests that
+    supply a worker script.
     """
+    import json as _json
+
     state = {"i": 0, "r": 0}
+    planner_payload = final_response(
+        _json.dumps({"tasks": [{"title": "all", "detail": "do everything"}]})
+    )
 
     def _factory(_profile: str | None):
         class _LLM:
             async def chat(self, messages, *, tools=None, stream=False, on_token=None, **_kw):
                 system = next((m["content"] for m in messages if m.get("role") == "system"), "")
+                if "task planner" in system:
+                    return planner_payload
                 if "review gate" in system or "AI review gate" in system:
                     state["r"] += 1
                     return cycle_reviewer(messages, tools)
@@ -101,15 +112,60 @@ def test_index_page_returns_chat_ui(settings, tmp_repo, monkeypatch):
     assert "chat-form" in resp.text
 
 
-def test_memory_page_lists_files(settings, tmp_repo):
+def test_memory_page_lists_files(settings, tmp_repo, monkeypatch):
     from nelke.core import services
 
+    monkeypatch.setenv("NELKE_WEB_LEGACY", "1")  # force the legacy Jinja2 page
     services.open_memory(tmp_repo.repo).write("facts/x.md", "# X\n\nbody")
     app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
     with TestClient(app) as client:
         resp = client.get("/memory")
     assert resp.status_code == 200
     assert "facts/x.md" in resp.text
+
+
+def test_api_memory_lists_files(settings, tmp_repo):
+    from nelke.core import services
+
+    services.open_memory(tmp_repo.repo).write("facts/x.md", "# X\n\nbody")
+    app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    with TestClient(app) as client:
+        resp = client.get("/api/memory")
+    assert resp.status_code == 200
+    rows = resp.json()
+    names = {r["name"] for r in rows}
+    assert "facts/x.md" in names
+
+
+def test_api_memory_file_returns_content(settings, tmp_repo):
+    from nelke.core import services
+
+    services.open_memory(tmp_repo.repo).write("facts/x.md", "# X\n\nbody text")
+    app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    with TestClient(app) as client:
+        resp = client.get("/api/memory/facts/x.md")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "facts/x.md"
+    # memory store normalises trailing newline
+    assert body["content"].startswith("# X\n\nbody text")
+
+
+def test_api_memory_file_404_for_unknown(settings, tmp_repo):
+    app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    with TestClient(app) as client:
+        resp = client.get("/api/memory/does/not/exist.md")
+    assert resp.status_code == 404
+
+
+def test_api_memory_file_rejects_non_markdown_and_traversal(settings, tmp_repo):
+    """The lookup only accepts known .md memory files; traversal/other exts 404."""
+    app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    with TestClient(app) as client:
+        # non-.md extension → not a memory file
+        assert client.get("/api/memory/facts/x.txt").status_code == 404
+        # path traversal must not escape the memory dir
+        assert client.get("/api/memory/../pyproject.toml").status_code == 404
 
 
 def test_health_endpoint(settings, tmp_repo):
@@ -245,7 +301,7 @@ def test_chat_message_unknown_chat_returns_404(settings, tmp_repo):
 # --------------------------------------------------------------------------- #
 # Cycles history pages + api
 # --------------------------------------------------------------------------- #
-def test_cycles_list_and_detail(settings, tmp_repo):
+def test_cycles_list_and_detail(settings, tmp_repo, monkeypatch):
     factory = _scripted_llm_factory(_good_fix_plan(), cycle_reviewer=_approved_reviewer())
     app = create_app(AppState(
         settings=settings, llm_factory=factory,
@@ -266,6 +322,9 @@ def test_cycles_list_and_detail(settings, tmp_repo):
         assert body["id"] == cid
         assert body["events"]
 
+        # Legacy Jinja2 pages are only served when the SPA is disabled; the SPA
+        # build at static/dist takes over client-side routing otherwise.
+        monkeypatch.setenv("NELKE_WEB_LEGACY", "1")
         page = c.get("/cycles")
         assert page.status_code == 200
         assert cid in page.text
@@ -291,7 +350,11 @@ def test_improve_auto_approve_merges(settings, tmp_repo):
     client = _client(settings, tmp_repo, factory, governance=FakeGovernance())
     with client:
         r = client.post("/api/improve", json={"objective": "add a memory lesson", "auto_approve": True})
-        assert r.json() == {"status": "started"}
+        body = r.json()
+        assert body["status"] == "started"
+        # The engine mints a cycle_id synchronously before the endpoint replies
+        # (captured from the `cycle_start` event), so the UI can navigate to it.
+        assert "cycle_id" in body and body["cycle_id"]
     # the background task ran to completion within the TestClient context
     assert (tmp_repo.repo / "memory" / "facts" / "web.md").exists()
     assert tmp_repo.current_branch() == "main"
@@ -378,7 +441,10 @@ def test_improve_human_gate_resolve_reject_keeps_branch(settings, tmp_repo):
     assert "memory lesson" not in main_log
 
 
-def test_review_page_shows_diff(settings, tmp_repo):
+def test_review_page_shows_diff(settings, tmp_repo, monkeypatch):
+    # The legacy Jinja2 review page is only served when the SPA is disabled;
+    # otherwise the SPA owns /review/{id} client-side.
+    monkeypatch.setenv("NELKE_WEB_LEGACY", "1")
     factory = _scripted_llm_factory(_good_fix_plan(), cycle_reviewer=_approved_reviewer())
     state = AppState(
         settings=settings, llm_factory=factory,
@@ -528,3 +594,25 @@ def test_spa_served_when_dist_built(settings, tmp_repo, monkeypatch):
         r = client.get("/")
     assert r.status_code == 200
     assert "SPA" in r.text
+
+
+def test_spa_takes_over_cycle_memory_review_routes(settings, tmp_repo, monkeypatch):
+    """When the SPA build exists, client-side-routed pages serve the SPA entry.
+
+    These routes used to render server-side (legacy Jinja2); now the React
+    router owns them. Legacy pages remain reachable via NELKE_WEB_LEGACY=1.
+    """
+    from nelke.frontends import web as web_mod
+
+    fake_dist = tmp_repo.repo / "static" / "dist"
+    fake_dist.mkdir(parents=True)
+    (fake_dist / "index.html").write_text("<!doctype html><html>SPA</html>")
+    (fake_dist / "assets").mkdir()
+    monkeypatch.setattr(web_mod, "_spa_dist_dir", lambda: fake_dist)
+    monkeypatch.delenv("NELKE_WEB_LEGACY", raising=False)
+    app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    with TestClient(app) as client:
+        for path in ("/memory", "/cycles", "/cycles/abc123", "/review/req-1"):
+            r = client.get(path)
+            assert r.status_code == 200, path
+            assert "SPA" in r.text, path

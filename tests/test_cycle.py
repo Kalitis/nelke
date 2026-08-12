@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from conftest import FakeGovernance, driver_fake, final_response, tool_response
+from conftest import (
+    FakeGovernance,
+    driver_fake,
+    final_response,
+    planner_returning,
+    scripted,
+    tool_response,
+)
 
 from nelke.core.cycle import CycleEngine
 from nelke.core.governance import CheckResult, GateResult
@@ -16,6 +23,8 @@ def _engine(repo, db, gov, llm, human=lambda req: True, **kw) -> CycleEngine:
         max_step_attempts=kw.pop("max_step_attempts", 3),
         max_review_rounds=kw.pop("max_review_rounds", 3),
         on_event=kw.pop("on_event", None),
+        mode=kw.pop("mode", "single"),
+        max_workers=kw.pop("max_workers", 6),
     )
 
 
@@ -340,3 +349,117 @@ async def test_deps_sync_once_on_pyproject_change(tmp_repo, db):
     # decision is cached -> never runs again
     assert not await engine._sync_dependencies_if_changed()
     assert runner.calls == [["uv", "sync"]]
+
+
+# --------------------------------------------------------------------------- #
+# Parallel mode: planner -> N workers -> central gate/commit                  #
+# --------------------------------------------------------------------------- #
+async def test_parallel_cycle_runs_workers_and_merges(tmp_repo, db):
+    """Two parallel workers each write a different memory file; the cycle
+    commits the combined diff once and merges."""
+    events: list[str] = []
+
+    def worker(m, t):
+        # Both workers share the same scripted plan; pick a file by reading
+        # the system prompt's worker id (each worker has a unique name).
+        sys = next((x["content"] for x in m if x.get("role") == "system"), "")
+        # Extract worker id from "Worker id: <id>" suffix.
+        wid = ""
+        for line in sys.splitlines():
+            if line.startswith("Worker id:"):
+                wid = line.split(":", 1)[1].strip()
+                break
+        path = f"memory/facts/{wid or 'x'}.md"
+        return tool_response("self_write", {"path": path, "content": "# x\ndone"})
+
+    llm = driver_fake(
+        worker=worker,
+        planner=planner_returning([
+            {"title": "task-A", "detail": "write file A"},
+            {"title": "task-B", "detail": "write file B"},
+        ]),
+    )
+    engine = _engine(
+        tmp_repo, db, FakeGovernance(), llm,
+        mode="parallel", max_workers=6,
+        on_event=lambda e: events.append(e.kind),
+    )
+    result = await engine.run("improve two things")
+    assert result.merged
+    # Two worker rows persisted.
+    workers = db.list_cycle_workers(result.cycle_id)
+    assert len(workers) == 2
+    titles = {w["title"] for w in workers}
+    assert titles == {"task-A", "task-B"}
+    # Each worker's status reflects completion.
+    assert all(w["status"] == "done" for w in workers)
+    # New event kinds surfaced for the UI.
+    assert "planned" in events
+    assert events.count("worker_start") == 2
+    assert events.count("worker_done") == 2
+    # One combined commit on main (not two).
+    main_log = tmp_repo._run("log", "--oneline", "main", "-10").stdout
+    assert main_log.count("Cycle ") == 1
+
+
+async def test_parallel_cycle_fallback_on_bad_planner_json(tmp_repo, db):
+    """A planner that returns garbage degrades to a single worker and still merges."""
+    def planner(m, t):
+        return final_response("this is not JSON at all")
+
+    def worker(m, t):
+        return tool_response(
+            "self_write",
+            {"path": "memory/facts/fallback.md", "content": "# Fallback\ndone"},
+        )
+
+    llm = driver_fake(
+        worker=scripted([tool_response(
+            "self_write",
+            {"path": "memory/facts/fallback.md", "content": "# Fallback\ndone"},
+        ), final_response("done")]),
+        planner=planner,
+    )
+    engine = _engine(tmp_repo, db, FakeGovernance(), llm, mode="parallel", max_workers=4)
+    result = await engine.run("do a thing")
+    assert result.merged
+    # Exactly one worker row (fallback to single task = whole objective).
+    workers = db.list_cycle_workers(result.cycle_id)
+    assert len(workers) == 1
+    assert workers[0]["title"] == "all"
+
+
+async def test_parallel_worker_events_carry_worker_id(tmp_repo, db):
+    """SSE consumers route per-worker progress by the worker_id payload field."""
+    captured: list[dict] = []
+
+    def on_event(ev):
+        captured.append({"kind": ev.kind, "data": dict(ev.data)})
+
+    def worker(m, t):
+        return tool_response(
+            "self_write",
+            {"path": "memory/facts/w.md", "content": "# w\ndone"},
+        )
+
+    llm = driver_fake(
+        worker=scripted([tool_response(
+            "self_write",
+            {"path": "memory/facts/w.md", "content": "# w\ndone"},
+        ), final_response("done")]),
+        planner=planner_returning([{"title": "only", "detail": "do it"}]),
+    )
+    engine = _engine(
+        tmp_repo, db, FakeGovernance(), llm,
+        mode="parallel", max_workers=2, on_event=on_event,
+    )
+    result = await engine.run("emit worker events")
+    assert result.merged
+    # worker_start/worker_done/agent_tool events must carry a worker_id.
+    worker_ids = {e["data"].get("worker_id") for e in captured
+                  if e["kind"] in ("worker_start", "worker_done", "agent_tool")}
+    worker_ids.discard(None)
+    assert worker_ids, "expected at least one worker_id-tagged event"
+    workers = db.list_cycle_workers(result.cycle_id)
+    expected_ids = {w["id"] for w in workers}
+    assert worker_ids <= expected_ids

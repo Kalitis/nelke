@@ -12,6 +12,8 @@
 - [Наблюдения](chats/20260811105752-37bb9979/notes/workspace.md) — - bash-инструмент работает через cmd (Windows). Доступны: dir, type, и т.п. (не ls/pwd/head).
 - [Цикл улучшения 20260811121107-6f0a032f](chats/20260811121107-6f0a032f/cycles/notes.md) — Статус: идёт. Начало — разминка выполнена (рекурсивный скрипт + скачивание файла).
 - [Рабочий каталог 20260811121107-6f0a032f](chats/20260811121107-6f0a032f/notes/workspace.md) — - Задача: определить недостатки возможностей Nelke и реализовать улучшения.
+- [Зачем существует N4 — Нова и REBIRTH](chats/unknown/rebirth-nova.md) — Дополнение к «рабочей конституции строителя» (chats/unknown/roadmap.md). Записано из прямого разговора с Игорем.
+- [N4 / REBIRTH — рабочая конституция строителя](chats/unknown/roadmap.md) — Записано из прямого разговора с Игорем (пользователь, совладелец направления).
 
 ## facts
 - [LLM providers](facts/llms.md) — - Nelke talks to any OpenAI-compatible endpoint via the `openai` library. #facts llm providers

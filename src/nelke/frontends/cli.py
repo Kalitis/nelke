@@ -251,6 +251,7 @@ def _build_session_agent(settings: Settings, profile: str | None, stream: Answer
         web_timeout=settings.web_timeout,
         db=db,
         temperature=settings.agent_temperature,
+        plan_first=settings.plan_first,
     )
     return agent, db, session_id, memory
 
@@ -642,6 +643,7 @@ def config_show() -> None:
         ("max_agent_iterations", str(settings.max_agent_iterations)),
         ("max_cycle_steps", str(settings.max_cycle_steps)),
         ("code_timeout", str(settings.code_timeout)),
+        ("plan_first", str(settings.plan_first)),
     ]
     for k, v in rows:
         table.add_row(k, v)

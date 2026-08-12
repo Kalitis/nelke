@@ -6,6 +6,8 @@ import { Transcript } from "@/components/chat/Transcript";
 import { Composer } from "@/components/chat/Composer";
 import { CyclesView } from "@/components/cycles/CyclesView";
 import { CycleDetailView } from "@/components/cycles/CycleDetailView";
+import { ProjectsView } from "@/components/projects/ProjectsView";
+import { ProjectDetailView } from "@/components/projects/ProjectDetailView";
 import { MemoryView } from "@/components/memory/MemoryView";
 import { useChatStore } from "@/state/chatStore";
 import { useRouter, useRoute } from "@/state/router";
@@ -72,6 +74,10 @@ export function AppShell() {
           <CyclesView />
         ) : route.name === "cycle" ? (
           <CycleDetailView cycleId={route.id} />
+        ) : route.name === "projects" ? (
+          <ProjectsView />
+        ) : route.name === "project" ? (
+          <ProjectDetailView projectId={route.id} />
         ) : route.name === "memory" ? (
           <MemoryView />
         ) : null}

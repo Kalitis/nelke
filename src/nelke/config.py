@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     max_cycle_steps: int = 30
     max_review_rounds: int = 3
     max_step_attempts: int = 3
+    # How many times a cycle sends the agent back to fix governance-gate
+    # failures (tests/lint/typecheck/test-gap) before giving up. A single agent
+    # slip should bounce back for rework, not kill the whole cycle.
+    max_gate_attempts: int = 5
+    # When True, the governance gate rejects any change that touches src code
+    # without a matching tests/test_<module>.py, forcing the agent to write
+    # tests for new code it introduces.
+    require_code_tests: bool = True
     code_timeout: int = 120
     web_timeout: int = 30
     recall_top_k: int = 8

@@ -9,6 +9,8 @@ export type Route =
   | { name: "chat" }
   | { name: "cycles" }
   | { name: "cycle"; id: string }
+  | { name: "projects" }
+  | { name: "project"; id: string }
   | { name: "memory" };
 
 export function parsePath(pathname: string): Route {
@@ -17,6 +19,8 @@ export function parsePath(pathname: string): Route {
   switch (parts[0]) {
     case "cycles":
       return parts[1] ? { name: "cycle", id: decodeURIComponent(parts[1]) } : { name: "cycles" };
+    case "projects":
+      return parts[1] ? { name: "project", id: decodeURIComponent(parts[1]) } : { name: "projects" };
     case "memory":
       return { name: "memory" };
     default:

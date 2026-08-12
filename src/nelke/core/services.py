@@ -133,6 +133,35 @@ def open_memory(repo: Path) -> MemoryStore:
     return MemoryStore(repo / "memory")
 
 
+class _ProjectMemoryStore(MemoryStore):
+    """A project's memory store: INDEX.md is a real seeded note.
+
+    The base ``MemoryStore`` hides ``INDEX.md`` from ``files()`` because it is
+    the auto-generated aggregate index across the whole memory tree. For a
+    project, however, ``INDEX.md`` is a user-facing seed note inside the
+    project's own directory, so it must be listed as one of the project's memory
+    files.
+    """
+
+    def files(self) -> list[Path]:  # type: ignore[override]
+        if not self.memory_dir.exists():
+            return []
+        out = [p.relative_to(self.memory_dir) for p in self.memory_dir.rglob("*.md")]
+        return sorted(out)
+
+
+def open_project_memory(repo: Path, project_id: str) -> MemoryStore:
+    """A project's own memory store under ``memory/projects/<id>/``.
+
+    Mirrors the existing ``memory/chats/<id>/`` per-entity convention: the
+    project gets its own directory of ``.md`` notes, indexed under the global
+    ``memory/INDEX.md`` (group ``projects/<id>``) and cross-linked by
+    ``MemoryStore.auto_link``. The store is root-agnostic, so this is a plain
+    sub-root of the global memory tree.
+    """
+    return _ProjectMemoryStore(repo / "memory" / "projects" / project_id)
+
+
 def build_chat_session(
     settings: Settings,
     profile: str | None,
@@ -294,13 +323,18 @@ async def run_cycle(
         raise RuntimeError(f"{repo_path} is not a git repository; cannot run a cycle")
     git = GitRepo(repo_path)
     db = open_db(settings)
-    gov = governance if governance is not None else Governance(git)
+    gov = (
+        governance
+        if governance is not None
+        else Governance(git, require_tests=settings.require_code_tests)
+    )
     engine = CycleEngine(
         git, db, gov, llm_factory(profile),
         on_event=on_event,
         human_approve=human_approve,
         max_steps=settings.max_cycle_steps,
         max_step_attempts=settings.max_step_attempts,
+        max_gate_attempts=settings.max_gate_attempts,
         max_review_rounds=settings.max_review_rounds,
         on_token=on_token,
         on_usage=on_usage,
@@ -582,6 +616,209 @@ def delete_chat(settings: Settings | None = None, session_id: str | None = None)
         return False
     db.delete_session(session_id)
     return True
+
+
+# --------------------------------------------------------------------------- #
+# Projects: user-facing units grouping chats (backend data layer)
+# --------------------------------------------------------------------------- #
+def create_project(
+    settings: Settings | None = None,
+    *,
+    name: str,
+    description: str = "",
+    stage: str = "",
+    meta: dict[str, Any] | None = None,
+    repo: Path | None = None,
+) -> str:
+    """Create a new project and seed its memory dir; returns its id.
+
+    Seeding ``memory/projects/<id>/`` (with a generated ``INDEX.md``) means the
+    project card can show an empty memory section instead of a missing one, and
+    the dir is in place for the first ``set_project_memory`` write.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("project name is required")
+    db = open_db(settings)
+    pid = db.create_project(name, description=description, stage=stage, meta=meta)
+    # Seed the project's memory directory so the card always has a memory link.
+    try:
+        repo_path = repo or find_repo(settings)
+        store = open_project_memory(repo_path, pid)
+        store.write("INDEX.md", f"# {name}\n\nProject memory.\n", overwrite=True)
+    except Exception:  # noqa: BLE001 - memory seeding is best-effort
+        pass
+    return pid
+
+
+def list_projects(settings: Settings | None = None) -> list[dict[str, Any]]:
+    """All projects, most recently updated first, with chat counts."""
+    db = open_db(settings)
+    out: list[dict[str, Any]] = []
+    for row in db.list_projects():
+        out.append(_project_dto(db, row))
+    return out
+
+
+def get_project(
+    settings: Settings | None = None,
+    project_id: str | None = None,
+    repo: Path | None = None,
+) -> dict[str, Any] | None:
+    """A single project with its attached chats and memory-file list."""
+    if not project_id:
+        return None
+    db = open_db(settings)
+    row = db.get_project(project_id)
+    if row is None:
+        return None
+    dto = _project_dto(db, row)
+    dto["chats"] = [
+        _chat_summary_for_project(r)
+        for r in db.list_project_sessions(project_id)
+    ]
+    dto["memory_files"] = project_memory_files(settings, project_id, repo=repo)
+    return dto
+
+
+def update_project(
+    settings: Settings | None = None,
+    project_id: str | None = None,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    stage: str | None = None,
+    meta: dict[str, Any] | None = None,
+) -> bool:
+    """Update a project's metadata (name / description / stage / meta blob)."""
+    if not project_id:
+        return False
+    db = open_db(settings)
+    return db.update_project(
+        project_id,
+        name=name.strip() if name is not None else None,
+        description=description if description is not None else None,
+        stage=stage.strip() if stage is not None else None,
+        meta=meta,
+    )
+
+
+def delete_project(settings: Settings | None = None, project_id: str | None = None) -> bool:
+    """Delete a project, detaching (but not deleting) its chats.
+
+    Project memory under ``memory/projects/<id>/`` is left in place (it is
+    git-tracked like the rest of the memory tree).
+    """
+    if not project_id:
+        return False
+    db = open_db(settings)
+    return db.delete_project(project_id)
+
+
+def attach_chat_to_project(
+    settings: Settings | None = None,
+    chat_id: str | None = None,
+    project_id: str | None = None,
+) -> bool:
+    """Attach a chat to a project (or detach it when ``project_id`` is None)."""
+    if not chat_id:
+        return False
+    db = open_db(settings)
+    return db.set_session_project(chat_id, project_id)
+
+
+def project_memory_files(
+    settings: Settings | None = None,
+    project_id: str | None = None,
+    *,
+    repo: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Memory ``.md`` files belonging to a project (name + size).
+
+    Empty list when the project has no memory dir yet (e.g. created before the
+    memory-seeding change, or the repo is unavailable).
+    """
+    if not project_id:
+        return []
+    try:
+        repo_path = repo or find_repo(settings)
+        store = open_project_memory(repo_path, project_id)
+        return [
+            {"name": str(p), "size": (store.memory_dir / p).stat().st_size}
+            for p in store.files()
+        ]
+    except Exception:  # noqa: BLE001 - memory listing is best-effort
+        return []
+
+
+def set_project_memory(
+    settings: Settings | None = None,
+    project_id: str | None = None,
+    name: str = "notes.md",
+    content: str = "",
+    *,
+    append: bool = True,
+    repo: Path | None = None,
+) -> bool:
+    """Write (or append to) a ``.md`` note in the project's memory dir.
+
+    Returns False when the project does not exist; raises ``ValueError`` for an
+    empty note name. The note name must end in ``.md`` and contain no path
+    separators (a flat filename under the project dir).
+    """
+    if not project_id:
+        return False
+    db = open_db(settings)
+    if db.get_project(project_id) is None:
+        return False
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("memory note name is required")
+    if "/" in name or "\\" in name or not name.endswith(".md"):
+        raise ValueError("memory note name must be a flat *.md filename")
+    repo_path = repo or find_repo(settings)
+    store = open_project_memory(repo_path, project_id)
+    target = store.memory_dir / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Preserve the exact content on write (no forced trailing newline), so the
+    # note round-trips through the API verbatim. Appending follows the same
+    # blank-line convention as ``MemoryStore.write``.
+    if append and target.exists():
+        body = target.read_text(encoding="utf-8", errors="replace").rstrip() + "\n\n" + content.strip()
+    else:
+        body = content
+    target.write_text(body, encoding="utf-8")
+    return True
+
+
+def _project_dto(db: Database, row: Any) -> dict[str, Any]:
+    keys = row.keys()
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"] or "",
+        "stage": (row["stage"] or "") if "stage" in keys else "",
+        "meta": _safe_json_obj(row["meta"] or "{}"),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "chat_count": int(row["chat_count"] or 0) if "chat_count" in keys else 0,
+    }
+
+
+def _chat_summary_for_project(row: Any) -> dict[str, Any]:
+    keys = row.keys()
+    out: dict[str, Any] = {
+        "id": row["id"],
+        "frontend": row["frontend"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+    }
+    # list_sessions adds message_count / last_message_at / meta; include them
+    # when present so the card can show a message count per chat.
+    if "message_count" in keys:
+        out["message_count"] = int(row["message_count"] or 0)
+    return out
+
 
 
 # --------------------------------------------------------------------------- #

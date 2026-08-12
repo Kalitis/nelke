@@ -454,7 +454,7 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
         _fatal(f"{repo_path} is not a git repository; cannot run a cycle")
     git = GitRepo(repo_path)
     db = open_db(settings)
-    gov = Governance(git)
+    gov = Governance(git, require_tests=settings.require_code_tests)
 
     stream = ImproveStream(objective, total_steps=settings.max_cycle_steps)
     stream.start()
@@ -475,6 +475,7 @@ def improve(objective: str, *, yes: bool = False, profile: str | None = None) ->
         human_approve=human_gate,
         max_steps=settings.max_cycle_steps,
         max_step_attempts=settings.max_step_attempts,
+        max_gate_attempts=settings.max_gate_attempts,
         max_review_rounds=settings.max_review_rounds,
         agent_temperature=settings.agent_temperature,
     )

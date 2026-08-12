@@ -7,6 +7,8 @@ import type {
   MessageTree,
   MemoryFile,
   Profile,
+  ProjectDetail,
+  ProjectSummary,
   StreamEvent,
   UsageAggregate,
 } from "@/state/types";
@@ -149,6 +151,76 @@ export const api = {
 
   async memoryFile(name: string): Promise<{ name: string; content: string }> {
     return json(await fetch(`/api/memory/${name.split("/").map(encodeURIComponent).join("/")}`));
+  },
+
+  // ---- projects (group chats + per-project memory) -----------------------
+
+  async projectsList(): Promise<ProjectSummary[]> {
+    return json(await fetch("/api/projects"));
+  },
+
+  async projectDetail(projectId: string): Promise<ProjectDetail> {
+    return json(await fetch(`/api/projects/${encodeURIComponent(projectId)}`));
+  },
+
+  async createProject(
+    name: string,
+    opts?: { description?: string; stage?: string },
+  ): Promise<{ id: string; name: string }> {
+    return json(
+      await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          description: opts?.description ?? "",
+          stage: opts?.stage ?? "",
+        }),
+      }),
+    );
+  },
+
+  async updateProject(
+    projectId: string,
+    fields: { name?: string; description?: string; stage?: string },
+  ): Promise<{ ok: boolean }> {
+    return json(
+      await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(fields),
+      }),
+    );
+  },
+
+  async deleteProject(projectId: string): Promise<{ ok: boolean }> {
+    return json(
+      await fetch(`/api/projects/${encodeURIComponent(projectId)}`, { method: "DELETE" }),
+    );
+  },
+
+  async linkChat(projectId: string, chatId: string): Promise<{ ok: boolean }> {
+    return json(
+      await fetch(
+        `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(chatId)}`,
+        { method: "POST" },
+      ),
+    );
+  },
+
+  async setProjectMemory(
+    projectId: string,
+    name: string,
+    content: string,
+    append = false,
+  ): Promise<{ ok: boolean; name: string }> {
+    return json(
+      await fetch(`/api/projects/${encodeURIComponent(projectId)}/memory`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, content, append }),
+      }),
+    );
   },
 
   // DB-backed token usage for a chat (totals + recent per-call events).

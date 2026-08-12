@@ -449,6 +449,75 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
         return EventSourceResponse(stream())
 
+    # ---- projects (group chats + per-project memory) -----------------------
+    @app.get("/api/projects")
+    async def api_projects() -> list[dict[str, Any]]:
+        return services.list_projects(state.settings)
+
+    @app.post("/api/projects")
+    async def api_create_project(payload: dict[str, Any]) -> JSONResponse:
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            return JSONResponse({"error": "project name is required"}, status_code=400)
+        description = str(payload.get("description") or "").strip()
+        stage = str(payload.get("stage") or "").strip()
+        pid = services.create_project(
+            state.settings, name=name, description=description, stage=stage,
+            repo=state.repo_path,
+        )
+        return JSONResponse({"id": pid, "name": name})
+
+    @app.get("/api/projects/{project_id}")
+    async def api_project_detail(project_id: str) -> JSONResponse:
+        project = services.get_project(state.settings, project_id, repo=state.repo_path)
+        if project is None:
+            return JSONResponse({"error": "project not found"}, status_code=404)
+        return JSONResponse(project)
+
+    @app.patch("/api/projects/{project_id}")
+    async def api_update_project(project_id: str, payload: dict[str, Any]) -> JSONResponse:
+        ok = services.update_project(
+            state.settings, project_id,
+            name=payload.get("name"),
+            description=payload.get("description"),
+            stage=payload.get("stage"),
+        )
+        if not ok:
+            return JSONResponse({"error": "project not found"}, status_code=404)
+        return JSONResponse({"ok": True, "id": project_id})
+
+    @app.delete("/api/projects/{project_id}")
+    async def api_delete_project(project_id: str) -> JSONResponse:
+        if not services.delete_project(state.settings, project_id):
+            return JSONResponse({"error": "project not found"}, status_code=404)
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/projects/{project_id}/chats/{chat_id}")
+    async def api_link_chat(project_id: str, chat_id: str) -> JSONResponse:
+        """Attach a chat to a project."""
+        if not services.attach_chat_to_project(
+            state.settings, chat_id=chat_id, project_id=project_id,
+        ):
+            return JSONResponse({"error": "project or chat not found"}, status_code=404)
+        return JSONResponse({"ok": True, "project_id": project_id, "chat_id": chat_id})
+
+    @app.post("/api/projects/{project_id}/memory")
+    async def api_set_project_memory(project_id: str, payload: dict[str, Any]) -> JSONResponse:
+        """Write a ``.md`` note into the project's memory directory."""
+        name = str(payload.get("name") or "notes.md").strip()
+        content = str(payload.get("content") or "")
+        try:
+            ok = services.set_project_memory(
+                state.settings, project_id, name, content,
+                append=bool(payload.get("append", False)),
+                repo=state.repo_path,
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if not ok:
+            return JSONResponse({"error": "project not found"}, status_code=404)
+        return JSONResponse({"ok": True, "name": name})
+
     # ---- message tree: edit / regenerate / branch (swipe) / delete ----------
     @app.get("/api/chats/{chat_id}/tree")
     async def api_chat_tree(chat_id: str) -> JSONResponse:

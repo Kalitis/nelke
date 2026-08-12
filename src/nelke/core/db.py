@@ -72,6 +72,16 @@ _SCHEMA = [
         title TEXT, detail TEXT, status TEXT, started_at TEXT, ended_at TEXT
     )
     """,
+    # Projects group multiple chats (and future work) under a single
+    # user-facing unit. `sessions.project_id` is an optional FK to this table
+    # (nullable so a chat without a project stays valid). `stage` is a free-form
+    # label (e.g. "idea", "in-progress", "done") shown on the project card.
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+        stage TEXT, meta TEXT, created_at TEXT, updated_at TEXT
+    )
+    """,
 ]
 
 # Additive migrations applied after the base schema (for databases created by
@@ -94,6 +104,12 @@ _MIGRATIONS = [
     # worker that produced it; null keeps existing single-worker cycles intact.
     "ALTER TABLE cycle_steps ADD COLUMN worker_id TEXT",
     "CREATE INDEX IF NOT EXISTS idx_cycle_workers_cycle ON cycle_workers(cycle_id)",
+    # Projects: optional Chat-to-Project relation. Legacy chats keep NULL here.
+    "ALTER TABLE sessions ADD COLUMN project_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)",
+    # Projects: free-form stage label on the project card. Added after the
+    # initial Projects migration, so older project rows get NULL here.
+    "ALTER TABLE projects ADD COLUMN stage TEXT",
 ]
 
 
@@ -260,6 +276,131 @@ class Database:
         with self._conn() as conn:
             conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+
+    # ---- projects ----------------------------------------------------------
+    def create_project(
+        self,
+        name: str,
+        description: str = "",
+        stage: str = "",
+        meta: dict[str, Any] | None = None,
+        project_id: str | None = None,
+    ) -> str:
+        """Create a project and return its id."""
+        self._prepare()
+        pid = project_id or new_id()
+        now = _now()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO projects (id, name, description, stage, meta, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (pid, name, description, stage, json.dumps(meta or {}), now, now),
+            )
+        return pid
+
+    def get_project(self, project_id: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM projects WHERE id=?", (project_id,)
+            ).fetchone()
+
+    def list_projects(self, limit: int | None = None) -> list[sqlite3.Row]:
+        """Projects ordered by most-recently updated, with chat counts."""
+        q = (
+            "SELECT p.*, "
+            "(SELECT COUNT(*) FROM sessions s WHERE s.project_id = p.id) AS chat_count "
+            "FROM projects p ORDER BY p.updated_at DESC"
+        )
+        if limit is not None:
+            q += " LIMIT ?"
+        with self._conn() as conn:
+            if limit is not None:
+                return list(conn.execute(q, (str(limit),)))
+            return list(conn.execute(q))
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        stage: str | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> bool:
+        """Update a project's metadata. Returns False if the project is missing."""
+        row = self.get_project(project_id)
+        if row is None:
+            return False
+        fields: dict[str, Any] = {}
+        if name is not None:
+            fields["name"] = name
+        if description is not None:
+            fields["description"] = description
+        if stage is not None:
+            fields["stage"] = stage
+        if meta is not None:
+            try:
+                merged = json.loads(row["meta"] or "{}")
+            except (ValueError, TypeError):
+                merged = {}
+            if not isinstance(merged, dict):
+                merged = {}
+            merged.update(meta)
+            fields["meta"] = json.dumps(merged)
+        fields["updated_at"] = _now()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE projects SET {cols} WHERE id=?",
+                (*fields.values(), project_id),
+            )
+        return True
+
+    def delete_project(self, project_id: str) -> bool:
+        """Remove a project, optionally detaching (not deleting) its chats.
+
+        Returns False if the project does not exist.
+        """
+        if self.get_project(project_id) is None:
+            return False
+        with self._conn() as conn:
+            conn.execute("UPDATE sessions SET project_id=NULL WHERE project_id=?", (project_id,))
+            conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        return True
+
+    def set_session_project(self, session_id: str, project_id: str | None) -> bool:
+        """Attach (or detach, when ``project_id`` is None) a chat to a project."""
+        if project_id is not None and self.get_project(project_id) is None:
+            return False
+        if self.get_session(session_id) is None:
+            return False
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE sessions SET project_id=? WHERE id=?",
+                (project_id, session_id),
+            )
+        return True
+
+    def list_project_sessions(self, project_id: str) -> list[sqlite3.Row]:
+        """Chats attached to a project, most recent first.
+
+        Each row carries ``message_count`` and ``last_message_at`` (computed
+        from the messages table, like ``list_sessions``) so a project card can
+        show per-chat activity without a follow-up query.
+        """
+        if self.get_project(project_id) is None:
+            return []
+        with self._conn() as conn:
+            return list(
+                conn.execute(
+                    "SELECT s.*, "
+                    "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count, "
+                    "(SELECT MAX(m.created_at) FROM messages m WHERE m.session_id = s.id) AS last_message_at "
+                    "FROM sessions s WHERE s.project_id=? "
+                    "ORDER BY COALESCE(last_message_at, s.started_at) DESC",
+                    (project_id,),
+                )
+            )
 
     def add_message(
         self,
@@ -693,6 +834,7 @@ class Database:
                 "tasks",
                 "usage_events",
                 "cycle_events",
+                "projects",
             ):
                 out[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return out

@@ -21,6 +21,7 @@ def _engine(repo, db, gov, llm, human=lambda req: True, **kw) -> CycleEngine:
         human_approve=human,
         max_steps=kw.pop("max_steps", 10),
         max_step_attempts=kw.pop("max_step_attempts", 3),
+        max_gate_attempts=kw.pop("max_gate_attempts", 5),
         max_review_rounds=kw.pop("max_review_rounds", 3),
         on_event=kw.pop("on_event", None),
         mode=kw.pop("mode", "single"),
@@ -144,14 +145,47 @@ async def test_cycle_no_changes(tmp_repo, db):
 
 
 async def test_cycle_gate_failure_stops(tmp_repo, db):
+    """The cycle gives up only after max_gate_attempts rework rounds, then returns failed-gate."""
     gov = FakeGovernance()
     fail = GateResult(passed=False, checks=[CheckResult("tests", ok=False, message="boom")])
-    gov.gates = [fail, fail, fail]  # max_step_attempts = 3
+    gov.gates = [fail, fail, fail]  # max_gate_attempts = 3
     llm = driver_fake(worker=_scripted_worker([final_response("done")]))
-    engine = _engine(tmp_repo, db, gov, llm)
+    engine = _engine(tmp_repo, db, gov, llm, max_gate_attempts=3)
     result = await engine.run("improve something broken")
     assert result.status == "failed-gate"
     assert not tmp_repo.has_changes()  # changes were stashed
+
+
+async def test_cycle_gate_failure_then_rework_succeeds(tmp_repo, db):
+    """A single gate slip sends the agent back for rework instead of killing the cycle."""
+    gov = FakeGovernance()
+    fail = GateResult(passed=False, checks=[CheckResult("lint", ok=False, message="unused import")])
+    gov.gates = [fail]  # first gate red, then green
+    worker = [
+        tool_response("self_write", {"path": "memory/facts/rework.md", "content": "# Rework\nBROKEN"}),
+        final_response("done"),
+        tool_response("self_write", {"path": "memory/facts/rework.md", "content": "# Rework\nGOOD"}),
+        final_response("done"),
+        tool_response("propose_cycle_complete", {}),
+        final_response("done"),
+    ]
+    llm = driver_fake(worker=_scripted_worker(worker))
+    engine = _engine(tmp_repo, db, gov, llm)
+    result = await engine.run("add a memory lesson")
+    assert result.merged
+    assert "GOOD" in (tmp_repo.repo / "memory" / "facts" / "rework.md").read_text()
+
+
+async def test_cycle_gate_exhausts_only_after_max_gate_attempts(tmp_repo, db):
+    """With max_gate_attempts=2, two red gates fail the cycle and leave the tree stashed."""
+    gov = FakeGovernance()
+    fail = GateResult(passed=False, checks=[CheckResult("tests", ok=False, message="boom")])
+    gov.gates = [fail, fail]
+    llm = driver_fake(worker=_scripted_worker([final_response("done")]))
+    engine = _engine(tmp_repo, db, gov, llm, max_gate_attempts=2)
+    result = await engine.run("improve something broken")
+    assert result.status == "failed-gate"
+    assert not tmp_repo.has_changes()
 
 
 async def test_cycle_awaiting_human_without_gate(tmp_repo, db):
@@ -465,3 +499,64 @@ async def test_parallel_worker_events_carry_worker_id(tmp_repo, db):
     workers = db.list_cycle_workers(result.cycle_id)
     expected_ids = {w["id"] for w in workers}
     assert worker_ids <= expected_ids
+
+
+async def test_parallel_cycle_gate_failure_then_rework_succeeds(tmp_repo, db):
+    """Parallel: one red central gate sends the workers back; a green round merges."""
+    gov = FakeGovernance()
+    fail = GateResult(passed=False, checks=[CheckResult("tests", ok=False, message="boom")])
+    gov.gates = [fail]  # round 1 red, then green
+    llm = driver_fake(
+        worker=scripted([
+            tool_response("self_write", {"path": "memory/facts/pw.md", "content": "# PW\nBROKEN"}),
+            final_response("done"),
+            tool_response("self_write", {"path": "memory/facts/pw.md", "content": "# PW\nGOOD"}),
+            final_response("done"),
+        ]),
+        planner=planner_returning([{"title": "only", "detail": "do it"}]),
+    )
+    engine = _engine(tmp_repo, db, gov, llm, mode="parallel", max_workers=2)
+    result = await engine.run("improve a thing")
+    assert result.merged
+    assert "GOOD" in (tmp_repo.repo / "memory" / "facts" / "pw.md").read_text()
+
+
+async def test_cycle_crash_cleans_up_branch_and_marks_error(tmp_repo, db):
+    """A crashing/killed cycle must mark itself error and delete its branch."""
+    from conftest import FakeLLM
+
+    class CrashLLM(FakeLLM):
+        async def chat(self, messages, *, tools=None, model=None, temperature=None,
+                       max_tokens=None, stream=False, on_token=None):
+            raise RuntimeError("simulated provider stall")
+
+    engine = _engine(tmp_repo, db, FakeGovernance(), CrashLLM())
+    with __import__("pytest").raises(RuntimeError, match="simulated provider stall"):
+        await engine.run("anything")
+    # the cycle is recorded as error, not left running
+    rows = db.list_cycles()
+    assert rows and rows[0]["status"] == "error"
+    assert rows[0]["ended_at"] is not None
+    # the repo is back on main...
+    assert tmp_repo.current_branch() == "main"
+    # ...and the crashed cycle's branch is physically gone
+    crash_branch = rows[0]["branch"]
+    assert not tmp_repo.branch_exists(crash_branch)
+
+
+async def test_cycle_reaps_orphan_running_cycles_on_start(tmp_repo, db):
+    """A pre-existing `running` cycle (from a crashed/killed run) is reaped."""
+    # simulate an orphaned cycle left behind by a previous crash
+    orphan_id = "20260101-000000-deadbeef"
+    db.create_cycle("orphan objective", "improve/20260101-000000-deadbeef-orphan",
+                    cycle_id=orphan_id)
+    db.update_cycle(orphan_id, status="running")
+    assert any(r["status"] == "running" for r in db.list_cycles())
+
+    llm = driver_fake(worker=_scripted_worker(_good_fix_plan()))
+    engine = _engine(tmp_repo, db, FakeGovernance(), llm)
+    result = await engine.run("add a memory lesson")
+    assert result.merged
+    # the orphan is no longer running
+    statuses = {r["id"]: r["status"] for r in db.list_cycles()}
+    assert statuses[orphan_id] == "error"

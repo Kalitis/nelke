@@ -4,6 +4,7 @@ import type { Route } from "@/state/router";
 
 const NAV_ITEMS: { label: string; path: string; route: Route["name"] }[] = [
   { label: "Chat", path: "/", route: "chat" },
+  { label: "Projects", path: "/projects", route: "projects" },
   { label: "Cycles", path: "/cycles", route: "cycles" },
   { label: "Memory", path: "/memory", route: "memory" },
 ];
@@ -34,8 +35,12 @@ export function TopBar({ onOpenSidebar }: { onOpenSidebar: () => void }) {
       </button>
       <nav className="flex items-center gap-1" aria-label="Primary">
         {NAV_ITEMS.map((item) => {
-          // "cycle" detail screen is part of the cycles section.
-          const active = route.name === item.route || (item.route === "cycles" && route.name === "cycle");
+          // Detail screens belong to their list section (cycle → cycles,
+          // project → projects) so the section stays highlighted while browsing.
+          const inDetail =
+            (item.route === "cycles" && route.name === "cycle") ||
+            (item.route === "projects" && route.name === "project");
+          const active = route.name === item.route || inDetail;
           return (
             <button
               key={item.path}

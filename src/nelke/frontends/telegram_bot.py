@@ -179,6 +179,7 @@ class NelkeBot:
         self.router.message.register(self.on_review, Command("review"))
         self.router.message.register(self.on_cancel, Command("cancel"))
         self.router.message.register(self.on_memory, Command("memory"))
+        self.router.message.register(self.on_project, Command("project"))
         self.router.callback_query.register(self.on_review_callback, F.data.startswith("review:"))
         # Catch-all: plain text = /chat. Registered last so command handlers
         # win; messages that begin with "/" (e.g. unknown commands) are ignored.
@@ -196,7 +197,13 @@ class NelkeBot:
             "/improve <objective> — self-improvement cycle\n"
             "/review — list / approve / reject pending reviews\n"
             "/cancel — stop the running task\n"
-            "/memory [query] — list memory or recall hits",
+            "/memory [query] — list memory or recall hits\n"
+            "/project create <name> — make a project\n"
+            "/project list — show all projects\n"
+            "/project show <id> — project card with chats/memory\n"
+            "/project set_stage <id> <stage> — set project stage (idea/active/done…)\n"
+            "/project set_memory <id> <note> <text> — write a memory note\n"
+            "/project link_chat <id> — attach this chat to a project",
         )
 
     # ---- chat session management -------------------------------------------
@@ -686,6 +693,174 @@ class NelkeBot:
             return
         lines = [f"{f['name']} ({f['size']} B)" for f in files]
         await message.answer("\n".join(lines)[:4000])
+
+    # ---- /project ----------------------------------------------------------
+    _PROJECT_USAGE = (
+        "Usage:\n"
+        "/project create <name>\n"
+        "/project list\n"
+        "/project show <id>\n"
+        "/project set_stage <id> <stage>\n"
+        "/project set_memory <id> <note.md> <text>\n"
+        "/project link_chat <id>"
+    )
+
+    def _resolve_project_id(self, prefix: str) -> str | None:
+        """Find a project id by exact / prefix / suffix match (like /open)."""
+        db = services.open_db(self.state.settings)
+        for row in db.list_projects(limit=2000):
+            pid = str(row["id"])
+            if pid == prefix or pid.endswith(prefix) or pid.startswith(prefix):
+                return pid
+        return None
+
+    async def on_project(self, message: Message, command: CommandObject) -> None:
+        args = (command.args or "").strip().split()
+        if not args:
+            await message.answer(self._PROJECT_USAGE)
+            return
+        sub = args[0].lower()
+        rest = args[1:]
+        try:
+            if sub == "create":
+                await self._project_create(message, rest)
+            elif sub == "list":
+                await self._project_list(message)
+            elif sub == "show":
+                await self._project_show(message, rest)
+            elif sub == "set_stage":
+                await self._project_set_stage(message, rest)
+            elif sub == "set_memory":
+                await self._project_set_memory(message, rest)
+            elif sub == "link_chat":
+                await self._project_link_chat(message, rest)
+            else:
+                await message.answer(self._PROJECT_USAGE)
+        except ValueError as exc:  # noqa: BLE001 - service-level input validation
+            await message.answer(str(exc)[:4000])
+        except Exception as exc:  # noqa: BLE001 - surface other failures cleanly
+            await message.answer(f"error: {exc}"[:4000])
+
+    async def _project_create(self, message: Message, rest: list[str]) -> None:
+        if not rest:
+            await message.answer("Usage: /project create <name>")
+            return
+        name = " ".join(rest).strip()
+        repo = self.state.repo_path or services.find_repo(self.state.settings)
+        pid = services.create_project(self.state.settings, name=name, repo=repo)
+        await message.answer(
+            f"✅ created project *{name}*\n"
+            f"id: `{pid}`\n"
+            f"/project set_stage {pid[-8:]} <stage> — set its stage"
+        )
+
+    async def _project_list(self, message: Message) -> None:
+        projects = services.list_projects(self.state.settings)
+        repo = self.state.repo_path or services.find_repo(self.state.settings)
+        if not projects:
+            await message.answer("no projects yet — /project create <name>")
+            return
+        lines: list[str] = ["Projects:"]
+        for p in projects:
+            stage = p.get("stage") or "—"
+            mem = services.project_memory_files(self.state.settings, p["id"], repo=repo)
+            lines.append(
+                f"· *{p['name']}*  [{stage}]  ({p['chat_count']} chats · {len(mem)} memory)\n"
+                f"  id: {p['id'][-8:]} · /project show {p['id'][-8:]}"
+            )
+        await message.answer("\n".join(lines)[:4000])
+
+    async def _project_show(self, message: Message, rest: list[str]) -> None:
+        if not rest:
+            await message.answer("Usage: /project show <id>")
+            return
+        pid = self._resolve_project_id(rest[0])
+        if pid is None:
+            await message.answer(f"project '{rest[0]}' not found — /project list")
+            return
+        repo = self.state.repo_path or services.find_repo(self.state.settings)
+        project = services.get_project(self.state.settings, pid, repo=repo)
+        if project is None:
+            await message.answer("project not found")
+            return
+        stage = project.get("stage") or "—"
+        lines = [
+            f"📂 *{project['name']}*",
+            f"stage: {stage}   ·   id: `{project['id']}`",
+            f"created {project.get('created_at')} · updated {project.get('updated_at')}",
+        ]
+        desc = project.get("description") or ""
+        lines.append(f"description: {desc}" if desc else "(no description)")
+        chats = project.get("chats") or []
+        lines.append(f"💬 {len(chats)} chat{'s' if len(chats) != 1 else ''}:")
+        for c in chats[:15]:
+            origin = _short_frontend(c.get("frontend"))
+            count = c.get("message_count", 0)
+            lines.append(f"  · [{origin}] {str(c['id'])[-8:]} ({count} msgs)")
+        if len(chats) > 15:
+            lines.append(f"  … and {len(chats) - 15} more")
+        mem = project.get("memory_files") or []
+        lines.append(f"🧠 {len(mem)} memory note{'s' if len(mem) != 1 else ''}:")
+        for m in mem[:15]:
+            lines.append(f"  · {m['name']} ({m['size']} B)")
+        if len(mem) > 15:
+            lines.append(f"  … and {len(mem) - 15} more")
+        if not mem:
+            lines.append("  (no memory yet — /project set_memory)")
+        await message.answer("\n".join(lines)[:4000])
+
+    async def _project_set_stage(self, message: Message, rest: list[str]) -> None:
+        if len(rest) < 2:
+            await message.answer("Usage: /project set_stage <id> <stage>")
+            return
+        prefix, stage_parts = rest[0], rest[1:]
+        stage = " ".join(stage_parts).strip()
+        pid = self._resolve_project_id(prefix)
+        if pid is None:
+            await message.answer(f"project '{prefix}' not found — /project list")
+            return
+        services.update_project(self.state.settings, pid, stage=stage)
+        await message.answer(f"✅ stage set to *{stage}*")
+
+    async def _project_set_memory(self, message: Message, rest: list[str]) -> None:
+        # /project set_memory <id> <note.md> <text...>
+        if len(rest) < 3:
+            await message.answer("Usage: /project set_memory <id> <note.md> <text>")
+            return
+        prefix, note = rest[0], rest[1]
+        text = " ".join(rest[2:]).strip()
+        if not text:
+            await message.answer("memory text is required")
+            return
+        pid = self._resolve_project_id(prefix)
+        if pid is None:
+            await message.answer(f"project '{prefix}' not found — /project list")
+            return
+        repo = self.state.repo_path or services.find_repo(self.state.settings)
+        ok = services.set_project_memory(
+            self.state.settings, pid, note, text, append=False, repo=repo,
+        )
+        if not ok:
+            await message.answer("could not write project memory")
+            return
+        await message.answer(f"✅ wrote *{note}* ({len(text)} chars)")
+
+    async def _project_link_chat(self, message: Message, rest: list[str]) -> None:
+        if not rest:
+            await message.answer("Usage: /project link_chat <id>")
+            return
+        chat_id = message.chat.id
+        session_id = self._ensure_session(chat_id)
+        pid = self._resolve_project_id(rest[0])
+        if pid is None:
+            await message.answer(f"project '{rest[0]}' not found — /project list")
+            return
+        services.attach_chat_to_project(
+            self.state.settings, chat_id=session_id, project_id=pid,
+        )
+        await message.answer(
+            f"✅ this chat is now linked to the project\nid: {pid[-8:]}"
+        )
 
 
 # --------------------------------------------------------------------------- #

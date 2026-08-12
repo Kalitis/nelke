@@ -635,3 +635,81 @@ def test_spa_takes_over_cycle_memory_review_routes(settings, tmp_repo, monkeypat
             r = client.get(path)
             assert r.status_code == 200, path
             assert "SPA" in r.text, path
+
+
+# --------------------------------------------------------------------------- #
+# /api/projects
+# --------------------------------------------------------------------------- #
+def _projects_client(settings, tmp_repo) -> TestClient:
+    app = create_app(AppState(settings=settings, repo_path=tmp_repo.repo))
+    return TestClient(app)
+
+
+def test_api_projects_crud(settings, tmp_repo):
+    with _projects_client(settings, tmp_repo) as client:
+        # empty initially
+        assert client.get("/api/projects").json() == []
+
+        # create
+        r = client.post("/api/projects", json={"name": "Nelke", "stage": "idea"})
+        assert r.status_code == 200
+        pid = r.json()["id"]
+
+        # list reflects it
+        rows = client.get("/api/projects").json()
+        assert len(rows) == 1 and rows[0]["id"] == pid
+        assert rows[0]["stage"] == "idea"
+
+        # patch stage
+        assert client.patch(f"/api/projects/{pid}", json={"stage": "active"}).status_code == 200
+        detail = client.get(f"/api/projects/{pid}").json()
+        assert detail["stage"] == "active"
+        assert detail["chat_count"] == 0
+        # memory dir seeded → detail lists at least INDEX.md
+        assert any(f["name"] == "INDEX.md" for f in detail["memory_files"])
+
+        # delete
+        assert client.delete(f"/api/projects/{pid}").status_code == 200
+        assert client.get(f"/api/projects/{pid}").status_code == 404
+
+
+def test_api_projects_create_requires_name(settings, tmp_repo):
+    with _projects_client(settings, tmp_repo) as client:
+        assert client.post("/api/projects", json={"name": ""}).status_code == 400
+
+
+def test_api_projects_memory_write_and_link(settings, tmp_repo):
+    from nelke.core import services
+
+    with _projects_client(settings, tmp_repo) as client:
+        pid = client.post("/api/projects", json={"name": "P"}).json()["id"]
+        sid = services.create_chat(settings, frontend="web")
+
+        # write a memory note
+        r = client.post(f"/api/projects/{pid}/memory", json={"name": "notes.md", "content": "hi"})
+        assert r.status_code == 200
+        # readable via the existing nested /api/memory path
+        note = client.get(f"/api/memory/projects/{pid}/notes.md").json()
+        assert note["content"] == "hi"
+
+        # link a chat
+        r = client.post(f"/api/projects/{pid}/chats/{sid}")
+        assert r.status_code == 200
+        detail = client.get(f"/api/projects/{pid}").json()
+        assert any(c["id"] == sid for c in detail["chats"])
+
+        # link with unknown chat → 404
+        assert client.post(f"/api/projects/{pid}/chats/ghost").status_code == 404
+
+
+def test_api_projects_memory_rejects_bad_name(settings, tmp_repo):
+    with _projects_client(settings, tmp_repo) as client:
+        pid = client.post("/api/projects", json={"name": "P"}).json()["id"]
+        # nested path rejected
+        assert client.post(
+            f"/api/projects/{pid}/memory", json={"name": "a/b.md", "content": "x"}
+        ).status_code == 400
+        # non-.md rejected
+        assert client.post(
+            f"/api/projects/{pid}/memory", json={"name": "notes.txt", "content": "x"}
+        ).status_code == 400

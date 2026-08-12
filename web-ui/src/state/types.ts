@@ -114,6 +114,34 @@ export interface MemoryFile {
   size: number;
 }
 
+// ---- Projects: user-facing units grouping chats + per-project memory -----
+
+export type ProjectStage = string;
+
+export interface ProjectChatSummary {
+  id: string;
+  frontend: string;
+  started_at: string | null;
+  ended_at: string | null;
+  message_count?: number;
+}
+
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  description: string;
+  stage: ProjectStage;
+  meta: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+  chat_count: number;
+}
+
+export interface ProjectDetail extends ProjectSummary {
+  chats: ProjectChatSummary[];
+  memory_files: MemoryFile[];
+}
+
 export interface UsageTotals {
   prompt_tokens: number;
   completion_tokens: number;

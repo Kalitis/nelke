@@ -99,14 +99,24 @@ def planner_returning(tasks: list[dict[str, str]]) -> Callable:
 # Fake governance
 # --------------------------------------------------------------------------- #
 class FakeGovernance:
-    """Programmable gate/boot-check. Defaults to always green."""
+    """Programmable gate/boot-check. Defaults to always green.
+
+    ``gates``/``boots`` are consumed in order; once empty the fake turns green.
+    Set ``fail_gates = True`` to keep the gate red forever (useful when a test
+    wants a cycle to exhaust its rework budget).
+    """
 
     def __init__(self) -> None:
         self.gates: list[GateResult] = []
         self.boots: list[CheckResult] = []
+        self.fail_gates: bool = False
 
     async def gate(self) -> GateResult:
-        return self.gates.pop(0) if self.gates else GateResult(passed=True, checks=[])
+        if self.gates:
+            return self.gates.pop(0)
+        if self.fail_gates:
+            return GateResult(passed=False, checks=[CheckResult("tests", ok=False, message="boom")])
+        return GateResult(passed=True, checks=[])
 
     async def boot_check(self) -> CheckResult:
         return self.boots.pop(0) if self.boots else CheckResult("boot-check", ok=True)

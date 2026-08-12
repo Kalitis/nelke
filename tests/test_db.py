@@ -15,9 +15,18 @@ def test_migrate_creates_all_tables(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-    assert {
-        "sessions", "messages", "cycles", "cycle_steps", "review_requests", "tasks", "usage_events", "cycle_events",
-    } <= tables
+    expected = {
+        "sessions",
+        "messages",
+        "cycles",
+        "cycle_steps",
+        "review_requests",
+        "tasks",
+        "usage_events",
+        "cycle_events",
+        "projects",
+    }
+    assert expected <= tables
 
 
 def test_cycle_events_roundtrip(tmp_path):
@@ -128,3 +137,51 @@ def test_usage_totals_omit_cache_when_absent(tmp_path):
     totals = db.usage_totals(session_id=sid)
     assert totals["cache_read_tokens"] == 0
     assert totals["cache_read_pct"] == 0
+
+
+def test_projects_crud_with_stage(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    pid = db.create_project("Nelke", description="self-improving agent", stage="idea")
+    row = db.get_project(pid)
+    assert row is not None
+    assert row["name"] == "Nelke"
+    assert row["stage"] == "idea"
+
+    # stage is updatable independently
+    assert db.update_project(pid, stage="active")
+    assert db.get_project(pid)["stage"] == "active"
+
+    # listing carries chat_count
+    rows = db.list_projects()
+    assert len(rows) == 1
+    assert rows[0]["chat_count"] == 0
+
+    # deleting detaches chats, does not raise
+    sid = db.create_session("web")
+    assert db.set_session_project(sid, pid)
+    assert db.delete_project(pid)
+    assert db.get_project(pid) is None
+    # session still exists, but no longer attached
+    assert db.get_session(sid)["project_id"] is None
+
+
+def test_project_sessions_carry_message_count(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    pid = db.create_project("P")
+    sid = db.create_session("web")
+    db.set_session_project(sid, pid)
+    db.add_message(sid, "user", "hello")
+    db.add_message(sid, "assistant", "hi")
+
+    rows = db.list_project_sessions(pid)
+    assert len(rows) == 1
+    assert rows[0]["message_count"] == 2
+    assert rows[0]["id"] == sid
+
+
+def test_set_session_project_rejects_unknown(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    sid = db.create_session("web")
+    assert db.set_session_project(sid, "nope") is False
+    # unknown session also rejected
+    assert db.set_session_project("ghost", None) is False

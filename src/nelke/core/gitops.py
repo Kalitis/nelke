@@ -77,6 +77,27 @@ class GitRepo:
         result = self._run("status", "--porcelain", "--", *paths)
         return bool(result.stdout.strip())
 
+    def changed_paths(self) -> list[str]:
+        """Working-tree paths that are modified, staged, or untracked.
+
+        Renames/copies resolve to the new path. Returns ``[]`` on any git
+        error (e.g. not a repository) so callers can degrade gracefully.
+        Used by the governance ``test-gap`` check to see what the agent just
+        produced in the working tree before it is committed.
+        """
+        result = self._run("status", "--porcelain", "-uall")
+        if not result.ok or not result.stdout:
+            return []
+        paths: list[str] = []
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:].strip()
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            paths.append(path)
+        return paths
+
     def stash_all(self) -> GitResult:
         """Stash tracked + untracked changes (used to discard a failed step)."""
         return self._run("stash", "-u", "--include-untracked")
@@ -105,6 +126,15 @@ class GitRepo:
     def branch_exists(self, name: str) -> bool:
         result = self._run("rev-parse", "--verify", "--quiet", f"refs/heads/{name}")
         return result.ok
+
+    def delete_branch(self, name: str, *, force: bool = False) -> GitResult:
+        """Delete a local branch (``-D`` when force, else ``-d``).
+
+        Used to clean up a cycle branch after the cycle crashed or was killed,
+        so the repo is not left on a stale ``improve/...`` branch.
+        """
+        flag = "-D" if force else "-d"
+        return self._run("branch", flag, name)
 
     def ahead_counts(self, base: str, branch: str) -> int:
         """Number of commits on ``branch`` not reachable from ``base``.

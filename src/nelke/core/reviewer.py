@@ -26,7 +26,9 @@ REVIEWER_PROMPT = """You are Nelke's AI review gate for its own self-improvement
 
 Review the proposed changes (the attached diff) against the stated objective for:
 - Correctness and obvious bugs.
-- Test coverage: do existing tests still pass conceptually / is new behavior tested?
+- Test coverage: every new behavior (new file, function, branch, CLI command, API
+  endpoint, …) MUST be covered by a passing test. If new code ships without a test,
+  REQUEST_CHANGES and name the missing tests (e.g. "tests/test_<module>.py").
 - Safety: no secrets, no destructive operations, no infinite loops, nothing that
   could brick the project (bad imports, broken syntax, unbounded processes).
 - Alignment: do the changes actually serve the objective?

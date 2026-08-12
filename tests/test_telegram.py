@@ -548,3 +548,74 @@ async def test_memory_empty(settings, tmp_repo):
     msg = fake.make_message("/memory")
     await nelke.on_memory(msg, _cmd(""))
     assert any("no memory files" in s["text"] for s in fake.sends)
+
+
+# --------------------------------------------------------------------------- #
+# /project
+# --------------------------------------------------------------------------- #
+async def test_project_no_args_shows_usage(settings, tmp_repo):
+
+    nelke, fake, _ = _make_bot(settings, tmp_repo, _scripted_llm_factory([final_response("x")]))
+    msg = fake.make_message("/project")
+    await nelke.on_project(msg, _cmd(""))
+    assert any("Usage" in s["text"] for s in fake.sends)
+
+
+async def test_project_create_list_show(settings, tmp_repo):
+    from nelke.core import services
+
+    nelke, fake, _ = _make_bot(settings, tmp_repo, _scripted_llm_factory([final_response("x")]))
+    # create
+    msg = fake.make_message("/project create Nelke")
+    await nelke.on_project(msg, _cmd("create Nelke"))
+    create_text = fake.sends[-1]["text"]
+    assert "created project" in create_text
+    # the id's last 8 chars appear in the response
+    suffix = create_text.split("set_stage ")[1].split()[0]
+    db = services.open_db(settings)
+    assert any(r["id"].endswith(suffix) for r in db.list_projects())
+
+    # list shows the project
+    msg = fake.make_message("/project list")
+    await nelke.on_project(msg, _cmd("list"))
+    assert any("Nelke" in s["text"] for s in fake.sends)
+
+    # set_stage then show reflects it
+    await nelke.on_project(fake.make_message("/project set_stage"), _cmd(f"set_stage {suffix} active"))
+    await nelke.on_project(fake.make_message("/project show"), _cmd(f"show {suffix}"))
+    show_text = fake.sends[-1]["text"]
+    assert "active" in show_text
+    assert "Nelke" in show_text
+
+
+async def test_project_set_memory_and_link_chat(settings, tmp_repo):
+    from nelke.core import services
+
+    nelke, fake, _ = _make_bot(settings, tmp_repo, _scripted_llm_factory([final_response("x")]))
+    await nelke.on_project(fake.make_message("/p"), _cmd("create Web UI"))
+    suffix = fake.sends[-1]["text"].split("set_stage ")[1].split()[0]
+    db = services.open_db(settings)
+    pid = next(r["id"] for r in db.list_projects() if r["id"].endswith(suffix))
+
+    # set_memory writes a note
+    await nelke.on_project(
+        fake.make_message("/p"),
+        _cmd(f"set_memory {suffix} notes.md first project note"),
+    )
+    assert "wrote" in fake.sends[-1]["text"]
+    store = services.open_project_memory(tmp_repo.repo, pid)
+    assert "first project note" in store.read("notes.md")
+
+    # link_chat attaches the current Telegram chat's session
+    await nelke.on_project(fake.make_message("/p"), _cmd(f"link_chat {suffix}"))
+    assert "linked" in fake.sends[-1]["text"]
+    # a session was created for this tg chat and attached to the project
+    attached = db.list_project_sessions(pid)
+    assert len(attached) == 1
+
+
+async def test_project_show_unknown_id(settings, tmp_repo):
+    nelke, fake, _ = _make_bot(settings, tmp_repo, _scripted_llm_factory([final_response("x")]))
+    msg = fake.make_message("/project show nope")
+    await nelke.on_project(msg, _cmd("show nope"))
+    assert any("not found" in s["text"] for s in fake.sends)

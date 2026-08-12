@@ -19,6 +19,14 @@ describe("parsePath", () => {
     expect(parsePath("/memory")).toEqual({ name: "memory" });
   });
 
+  it("routes /projects to projects list", () => {
+    expect(parsePath("/projects")).toEqual({ name: "projects" });
+  });
+
+  it("routes /projects/:id to project detail", () => {
+    expect(parsePath("/projects/abc-1")).toEqual({ name: "project", id: "abc-1" });
+  });
+
   it("falls back to chat for unknown paths", () => {
     expect(parsePath("/whatever/else")).toEqual({ name: "chat" });
   });

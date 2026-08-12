@@ -509,3 +509,67 @@ def test_reconcile_stale_cycles_marks_empty_branches(tmp_repo, settings):
     assert db.get_cycle("c-work")["status"] == "running"
 
 
+# --------------------------------------------------------------------------- #
+# Projects: CRUD + per-project memory
+# --------------------------------------------------------------------------- #
+def test_create_project_seeds_memory_and_returns_stage(tmp_repo, settings):
+    pid = services.create_project(
+        settings, name="Nelke", description="agent", stage="idea", repo=tmp_repo.repo,
+    )
+    # memory dir seeded with an INDEX.md
+    store = services.open_project_memory(tmp_repo.repo, pid)
+    assert "INDEX.md" in {str(p) for p in store.files()}
+
+    detail = services.get_project(settings, pid, repo=tmp_repo.repo)
+    assert detail is not None
+    assert detail["stage"] == "idea"
+    assert detail["chat_count"] == 0
+    # detail carries memory files (at least the seeded INDEX)
+    assert any(f["name"] == "INDEX.md" for f in detail["memory_files"])
+
+
+def test_set_project_memory_writes_note_and_detail_lists_it(tmp_repo, settings):
+    pid = services.create_project(settings, name="P", repo=tmp_repo.repo)
+    ok = services.set_project_memory(
+        settings, pid, "notes.md", "first note", append=False, repo=tmp_repo.repo,
+    )
+    assert ok
+    detail = services.get_project(settings, pid, repo=tmp_repo.repo)
+    names = {f["name"] for f in detail["memory_files"]}
+    assert "notes.md" in names
+    # content round-trips through the MemoryStore
+    store = services.open_project_memory(tmp_repo.repo, pid)
+    assert "first note" in store.read("notes.md")
+
+
+def test_set_project_memory_rejects_bad_names_and_unknown_project(tmp_repo, settings):
+    pid = services.create_project(settings, name="P", repo=tmp_repo.repo)
+    with pytest.raises(ValueError):
+        services.set_project_memory(settings, pid, "sub/dir.md", "x", repo=tmp_repo.repo)
+    with pytest.raises(ValueError):
+        services.set_project_memory(settings, pid, "notes.txt", "x", repo=tmp_repo.repo)
+    # unknown project → False, not an exception
+    assert services.set_project_memory(settings, "ghost", "notes.md", "x", repo=tmp_repo.repo) is False
+
+
+def test_attach_chat_to_project_and_list(tmp_repo, settings):
+    pid = services.create_project(settings, name="P", repo=tmp_repo.repo)
+    sid = services.create_chat(settings, frontend="web")
+    assert services.attach_chat_to_project(settings, chat_id=sid, project_id=pid)
+    detail = services.get_project(settings, pid, repo=tmp_repo.repo)
+    assert len(detail["chats"]) == 1
+    assert detail["chats"][0]["id"] == sid
+
+    # detach
+    assert services.attach_chat_to_project(settings, chat_id=sid, project_id=None)
+    assert len(services.get_project(settings, pid, repo=tmp_repo.repo)["chats"]) == 0
+
+
+def test_update_project_stage_and_delete(tmp_repo, settings):
+    pid = services.create_project(settings, name="P", stage="idea", repo=tmp_repo.repo)
+    assert services.update_project(settings, pid, stage="active")
+    assert services.get_project(settings, pid, repo=tmp_repo.repo)["stage"] == "active"
+    assert services.delete_project(settings, pid)
+    assert services.get_project(settings, pid, repo=tmp_repo.repo) is None
+
+

@@ -50,8 +50,14 @@ the cycle engine automatically after you finish — do not call them yourself.
 
 Workflow:
 1. Explore the repo (self_read/self_glob/self_grep) and recall relevant memory.
-2. Make focused edits toward the objective; keep existing tests green; add or adjust
-   tests for new behavior when relevant.
+2. Make focused edits toward the objective, and ALWAYS add or update tests for any
+   new behavior in the same step:
+   - Every new or changed src module (src/**/*.py) needs a matching
+     tests/test_<module>.py that exercises the new behavior.
+   - New functions/methods/branches added to an existing module need a new test
+     case in that module's test file (create the test file if missing).
+   Writing tests is MANDATORY, not optional: the governance gate now rejects code
+   shipped without a matching test file, so you will be sent back to add them.
 3. When you have a coherent improvement ready, you are done for this step — do NOT
    loop infinitely; the engine commits, gates and boot-checks, then feeds results back.
 4. Wait for gate feedback. If the gate failed or a commit was reverted, fix the
@@ -74,8 +80,14 @@ workers finish.
 
 Workflow:
 1. Read your assigned task (title + detail). Explore only the files in scope.
-2. Make focused edits toward the task. Keep existing tests green; add or adjust
-   tests for new behavior when relevant.
+2. Make focused edits toward the task, and ALWAYS add or update tests for any new
+   behavior in the same pass:
+   - Every new or changed src module (src/**/*.py) needs a matching
+     tests/test_<module>.py that exercises the new behavior.
+   - New functions/methods/branches added to an existing module need a new test
+     case in that module's test file (create the test file if missing).
+   Writing tests is MANDATORY, not optional: the governance gate rejects code
+   shipped without a matching test file, so you will be sent back to add them.
 3. Optionally run the gates to self-check your edits.
 4. When your slice is complete, stop and return a short summary of what you did.
 
@@ -166,6 +178,7 @@ class CycleEngine:
         human_approve: Callable[[HumanReviewRequest], bool | Awaitable[bool]] | None = None,
         max_steps: int = 30,
         max_step_attempts: int = 3,
+        max_gate_attempts: int = 5,
         max_review_rounds: int = 3,
         on_token: ToolCallback = None,
         on_usage: Callable[[dict[str, Any]], Any] | None = None,
@@ -182,6 +195,7 @@ class CycleEngine:
         self.human_approve = human_approve
         self.max_steps = max_steps
         self.max_step_attempts = max_step_attempts
+        self.max_gate_attempts = max_gate_attempts
         self.max_review_rounds = max_review_rounds
         self.on_token = on_token
         self.on_usage = on_usage
@@ -348,22 +362,61 @@ class CycleEngine:
                 "refusing to start a cycle: the working tree has uncommitted changes. "
                 "Commit or stash them first, then re-run the cycle."
             )
+        # Reap orphaned cycles: any row still `running` belongs to a cycle that
+        # crashed or was killed (a new run cannot start while another is in
+        # flight), so mark it failed. This also frees the UI/API from stuck
+        # spinners left by a Ctrl-C'd or OOM-killed run.
+        self._reap_orphan_running_cycles()
         if repo.current_branch() != "main":
             repo.checkout("main")
         repo.checkout_new_branch(branch, base="main")
         self._synced = False
         self.db.create_cycle(objective, branch, cycle_id=cycle_id)
+        completed = False
         try:
             if self.mode == "parallel":
-                return await self._run_impl_parallel(repo, objective, branch, cycle_id, human_gate)
-            return await self._run_impl(repo, objective, branch, cycle_id, human_gate)
-        except Exception:  # noqa: BLE001 - never leave a cycle stuck as `running`
+                result = await self._run_impl_parallel(repo, objective, branch, cycle_id, human_gate)
+            else:
+                result = await self._run_impl(repo, objective, branch, cycle_id, human_gate)
+            completed = True
+            return result
+        except BaseException:  # noqa: BLE001 - catch CancelledError/KeyboardInterrupt too
             try:
                 self.db.update_cycle(cycle_id, status="error", ended_at=_now())
                 self._emit("cycle_error", "cycle crashed", cycle_id=cycle_id, branch=branch)
             except Exception:  # noqa: BLE001 - persistence must never mask the crash
                 pass
             raise
+        finally:
+            # On any non-success exit (crash, cancel, kill), roll the working
+            # tree back to main and delete the orphaned cycle branch so the
+            # repo is never left on a stale improve/... branch.
+            if not completed:
+                self._cleanup_failed_branch(repo, branch)
+
+    def _reap_orphan_running_cycles(self) -> None:
+        """Mark every still-`running` cycle as `error`.
+
+        Only one cycle runs at a time, so any pre-existing `running` row is an
+        orphan from a crashed/killed run. Best-effort: persistence errors here
+        must not block the new cycle.
+        """
+        try:
+            for row in self.db.list_cycles(status="running"):
+                self.db.update_cycle(row["id"], status="error", ended_at=_now())
+                self._emit("cycle_error", "orphaned running cycle reaped", cycle_id=row["id"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _cleanup_failed_branch(self, repo: GitRepo, branch: str) -> None:
+        """Best-effort: return to ``main`` and delete a failed cycle's branch."""
+        try:
+            if repo.current_branch() != "main":
+                repo.checkout("main")
+            if repo.branch_exists(branch):
+                repo.delete_branch(branch, force=True)
+        except Exception:  # noqa: BLE001 - cleanup must never mask the original error
+            pass
 
     async def _run_impl(
         self,
@@ -459,7 +512,7 @@ class CycleEngine:
             while step_no < self.max_steps:
                 gate_passed = False
                 pending_propose = False
-                for _ in range(self.max_step_attempts):
+                for _ in range(self.max_gate_attempts):
                     step_no += 1
                     state["propose_complete"] = False
                     task = objective if not feedback else f"{objective}\n\n[feedback]\n{feedback}"
@@ -717,7 +770,7 @@ class CycleEngine:
             gate = await self.governance.gate()
             emit("gate", gate.describe(), passed=gate.passed)
             if not gate.passed:
-                if round_no >= self.max_step_attempts:
+                if round_no >= self.max_gate_attempts:
                     self.db.add_step(cycle_id, round_no, None, "failed-gate", gate.describe()[:500])
                     self.db.update_cycle(cycle_id, status="failed-gate", ended_at=_now())
                     emit("cycle_error", "gate could not be satisfied", feedback=gate.describe()[:2000])

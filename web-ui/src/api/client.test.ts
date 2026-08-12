@@ -172,3 +172,72 @@ describe("api.usage", () => {
     expect(result.totals.total_tokens).toBe(150);
   });
 });
+
+describe("api.projects", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function mockFetch(routes: Record<string, (body: any) => unknown>) {
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      for (const key of Object.keys(routes)) {
+        const [m, path] = key.split(" ");
+        if (method === m && url === path) {
+          return Promise.resolve(
+            new Response(JSON.stringify(routes[key](body)), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          ) as never;
+        }
+      }
+      return Promise.resolve(new Response("not found", { status: 404 })) as never;
+    }) as never;
+  }
+
+  it("lists projects via GET /api/projects", async () => {
+    const projects = [{ id: "p1", name: "Nelke", stage: "idea", chat_count: 0 }];
+    mockFetch({ "GET /api/projects": () => projects });
+    const result = await api.projectsList();
+    expect(result).toHaveLength(1);
+    expect(result[0].name).toBe("Nelke");
+  });
+
+  it("creates a project via POST with name/description/stage", async () => {
+    let captured: any = null;
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      captured = { url: String(input), method: init?.method, body: JSON.parse(String(init?.body ?? "{}")) };
+      return Promise.resolve(
+        new Response(JSON.stringify({ id: "p1", name: "Nelke" }), {
+          status: 200, headers: { "content-type": "application/json" },
+        }),
+      ) as never;
+    }) as never;
+
+    const result = await api.createProject("Nelke", { description: "agent", stage: "idea" });
+    expect(captured.url).toBe("/api/projects");
+    expect(captured.method).toBe("POST");
+    expect(captured.body).toEqual({ name: "Nelke", description: "agent", stage: "idea" });
+    expect(result.id).toBe("p1");
+  });
+
+  it("links a chat via POST /api/projects/:id/chats/:chatId", async () => {
+    let requestedUrl = "";
+    mockFetch({
+      "POST /api/projects/p1/chats/c1": () => {
+        requestedUrl = "/api/projects/p1/chats/c1";
+        return { ok: true };
+      },
+    });
+    const result = await api.linkChat("p1", "c1");
+    expect(requestedUrl).toBe("/api/projects/p1/chats/c1");
+    expect(result.ok).toBe(true);
+  });
+});

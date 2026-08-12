@@ -1,20 +1,26 @@
 """Governance: the self-improvement gates.
 
-Intermediate commit gate  = lint + typecheck + tests all pass (tests mandatory,
-non-empty). Rollback gate = post-commit boot check. All commands run against the
-Nelke repo via the project venv (``uv run``); missing optional tools degrade to a
-reported skip so the gate is never a permanent blocker, while tests stay enforced.
+Intermediate commit gate = lint + typecheck + test-gap + tests all pass (tests
+mandatory, non-empty; the test-gap step rejects src changes that ship without a
+matching test file). Rollback gate = post-commit boot check. All commands run
+against the Nelke repo via the project venv (``uv run``); missing optional tools
+degrade to a reported skip so the gate is never a permanent blocker, while tests
+stay enforced.
 """
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from nelke.core.gitops import GitRepo
 
 GOVERNANCE_TIMEOUT = 900
 BOOT_CHECK_TIMEOUT = 180
+
+# src modules that don't need a dedicated test file (boilerplate/entrypoints).
+_NO_TEST_SRC = {"__init__.py", "__main__.py", "conftest.py"}
 
 
 @dataclass
@@ -61,9 +67,18 @@ class CommandRunner:
 
 
 class Governance:
-    def __init__(self, repo: GitRepo, runner: CommandRunner | None = None) -> None:
+    def __init__(
+        self,
+        repo: GitRepo,
+        runner: CommandRunner | None = None,
+        *,
+        require_tests: bool = True,
+    ) -> None:
         self.repo = repo
         self.runner = runner or CommandRunner()
+        # When True the gate rejects src changes that ship without a matching
+        # tests/test_<module>.py, so the cycle's agent cannot skip test-writing.
+        self.require_tests = require_tests
 
     def _base_cmd(self, tool_cmd: list[str]) -> list[str]:
         return ["uv", "run", *tool_cmd]
@@ -93,14 +108,52 @@ class Governance:
             "tests", self._base_cmd(["pytest", "-q"]), timeout=GOVERNANCE_TIMEOUT
         )
 
+    async def run_code_test_gap(self) -> CheckResult:
+        """Reject src changes without a matching ``tests/test_<module>.py``.
+
+        Forces the cycle's agent to write tests for new code. A src file is
+        "changed" when it is modified, staged, or newly added in the working
+        tree (``git status --porcelain``). Each changed ``src/**/*.py`` must
+        have a corresponding test file; the test may be pre-existing (subsequent
+        edits to an already-covered module don't need a fresh test touch), but a
+        brand-new module without a test fails the gate. ``__init__`` / ``__main__``
+        / ``conftest`` are exempt. Degrades to ``skipped`` when git is unavailable
+        or no code changed, so this check can never become a false blocker.
+        """
+        if not self.require_tests:
+            return CheckResult(
+                "test-gap", ok=True, skipped=True, message="test-coverage enforcement disabled"
+            )
+        paths = self.repo.changed_paths()
+        if not paths:
+            return CheckResult(
+                "test-gap", ok=True, skipped=True,
+                message="no changed paths (or not a git repo)",
+            )
+        src = [
+            p for p in paths
+            if p.startswith("src/") and p.endswith(".py") and Path(p).name not in _NO_TEST_SRC
+        ]
+        if not src:
+            return CheckResult("test-gap", ok=True, skipped=True, message="no code changes to test")
+        missing = []
+        for path in src:
+            expected = self.repo.repo / "tests" / f"test_{Path(path).stem}.py"
+            if not expected.exists():
+                missing.append(f"{path} -> tests/test_{Path(path).stem}.py")
+        if missing:
+            msg = "new/changed code lacks a matching test: " + "; ".join(missing)
+            return CheckResult("test-gap", ok=False, message=msg)
+        return CheckResult("test-gap", ok=True, message="all changed code has matching tests")
+
     async def boot_check(self) -> CheckResult:
         cmd = self._base_cmd(["python", "-c", "import nelke; nelke.boot_check()"])
         return await self._check("boot-check", cmd, timeout=BOOT_CHECK_TIMEOUT)
 
     async def gate(self) -> GateResult:
-        """Run lint -> typecheck -> tests, failing fast on the first hard failure."""
+        """Lint -> typecheck -> test-gap -> tests, failing fast on a hard failure."""
         checks: list[CheckResult] = []
-        for fn in (self.run_lint, self.run_typecheck, self.run_tests):
+        for fn in (self.run_lint, self.run_typecheck, self.run_code_test_gap, self.run_tests):
             result = await fn()
             checks.append(result)
             if not result.ok and not result.skipped:

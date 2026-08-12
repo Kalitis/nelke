@@ -7,6 +7,12 @@
 # deterministic sampling.
 # NELKE_AGENT_TEMPERATURE=1.0
 
+# Self-improvement cycle knobs (environment, not TOML):
+#   NELKE_MAX_GATE_ATTEMPTS=5   how many times a cycle sends the agent back to
+#                               fix gate failures before giving up
+#   NELKE_REQUIRE_CODE_TESTS=true  reject src changes without matching tests
+#   NELKE_MAX_STEP_ATTEMPTS=3   lower-level retry budget (boot/review rounds)
+
 [profiles.openai]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"

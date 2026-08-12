@@ -1,11 +1,11 @@
 """Textual TUI frontend — a thin I/O adapter over the Nelke core.
 
 Tabs: Chat (streaming + multi-turn), Improve (live cycle events + review
-modal), Memory (file list + recall). Agent/cycle work runs inside Textual
-workers; streaming callbacks and cycle events are marshalled back onto the UI
-loop via ``call_from_thread`` so the app never blocks. The review modal is an
-async ``ModalScreen``: ``CycleEngine``'s awaitable ``human_approve`` gate
-``await``s it directly.
+modal), Memory (file list + recall), Projects (list + inspect). Agent/cycle
+work runs inside Textual workers; streaming callbacks and cycle events are
+marshalled back onto the UI loop via ``call_from_thread`` so the app never
+blocks. The review modal is an async ``ModalScreen``: ``CycleEngine``'s
+awaitable ``human_approve`` gate ``await``s it directly.
 """
 
 from __future__ import annotations
@@ -211,6 +211,12 @@ class NelkeTUI(App):
     #chat-new { margin-right: 1; }
     #cycle-list { height: 8; border: $border; margin-bottom: 1; }
     #cycle-detail { height: 1fr; }
+    #project-list { height: 1fr; border: $border; }
+    #project-detail { height: 1fr; }
+    .project-card { border: $border; padding: 1 2; margin: 0 0 1 0; height: auto; }
+    .project-card-title { text-style: bold; }
+    .project-card-meta { color: $text-muted; }
+    .project-detail-text { height: 1fr; }
     """
 
     BINDINGS = [
@@ -225,6 +231,8 @@ class NelkeTUI(App):
         self._active_chat: str | None = None
         self._chat_ids: list[str] = []
         self._cycle_ids: list[str] = []
+        self._project_ids: list[str] = []
+        self._active_project: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -254,6 +262,17 @@ class NelkeTUI(App):
                 yield ListView(id="memory-list")
                 yield Input(id="recall-input", placeholder="Recall query… (Enter)")
                 yield RichLog(id="memory-detail", markup=True)
+            with TabPane("Projects", id="projects-tab"):
+                yield Horizontal(
+                    Button("+ New project", id="project-new", variant="primary"),
+                    Button("Refresh", id="project-refresh"),
+                    classes="tab-actions",
+                )
+                yield Input(id="project-input", placeholder="Project name for new project (Enter)")
+                with Horizontal(classes="chat-split"):
+                    yield ListView(id="project-list")
+                    with Vertical(classes="chat-main"):
+                        yield RichLog(id="project-detail", markup=True, classes="project-detail-text")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -261,6 +280,7 @@ class NelkeTUI(App):
         self._refresh_memory()
         self._refresh_chats()
         self._refresh_cycles()
+        self._refresh_projects()
 
     # ---- helpers ------------------------------------------------------------
     def _ui(self, fn: Any, *args: Any, **kwargs: Any) -> None:
@@ -563,6 +583,92 @@ class NelkeTUI(App):
             log.write(f"[red]{exc}[/]")
             return
         log.write(content)
+
+    # ---- Projects -----------------------------------------------------------
+    def _repo(self) -> Any:
+        return self.state.repo_path or services.find_repo(self.state.settings)
+
+    def _refresh_projects(self, select_id: str | None = None) -> None:
+        try:
+            projects = services.list_projects(self.state.settings)
+        except Exception:  # noqa: BLE001 - project list is best-effort
+            return
+        lv = self.query_one("#project-list", ListView)
+        lv.clear()
+        self._project_ids = []
+        for p in projects:
+            self._project_ids.append(p["id"])
+            stage = p.get("stage") or ""
+            badge = f"  [{stage}]" if stage else ""
+            lv.append(
+                ListItem(Static(f"[b]{p['name']}[/]{badge}  ({p['chat_count']} chats)"))
+            )
+        if select_id and select_id in self._project_ids:
+            lv.index = self._project_ids.index(select_id)
+
+    @on(Button.Pressed, "#project-new")
+    def _on_project_new(self) -> None:
+        self.query_one("#project-input", Input).focus()
+
+    @on(Input.Submitted, "#project-input")
+    def _on_project_submit(self, event: Input.Submitted) -> None:
+        name = event.value.strip()
+        if not name:
+            return
+        event.input.value = ""
+        try:
+            pid = services.create_project(self.state.settings, name=name, repo=self._repo())
+        except Exception as exc:  # noqa: BLE001
+            log = self._query_one_log("project-detail")
+            log.write(f"[bold red]error:[/] {exc}")
+            return
+        self._refresh_projects(select_id=pid)
+        self._show_project_detail(pid)
+
+    @on(Button.Pressed, "#project-refresh")
+    def _on_project_refresh(self) -> None:
+        self._refresh_projects(select_id=self._active_project)
+
+    @on(ListView.Selected, "#project-list")
+    def _on_project_select(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is None or not (0 <= idx < len(self._project_ids)):
+            return
+        self._active_project = self._project_ids[idx]
+        self._show_project_detail(self._active_project)
+
+    def _show_project_detail(self, project_id: str) -> None:
+        log = self._query_one_log("project-detail")
+        log.clear()
+        project = services.get_project(self.state.settings, project_id, repo=self._repo())
+        if project is None:
+            log.write("[bold red]project not found[/]")
+            return
+        stage = project.get("stage") or ""
+        stage_tag = f"  [reverse]{stage}[/]" if stage else "  [dim](no stage)[/]"
+        log.write(f"[bold]{project['name']}[/]{stage_tag}  [dim]{project['id']}[/]")
+        log.write(f"[dim]created {project['created_at']} · updated {project['updated_at']}[/]")
+        if project.get("description"):
+            log.write(f"description: {project['description']}")
+        else:
+            log.write("[dim](no description)[/]")
+        mem = project.get("memory_files") or []
+        log.write(f"[bold]{len(mem)} memory note{'s' if len(mem) != 1 else ''}[/]")
+        for m in mem[:20]:
+            log.write(f"[dim]·[/] {m['name']} ({m['size']} B)")
+        if len(mem) > 20:
+            log.write(f"[dim]… and {len(mem) - 20} more[/]")
+        if not mem:
+            log.write("[dim](no memory yet)[/]")
+        chats = project.get("chats") or []
+        log.write(f"[bold]{len(chats)} chat{'s' if len(chats) != 1 else ''}[/]")
+        for c in chats[:20]:
+            count = c.get("message_count", 0)
+            log.write(
+                f"[dim]·[/] [{_short_frontend(c['frontend'])}] {str(c['id'])[-8:]} ({count} msgs)"
+            )
+        if len(chats) > 20:
+            log.write(f"[dim]… and {len(chats) - 20} more[/]")
 
     # ---- helpers ------------------------------------------------------------
     def _query_one_log(self, widget_id: str) -> RichLog:

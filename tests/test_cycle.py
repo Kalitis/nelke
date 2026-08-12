@@ -521,6 +521,68 @@ async def test_parallel_cycle_gate_failure_then_rework_succeeds(tmp_repo, db):
     assert "GOOD" in (tmp_repo.repo / "memory" / "facts" / "pw.md").read_text()
 
 
+async def test_parallel_cycle_reprompts_explore_only_workers(tmp_repo, db):
+    """Workers that only explore (no edits) must be re-prompted to implement
+    instead of the cycle dying immediately with `no-changes`.
+
+    Regression for the observed failure where both workers burned their whole
+    budget on read/grep/glob, returned empty answers, and the engine declared
+    `no-changes` without ever asking them to write code.
+    """
+    events: list[str] = []
+
+    def worker(m, t):
+        # Round 1: pure exploration, no edit. Once the engine re-prompts with
+        # the `no_progress` feedback, actually write the file.
+        task_text = m[-1]["content"] if isinstance(m[-1].get("content"), str) else ""
+        if "No worker edited any files" in task_text:
+            return tool_response(
+                "self_write",
+                {"path": "memory/facts/explored.md", "content": "# Explored\ndone"},
+            )
+        return final_response("exploring the codebase...")
+
+    llm = driver_fake(
+        worker=worker,
+        planner=planner_returning([{"title": "only", "detail": "do it"}]),
+    )
+    engine = _engine(
+        tmp_repo, db, FakeGovernance(), llm,
+        mode="parallel", max_workers=2, max_step_attempts=3,
+        on_event=lambda e: events.append(e.kind),
+    )
+    result = await engine.run("improve a thing")
+    # The cycle recovered: it re-prompted the workers and merged the result.
+    assert result.merged
+    assert (tmp_repo.repo / "memory" / "facts" / "explored.md").exists()
+    assert "no_progress" in events
+    assert db.get_cycle(result.cycle_id)["status"] == "merged"
+
+
+async def test_parallel_cycle_gives_up_no_changes_after_retries(tmp_repo, db):
+    """A re-prompted worker that STILL refuses to edit eventually becomes
+    `no-changes` (bounded retries, not an infinite loop)."""
+    events: list[str] = []
+
+    def worker(m, t):
+        # Always only explore; never write a file.
+        return final_response("still exploring...")
+
+    llm = driver_fake(
+        worker=worker,
+        planner=planner_returning([{"title": "only", "detail": "do it"}]),
+    )
+    engine = _engine(
+        tmp_repo, db, FakeGovernance(), llm,
+        mode="parallel", max_workers=2, max_step_attempts=2,
+        on_event=lambda e: events.append(e.kind),
+    )
+    result = await engine.run("improve a thing")
+    assert result.status == "no-changes"
+    assert events.count("no_progress") == 2
+    assert db.get_cycle(result.cycle_id)["status"] == "no-changes"
+
+
 async def test_cycle_crash_cleans_up_branch_and_marks_error(tmp_repo, db):
     """A crashing/killed cycle must mark itself error and delete its branch."""
     from conftest import FakeLLM

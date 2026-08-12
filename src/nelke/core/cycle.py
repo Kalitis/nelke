@@ -719,6 +719,12 @@ class CycleEngine:
         verdict: ReviewVerdict | None = None
         committed_any = False
         round_no = 0
+        # Consecutive rounds in which NO worker produced any changes. A worker
+        # that burns its whole budget on exploration (read/grep/glob) and never
+        # edits must be re-prompted to actually implement, not immediately sunk
+        # as a dead `no-changes` cycle. We retry a bounded number of times,
+        # then give up.
+        no_progress_rounds = 0
 
         while True:
             round_no += 1
@@ -759,6 +765,28 @@ class CycleEngine:
             # earlier rounds, the cycle has nothing to commit.
             if not repo.has_changes():
                 if not had_changes_before:
+                    # Give the workers a bounded chance to turn their exploration
+                    # into actual edits before declaring the cycle dead. See
+                    # `no_progress_rounds` above.
+                    if no_progress_rounds < self.max_step_attempts:
+                        no_progress_rounds += 1
+                        feedback = (
+                            "No worker edited any files in the previous round — you only "
+                            "explored the codebase. Exploration alone is not a result. "
+                            "You MUST make concrete edits to the repo (add the module, "
+                            "wire the service/API/UI, and add matching tests) that move "
+                            "toward your assigned task. Do not distribute more exploration: "
+                            "write code now."
+                        )
+                        emit(
+                            "no_progress",
+                            "workers made no changes; re-prompting to implement "
+                            f"({no_progress_rounds}/{self.max_step_attempts})",
+                            round=round_no,
+                            attempts=no_progress_rounds,
+                            limit=self.max_step_attempts,
+                        )
+                        continue
                     self.db.update_cycle(cycle_id, status="no-changes", ended_at=_now())
                     emit("cycle_error", "no changes produced by any worker")
                     return self._result(cycle_id, objective, branch, "no-changes",

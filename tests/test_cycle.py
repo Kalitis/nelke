@@ -248,9 +248,11 @@ async def test_cycle_records_progress_events(tmp_repo, db):
     # lifecycle + worker tool activity are all recorded
     assert {"cycle_start", "step_start", "gate", "commit", "step_ok", "merged"} <= kinds
     assert "agent_tool" in kinds
-    # the cycle-worker streams its tokens (stream=True) -> agent_token events
-    # are emitted, giving the web/TUI/CLI a live view of the agent's reply.
-    assert "agent_token" in kinds
+    # tokens are streamed live (not persisted per-token); one `agent_text` row
+    # is persisted per finished turn, so the worker's prose is captured without
+    # blowing up the DB on multi-million-token runs.
+    assert "agent_text" in kinds
+    assert "agent_token" not in kinds
     # per-call usage is emitted + persisted to usage_events in real time
     assert "usage" in kinds
     usage_events = db.list_usage(cycle_id=result.cycle_id)

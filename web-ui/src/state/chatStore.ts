@@ -7,6 +7,7 @@ import type {
   MessageTree,
   Profile,
   StreamEvent,
+  UsageTotals,
 } from "@/state/types";
 import { activePath, appendOptimistic, findActiveLeaf, removeOptimistic } from "@/lib/tree";
 import { pathToRoot } from "@/lib/tree";
@@ -24,6 +25,11 @@ interface ChatState {
   // id of the optimistic user message inserted before a turn; rolled back on
   // error and replaced by the canonical tree on the `done` event.
   optimisticMessageId: string | null;
+  // token usage for the active chat: persisted baseline (from the DB, loaded
+  // on chat select) plus every turn streamed in this session.
+  usage: UsageTotals;
+  // per-call usage of the in-flight turn, folded into `usage` on `done`.
+  liveUsage: UsageTotals;
   error: string | null;
 
   loadProfiles: () => Promise<void>;
@@ -51,6 +57,15 @@ function emptyTree(): MessageTree {
   return { root_id: null, nodes: {}, children: {} };
 }
 
+export const ZERO_USAGE: UsageTotals = {
+  prompt_tokens: 0,
+  completion_tokens: 0,
+  total_tokens: 0,
+  cache_read_tokens: 0,
+  cache_read_pct: 0,
+  calls: 0,
+};
+
 export const useChatStore = create<ChatState>((set, get) => ({
   chats: [],
   activeChatId: null,
@@ -60,6 +75,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   streaming: false,
   streamBuffer: { content: "", tools: [] },
   optimisticMessageId: null,
+  usage: { ...ZERO_USAGE },
+  liveUsage: { ...ZERO_USAGE },
   error: null,
 
   loadProfiles: async () => {
@@ -91,10 +108,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   selectChat: async (id) => {
-    set({ activeChatId: id, error: null, streamBuffer: { content: "", tools: [] }, optimisticMessageId: null });
+    set({
+      activeChatId: id,
+      error: null,
+      streamBuffer: { content: "", tools: [] },
+      optimisticMessageId: null,
+      liveUsage: { ...ZERO_USAGE },
+    });
     try {
-      const chat = await api.getChat(id);
-      set({ chat });
+      const [chat, usage] = await Promise.all([api.getChat(id), api.usage(id)]);
+      set({ chat, usage: usage.totals });
     } catch (err) {
       set({ error: String(err), chat: null });
     }
@@ -253,7 +276,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
 // ---- streaming helper ----------------------------------------------------
 
-function makeHandlers(
+export function makeHandlers(
   set: (partial: Partial<ChatState>) => void,
 ): { onEvent: (ev: StreamEvent) => void; onError: (err: Error) => void } {
   return {
@@ -283,18 +306,60 @@ function makeHandlers(
             },
           });
           break;
+        case "usage": {
+          const live = useChatStore.getState().liveUsage;
+          const d = ev.data;
+          set({
+            liveUsage: {
+              prompt_tokens: live.prompt_tokens + (d.prompt_tokens ?? 0),
+              completion_tokens: live.completion_tokens + (d.completion_tokens ?? 0),
+              total_tokens: live.total_tokens + (d.total_tokens ?? 0),
+              cache_read_tokens: live.cache_read_tokens + (d.cache_read_tokens ?? 0),
+              cache_read_pct: live.cache_read_pct,
+              calls: live.calls + 1,
+            },
+          });
+          break;
+        }
         case "error":
           set({ error: ev.data.message, streaming: false });
           rollbackOptimistic();
           break;
-        case "done":
+        case "done": {
+          // Fold the turn's usage into the chat total. `done` can carry the
+          // run aggregate; fall back to the per-call events summed so far.
+          const st = useChatStore.getState();
+          const agg = ev.data.usage;
+          const turn: UsageTotals =
+            agg && agg.total_tokens
+              ? {
+                  prompt_tokens: agg.prompt_tokens ?? 0,
+                  completion_tokens: agg.completion_tokens ?? 0,
+                  total_tokens: agg.total_tokens,
+                  cache_read_tokens: agg.cache_read_tokens ?? 0,
+                  cache_read_pct: agg.cache_read_pct ?? 0,
+                  calls: st.liveUsage.calls || 1,
+                }
+              : st.liveUsage;
+          set({
+            usage: {
+              prompt_tokens: st.usage.prompt_tokens + turn.prompt_tokens,
+              completion_tokens: st.usage.completion_tokens + turn.completion_tokens,
+              total_tokens: st.usage.total_tokens + turn.total_tokens,
+              cache_read_tokens: st.usage.cache_read_tokens + turn.cache_read_tokens,
+              cache_read_pct: st.usage.cache_read_pct,
+              calls: st.usage.calls + turn.calls,
+            },
+            liveUsage: { ...ZERO_USAGE },
+            optimisticMessageId: null,
+          });
           // Server has persisted the new messages; refresh the canonical view.
           // The reload replaces the optimistic node with the canonical user
           // message (different id), so clear the marker.
-          set({ optimisticMessageId: null });
           void useChatStore.getState().selectChat(useChatStore.getState().activeChatId!);
           void useChatStore.getState().loadChats();
           break;
+        }
         default:
           break;
       }

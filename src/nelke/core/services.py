@@ -479,10 +479,17 @@ def create_chat(
 
 def list_chats(
     settings: Settings | None = None,
-    frontend: str = "web",
+    frontend: str | None = None,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
-    """Recent chat sessions for a frontend, newest activity first."""
+    """Recent chat sessions, newest activity first.
+
+    A chat is a single frontend-agnostic conversation: a session started in
+    one frontend (web/TUI/Telegram) is resumable from any other, so by default
+    every chat across frontends is listed. ``frontend`` narrows the view to
+    the sessions that specifically originated in one frontend (kept for
+    backwards-compatible per-frontend callers); ``None`` lists all of them.
+    """
     db = open_db(settings)
     out: list[dict[str, Any]] = []
     for row in db.list_sessions(frontend=frontend, limit=limit):
@@ -969,7 +976,7 @@ def get_cycle_detail(
         return None
     detail = _cycle_summary(db, row)
     events = []
-    for ev in db.list_cycle_events(cycle_id, limit=500):
+    for ev in db.list_cycle_events(cycle_id, limit=5000):
         events.append(
             {
                 "id": ev["id"], "kind": ev["kind"], "message": ev["message"],

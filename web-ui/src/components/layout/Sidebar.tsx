@@ -15,6 +15,10 @@ function formatTime(iso: string | null): string {
   return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
+function frontendLabel(frontend: string): string {
+  return ({ telegram: "tg", tui: "tui", web: "web" }[frontend] ?? frontend) || "?";
+}
+
 function ChatRow({ chat }: { chat: ChatSummary }) {
   const activeChatId = useChatStore((s) => s.activeChatId);
   const selectChat = useChatStore((s) => s.selectChat);
@@ -33,6 +37,9 @@ function ChatRow({ chat }: { chat: ChatSummary }) {
       <div className="min-w-0 flex-1">
         <div className="truncate">{chat.title || "New chat"}</div>
         <div className="truncate text-[11px] text-zinc-500">
+          <span className="rounded bg-edge px-1 text-[10px] uppercase text-zinc-500">
+            {frontendLabel(chat.frontend)}
+          </span>{" "}
           {chat.message_count} msgs · {formatTime(chat.last_message_at || chat.started_at)}
         </div>
       </div>

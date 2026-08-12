@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { parseFrame, pumpStream } from "./client";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { api, parseFrame, pumpStream } from "./client";
 import type { StreamEvent } from "@/state/types";
 
 // SSE frames as emitted by sse_starlette use CRLF ("\r\n") line endings and a
@@ -135,5 +135,40 @@ describe("pumpStream", () => {
   it("throws on a non-2xx response", async () => {
     const bad = new Response("nope", { status: 500 });
     await expect(pumpStream(bad, { onEvent: () => {} })).rejects.toThrow("HTTP 500");
+  });
+});
+
+describe("api.usage", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("requests the persisted usage for a session and returns its totals", async () => {
+    const totals = {
+      prompt_tokens: 100,
+      completion_tokens: 50,
+      total_tokens: 150,
+      cache_read_tokens: 40,
+      cache_read_pct: 26,
+      calls: 3,
+    };
+    const payload = { totals, events: [] };
+    let requestedUrl = "";
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockImplementation((url: RequestInfo | URL) => {
+      requestedUrl = String(url);
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }) as never;
+
+    const result = await api.usage("chat-123");
+    expect(requestedUrl).toBe("/api/usage?session_id=chat-123");
+    expect(result.totals.total_tokens).toBe(150);
   });
 });

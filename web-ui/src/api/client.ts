@@ -8,6 +8,7 @@ import type {
   MemoryFile,
   Profile,
   StreamEvent,
+  UsageAggregate,
 } from "@/state/types";
 
 async function json<T>(resp: Response): Promise<T> {
@@ -148,6 +149,13 @@ export const api = {
 
   async memoryFile(name: string): Promise<{ name: string; content: string }> {
     return json(await fetch(`/api/memory/${name.split("/").map(encodeURIComponent).join("/")}`));
+  },
+
+  // DB-backed token usage for a chat (totals + recent per-call events).
+  async usage(sessionId: string): Promise<UsageAggregate> {
+    return json(
+      await fetch(`/api/usage?session_id=${encodeURIComponent(sessionId)}`),
+    );
   },
 };
 

@@ -100,15 +100,21 @@ cd web-ui && npm run typecheck && npm test
 
 ### Chats and cycles history
 
-Both the web and TUI frontends manage **multiple named chats**: each chat keeps
-its own persisted transcript (in SQLite `sessions`/`messages`, including tool
-calls) and its own per-chat memory store under `memory/chats/<session_id>/`.
-Opening a chat reloads its history so conversations continue across restarts.
-The Telegram bot does the same: each Telegram chat keeps a persistent session
-(typing a message — or `/chat <text>` — continues the conversation; `/new`
-starts a fresh chat, `/history` shows the transcript, `/chats`/`/open <id>`
-list and resume older chats). In group chats the bot only answers messages
-that mention it or reply to one of its own messages.
+Chats are shared across frontends: both the web and TUI frontends manage
+**multiple named chats**, and every chat is a single frontend-agnostic
+conversation. Each chat keeps its own persisted transcript (in SQLite
+`sessions`/`messages`, including tool calls) and its own per-chat memory store
+under `memory/chats/<session_id>/`. Opening a chat reloads its history so
+conversations continue across restarts. Because the same SQLite store backs
+web, TUI and Telegram, the chat lists in all three show **every** conversation
+(labelled with the frontend that created it: `web`/`tui`/`tg`), and any chat
+is resumable from any frontend — pick up a chat you started on the web from
+the Telegram bot with `/open <id>` (or vice versa), and the conversation
+continues exactly where you left off. The Telegram bot keeps one persistent
+session per Telegram chat by default (typing a message — or `/chat <text>` —
+continues the conversation; `/new` starts a fresh chat, `/history` shows the
+transcript, `/chats`/`/open <id>` list and resume older chats). In group chats
+the bot only answers messages that mention it or reply to one of its own messages.
 Self-improvement **cycles** live in a separate view — the web `/cycles` page
 and the TUI "Improve" tab list every cycle with its steps, timeline events and
 review links.

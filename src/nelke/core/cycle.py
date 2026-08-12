@@ -398,10 +398,22 @@ class CycleEngine:
 
         # Route agent tool activity of the cycle-worker to progress events so
         # the web card / TG / TUI can stream what the agent is actually doing.
+        # Tokens are streamed live (for the SSE/UI) but NOT persisted per-token;
+        # instead one `agent_text` row is written per finished turn via
+        # `on_worker_turn_end`, so a multi-million-token run can't blow up the DB.
+        turn_buf: list[str] = []
+
         def on_worker_token(tok: str) -> None:
             if self.on_token is not None:
                 self.on_token(tok)
-            emit("agent_token", "", token=tok)
+            turn_buf.append(tok)
+            self._emit("agent_token", "", token=tok)
+
+        def on_worker_turn_end() -> None:
+            text = "".join(turn_buf).strip()
+            turn_buf.clear()
+            if text:
+                emit("agent_text", text, text=text)
 
         def on_worker_tool(name: str, args: dict[str, Any]) -> None:
             emit("agent_tool", f"tool {name}", tool=name, args=args, step=step_no)
@@ -429,6 +441,7 @@ class CycleEngine:
                     pass
 
         agent.on_token = on_worker_token
+        agent.on_turn_end = on_worker_turn_end
         agent.on_tool = on_worker_tool
         agent.on_tool_result = on_worker_tool_result
         agent.on_usage = on_worker_usage
@@ -856,8 +869,20 @@ class CycleEngine:
         emit("worker_start", f"worker {worker_index} started",
              worker_id=worker_id, worker_index=worker_index, title=task.title)
 
+        # Tokens stream live (for SSE/UI) but are not persisted per-token; one
+        # `agent_text` row per finished turn keeps multi-million-token runs from
+        # blowing up the DB.
+        turn_buf: list[str] = []
+
         def on_worker_token(tok: str) -> None:
-            emit("agent_token", tok, worker_id=worker_id, token=tok)
+            turn_buf.append(tok)
+            self._emit("agent_token", tok, worker_id=worker_id, token=tok)
+
+        def on_worker_turn_end() -> None:
+            text = "".join(turn_buf).strip()
+            turn_buf.clear()
+            if text:
+                emit("agent_text", text, worker_id=worker_id, text=text)
 
         def on_worker_tool(name: str, args: dict[str, Any]) -> None:
             try:
@@ -886,6 +911,7 @@ class CycleEngine:
             ctx, memory, worker_id, task,
             on_token=on_worker_token, on_usage=on_worker_usage,
         )
+        agent.on_turn_end = on_worker_turn_end
         agent.on_tool = on_worker_tool
         agent.on_tool_result = on_worker_tool_result
 

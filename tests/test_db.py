@@ -25,6 +25,9 @@ def test_migrate_creates_all_tables(tmp_path):
         "usage_events",
         "cycle_events",
         "projects",
+        "kanban_boards",
+        "kanban_columns",
+        "kanban_cards",
     }
     assert expected <= tables
 
@@ -185,3 +188,127 @@ def test_set_session_project_rejects_unknown(tmp_path):
     assert db.set_session_project(sid, "nope") is False
     # unknown session also rejected
     assert db.set_session_project("ghost", None) is False
+
+
+# ---- kanban ---------------------------------------------------------------
+
+def test_kanban_board_columns_cards_roundtrip(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    pid = db.create_project("P")
+    bid = db.create_board(pid, "Sprint", columns=["Backlog", "Done"])
+    board = db.get_board(bid)
+    assert board["name"] == "Sprint"
+    assert board["project_id"] == pid
+
+    cols = db.list_columns(bid)
+    assert [c["name"] for c in cols] == ["Backlog", "Done"]
+    assert [c["position"] for c in cols] == [0, 1]
+
+    # add a card to the first column
+    cid = cols[0]["id"]
+    card = db.add_card(bid, cid, title="Write docs", description="d")
+    assert db.get_card(card)["title"] == "Write docs"
+    assert db.get_card(card)["position"] == 0
+
+    # listing carries counts
+    boards = db.list_boards(pid)
+    assert len(boards) == 1
+    assert boards[0]["column_count"] == 2
+    assert boards[0]["card_count"] == 1
+
+    # status reflects the kanban tables
+    status = db.status()
+    assert status["kanban_boards"] == 1
+    assert status["kanban_columns"] == 2
+    assert status["kanban_cards"] == 1
+
+
+def test_kanban_move_and_reorder(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    pid = db.create_project("P")
+    bid = db.create_board(pid, "B", columns=["A", "B"])
+    cols = {c["name"]: c["id"] for c in db.list_columns(bid)}
+
+    k1 = db.add_card(bid, cols["A"], "one")
+    k2 = db.add_card(bid, cols["A"], "two")
+    # positions auto-assigned in order
+    assert db.get_card(k1)["position"] == 0
+    assert db.get_card(k2)["position"] == 1
+
+    # move k1 into column B
+    assert db.move_card(k1, cols["B"])
+    assert db.get_card(k1)["column_id"] == cols["B"]
+    assert db.get_card(k1)["position"] == 0  # appended at end of B
+
+    # explicit position update
+    assert db.update_card(k2, position=5)
+    assert db.get_card(k2)["position"] == 5
+
+    # list_cards filtered by column
+    col_a = db.list_cards(bid, column_id=cols["A"])
+    assert [c["title"] for c in col_a] == ["two"]
+
+    # unknown targets rejected
+    assert db.move_card("ghost", cols["B"]) is False
+    assert db.move_card(k2, "ghost") is False
+
+
+def test_kanban_column_position_defaults_end(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    pid = db.create_project("P")
+    bid = db.create_board(pid, "B")
+    a = db.add_column(bid, "A")
+    b = db.add_column(bid, "B")
+    assert db.get_column(a)["position"] == 0
+    assert db.get_column(b)["position"] == 1
+    # insertion explicitly at a specific position
+    db.add_column(bid, "C", position=0)
+    positions = [c["name"] for c in db.list_columns(bid)]
+    assert positions == ["C", "A", "B"]
+
+
+def test_kanban_delete_cascades(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    pid = db.create_project("P")
+    bid = db.create_board(pid, "B", columns=["A"])
+    col = db.list_columns(bid)[0]
+    db.add_card(bid, col["id"], "card")
+
+    # deleting a column removes its cards
+    assert db.delete_column(col["id"])
+    assert db.get_column(col["id"]) is None
+    assert db.status()["kanban_cards"] == 0
+
+    # deleting a board removes its columns
+    assert db.delete_board(bid)
+    assert db.get_board(bid) is None
+    assert db.status()["kanban_columns"] == 0
+    assert db.status()["kanban_boards"] == 0
+
+    # deleting an unknown board returns False
+    assert db.delete_board("ghost") is False
+
+
+def test_kanban_create_board_rejects_unknown_project(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    import pytest
+
+    with pytest.raises(ValueError):
+        db.create_board("ghost", "B")
+
+
+def test_kanban_update_card_and_delete_card(tmp_path):
+    db = Database(tmp_path / "nelke.db")
+    pid = db.create_project("P")
+    bid = db.create_board(pid, "B", columns=["A"])
+    col = db.list_columns(bid)[0]
+    card = db.add_card(bid, col["id"], "t")
+
+    assert db.update_card(card, title="new", description="d")
+    assert db.get_card(card)["title"] == "new"
+    assert db.get_card(card)["description"] == "d"
+    assert db.update_card("ghost") is False
+
+    assert db.delete_card(card)
+    assert db.get_card(card) is None
+    assert db.delete_card("ghost") is False

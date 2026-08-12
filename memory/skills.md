@@ -32,3 +32,5 @@ Related: [Зачем существует N4 — Нова и REBIRTH](chats/unkn
 Related: [ML Sandbox (WSL)](facts/ml-sandbox-wsl.md)
 
 Related: [Оценка двух подходов к долговременной памяти (steering vs merging) — 2026-08-12](chats/20260812093926-ff525969/cycles/notes.md)
+
+Related: [N4 / Nachtschatten — долговременная память: прототипы steering / merging / associative](chats/20260812093926-ff525969/cycles/nachtschatten-memory-prototypes.md)

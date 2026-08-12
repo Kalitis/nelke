@@ -346,9 +346,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
         return EventSourceResponse(stream())
 
     # ---- chats (multiple conversations, each with history + memory) --------
+    # Chats are shared across all frontends (web/TUI/Telegram): a conversation
+    # started anywhere is listed and resumable here, and vice versa.
     @app.get("/api/chats")
     async def api_chats() -> list[dict[str, Any]]:
-        return services.list_chats(state.settings, frontend="web")
+        return services.list_chats(state.settings)
 
     @app.post("/api/chats")
     async def api_create_chat(payload: dict[str, Any]) -> JSONResponse:

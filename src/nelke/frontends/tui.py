@@ -157,6 +157,13 @@ def _fmt_args(args: dict[str, Any]) -> str:
     return ", ".join(items)
 
 
+def _short_frontend(frontend: str | None) -> str:
+    """Compact origin label for a chat (which frontend created it)."""
+    return {"telegram": "tg", "tui": "tui", "web": "web"}.get(
+        str(frontend or ""), str(frontend or "?")
+    )
+
+
 def build_tui_callbacks(sink: StreamSink) -> Callbacks:
     """Wire a :class:`StreamSink` into a :class:`Callbacks` for ``run_task``."""
     return Callbacks(
@@ -298,7 +305,8 @@ class NelkeTUI(App):
 
     def _refresh_chats(self, select_id: str | None = None) -> None:
         try:
-            chats = services.list_chats(self.state.settings, frontend="tui")
+            # Every chat across frontends (web/TUI/Telegram) is resumable here.
+            chats = services.list_chats(self.state.settings)
         except Exception:  # noqa: BLE001 - chat list is best-effort
             return
         lv = self.query_one("#chat-list", ListView)
@@ -306,7 +314,7 @@ class NelkeTUI(App):
         self._chat_ids = []
         for c in chats:
             self._chat_ids.append(c["id"])
-            lv.append(ListItem(Static(f"{c['title']}  ({c['message_count']})")))
+            lv.append(ListItem(Static(f"[{_short_frontend(c['frontend'])}] {c['title']}  ({c['message_count']})")))
         if select_id and select_id in self._chat_ids:
             lv.index = self._chat_ids.index(select_id)
 

@@ -14,8 +14,13 @@ export function TopBar({ onOpenSidebar }: { onOpenSidebar: () => void }) {
   const profile = useChatStore((s) => s.profile);
   const setProfile = useChatStore((s) => s.setProfile);
   const streaming = useChatStore((s) => s.streaming);
+  const usage = useChatStore((s) => s.usage);
+  const liveUsage = useChatStore((s) => s.liveUsage);
   const navigate = useRouter((s) => s.navigate);
   const route = useRoute();
+
+  const tokens = (usage?.total_tokens ?? 0) + (liveUsage?.total_tokens ?? 0);
+  const calls = (usage?.calls ?? 0) + (liveUsage?.calls ?? 0);
 
   return (
     <header className="flex items-center gap-3 border-b border-edge bg-panel/70 px-4 py-2.5 backdrop-blur">
@@ -62,6 +67,15 @@ export function TopBar({ onOpenSidebar }: { onOpenSidebar: () => void }) {
           </option>
         ))}
       </select>
+      {route.name === "chat" && tokens > 0 && (
+        <span
+          className="whitespace-nowrap rounded-lg border border-edge bg-panel2 px-2 py-1 text-xs tabular-nums text-zinc-400"
+          title="Token usage for this chat (persisted to the database)"
+        >
+          {calls} call{calls === 1 ? "" : "s"} · {tokens.toLocaleString()} tokens
+          {streaming && ` (+${liveUsage?.total_tokens ?? 0})`}
+        </span>
+      )}
       {streaming && (
         <span className="flex items-center gap-1.5 text-xs text-accent">
           <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-accent" />

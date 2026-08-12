@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useChatStore } from "@/state/chatStore";
 import type { Message, MessageTree } from "@/state/types";
+import { toolEntriesFromMessage } from "@/lib/tools";
 import { Markdown } from "./Markdown";
 import { MessageActions } from "./MessageActions";
 import { SwipeNav } from "./SwipeNav";
@@ -37,6 +38,12 @@ export function MessageBubble({ node, tree, liveTools }: MessageBubbleProps) {
   const [editing, setEditing] = useState(false);
 
   const isUser = node.role === "user";
+  // Tool-result rows are folded into their parent assistant's collapsible tool
+  // block; rendering them standalone would dump the raw tool output into the
+  // conversation as an assistant-looking bubble.
+  if (node.role === "tool") return null;
+  const persistedTools = isUser ? [] : toolEntriesFromMessage(node, tree);
+  const tools = liveTools && liveTools.length ? liveTools : persistedTools;
 
   if (editing && isUser) {
     return (
@@ -63,10 +70,12 @@ export function MessageBubble({ node, tree, liveTools }: MessageBubbleProps) {
           </div>
           {isUser ? (
             <div className="whitespace-pre-wrap break-words text-zinc-100">{node.content}</div>
-          ) : node.content || (liveTools && liveTools.length) ? (
+          ) : node.content || tools.length ? (
             <>
               {node.content && <Markdown content={node.content} />}
-              {liveTools?.map((t, i) => <ToolCallBlock key={i} tool={t} />)}
+              {tools.map((t, i) => (
+                <ToolCallBlock key={`${node.id}-tool-${i}`} tool={t} />
+              ))}
             </>
           ) : (
             <div className="text-zinc-600">…</div>

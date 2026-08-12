@@ -118,7 +118,26 @@ export interface UsageTotals {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  cache_read_tokens: number;
+  cache_read_pct: number;
   calls: number;
+}
+
+export interface UsageEvent {
+  id: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cache_read_tokens: number;
+  cache_read_pct: number;
+  created_at: string;
+  session_id: string | null;
+  cycle_id: string | null;
+}
+
+export interface UsageAggregate {
+  totals: UsageTotals;
+  events: UsageEvent[];
 }
 
 // SSE events emitted by the chat / regenerate endpoints, plus the cycle live

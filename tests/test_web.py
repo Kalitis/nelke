@@ -271,6 +271,25 @@ def test_chats_create_list_detail_rename_delete(settings, tmp_repo):
     assert services.get_chat(settings, cid) is None
 
 
+def test_chats_list_includes_all_frontends(settings, tmp_repo):
+    """Chats started in Telegram/TUI are listed by the shared web chat list."""
+    from nelke.core import services
+
+    factory = _scripted_llm_factory([final_response("hi")])
+    client = _client(settings, tmp_repo, factory)
+    web_id = services.create_chat(settings, title="Web", frontend="web")
+    tg_id = services.create_chat(settings, title="Tg", frontend="telegram")
+    tui_id = services.create_chat(settings, title="Tui", frontend="tui")
+    with client:
+        lst = client.get("/api/chats").json()
+        by_id = {c["id"]: c for c in lst}
+        assert web_id in by_id and tg_id in by_id and tui_id in by_id
+        assert by_id[tg_id]["frontend"] == "telegram"
+        # a telegram chat is fully resumable from the web
+        det = client.get("/api/chats/" + tg_id).json()
+        assert det["id"] == tg_id and det["frontend"] == "telegram"
+
+
 def test_chat_message_in_session_persists_history(settings, tmp_repo):
     factory = _scripted_llm_factory([final_response("hello there")])
     client = _client(settings, tmp_repo, factory)

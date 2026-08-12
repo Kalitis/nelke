@@ -311,8 +311,8 @@ async def test_chats_lists_and_open_switches(settings, tmp_repo):
 
     await nelke.on_chats(fake.make_message("/chats"))
     joined = " ".join(s["text"] for s in fake.sends)
-    assert f"{sid1[-8:]} first" in joined
-    assert f"{sid3[-8:]} third" in joined
+    assert f"{sid1[-8:]} [tg] first" in joined
+    assert f"{sid3[-8:]} [tg] third" in joined
     assert "4 msgs" in joined and "2 msgs" in joined
 
     await nelke.on_open(fake.make_message(f"/open {sid1[-8:]}"), _cmd(sid1[-8:]))
@@ -324,6 +324,33 @@ async def test_open_unknown_chat(settings, tmp_repo):
     nelke, fake, state = _make_bot(settings, tmp_repo, factory)
     await nelke.on_open(fake.make_message("/open deadbeef"), _cmd("deadbeef"))
     assert any("not found" in s["text"] for s in fake.sends)
+
+
+async def test_cross_frontend_web_chat_lists_and_opens(settings, tmp_repo):
+    """A chat created on the web is listed by /chats, /open picks it up and a
+    /chat turn continues the same session (shared across frontends)."""
+    from nelke.core import services
+
+    web_id = services.create_chat(settings, title="Web sync chat", frontend="web")
+    db = services.open_db(settings)
+    db.add_message(web_id, "user", "web question")
+
+    factory = _scripted_llm_factory([final_response("from tg")])
+    nelke, fake, state = _make_bot(settings, tmp_repo, factory)
+
+    await nelke.on_chats(fake.make_message("/chats"))
+    joined = " ".join(s["text"] for s in fake.sends)
+    assert f"{web_id[-8:]} [web] Web sync chat" in joined
+
+    await nelke.on_open(fake.make_message(f"/open {web_id[-8:]}"), _cmd(web_id[-8:]))
+    assert state.current_sessions[1] == web_id
+    assert any("Opened [web] chat" in s["text"] for s in fake.sends)
+
+    await nelke.on_chat(fake.make_message("/chat continue here"), _cmd("continue here"))
+    await _wait_for(state)
+    roles = [r["role"] for r in db.list_messages(web_id)]
+    assert roles.count("user") == 2
+    assert roles.count("assistant") == 1
 
 
 # --------------------------------------------------------------------------- #

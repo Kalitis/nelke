@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useChatStore, visibleTranscript } from "./chatStore";
+import { useChatStore, makeHandlers, ZERO_USAGE, visibleTranscript } from "./chatStore";
 import type { ChatDetail } from "@/state/types";
 
 // Build a chat detail with a minimal tree: one assistant message (no parent).
@@ -72,6 +72,8 @@ describe("chatStore optimistic user message", () => {
       streaming: false,
       streamBuffer: { content: "", tools: [] },
       optimisticMessageId: null,
+      usage: { ...ZERO_USAGE },
+      liveUsage: { ...ZERO_USAGE },
       error: null,
     });
   });
@@ -118,5 +120,71 @@ describe("chatStore optimistic user message", () => {
     // The tree is back to the original single-node shape.
     const transcript = visibleTranscript(chat);
     expect(transcript.map((m) => m.id)).toEqual(["a1"]);
+  });
+});
+
+describe("chatStore token usage", () => {
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    useChatStore.setState({
+      activeChatId: "c1",
+      chat: chatFixture(),
+      usage: { ...ZERO_USAGE },
+      liveUsage: { ...ZERO_USAGE },
+      error: null,
+    });
+    // The `done` handler fires-and-forgets a chat reload; keep those fetches
+    // inert so they never hit the network in the test.
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response("{}", { status: 200, headers: { "content-type": "application/json" } }),
+    ) as never;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("accumulates per-call usage events into the live turn counter", () => {
+    const handlers = makeHandlers(useChatStore.setState);
+    handlers.onEvent({ event: "usage", data: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } });
+    handlers.onEvent({ event: "usage", data: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } });
+
+    const { usage, liveUsage } = useChatStore.getState();
+    expect(usage.total_tokens).toBe(0);
+    expect(liveUsage.total_tokens).toBe(20);
+    expect(liveUsage.calls).toBe(2);
+    expect(liveUsage.prompt_tokens).toBe(13);
+    expect(liveUsage.completion_tokens).toBe(7);
+  });
+
+  it("folds the live turn usage into the chat total on done", () => {
+    const handlers = makeHandlers(useChatStore.setState);
+    handlers.onEvent({ event: "usage", data: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } });
+    // `done` without an aggregate falls back to the accumulated turn usage.
+    handlers.onEvent({ event: "done", data: { answer: "ok", usage: {}, chat_id: "c1" } });
+
+    const { usage, liveUsage } = useChatStore.getState();
+    expect(usage.total_tokens).toBe(15);
+    expect(usage.calls).toBe(1);
+    expect(liveUsage.total_tokens).toBe(0);
+  });
+
+  it("prefers the done aggregate over the accumulated turn usage", () => {
+    const handlers = makeHandlers(useChatStore.setState);
+    handlers.onEvent({ event: "usage", data: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } });
+    handlers.onEvent({
+      event: "done",
+      data: {
+        answer: "ok",
+        usage: { prompt_tokens: 90, completion_tokens: 50, total_tokens: 140 },
+        chat_id: "c1",
+      },
+    });
+
+    const { usage } = useChatStore.getState();
+    expect(usage.total_tokens).toBe(140);
+    expect(usage.calls).toBe(1);
   });
 });

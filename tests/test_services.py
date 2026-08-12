@@ -345,6 +345,25 @@ def test_list_chats_orders_by_activity_and_derives_title(settings):
     assert any(c["id"] == a and c["message_count"] == 1 for c in chats)
 
 
+def test_list_chats_default_lists_every_frontend(settings, tmp_repo):
+    web = services.create_chat(settings, title="Web chat", frontend="web")
+    tui = services.create_chat(settings, title="TUI chat", frontend="tui")
+    tg = services.create_chat(settings, title="TG chat", frontend="telegram")
+    # default view = all chats, shared across frontends (web/TUI/Telegram)
+    all_chats = services.list_chats(settings)
+    ids = {c["id"] for c in all_chats}
+    assert {web, tui, tg} <= ids
+    by_id = {c["id"]: c for c in all_chats}
+    assert by_id[web]["frontend"] == "web"
+    assert by_id[tui]["frontend"] == "tui"
+    assert by_id[tg]["frontend"] == "telegram"
+    # per-frontend filter is still available for backwards compatibility
+    web_only = services.list_chats(settings, frontend="web")
+    assert web_only and all(c["frontend"] == "web" for c in web_only)
+    assert web in {c["id"] for c in web_only}
+    assert tg not in {c["id"] for c in web_only}
+
+
 def _chat_llm_factory(responses):
     """llm_factory that records every messages list it sees, for continuity checks."""
     seen: list[list[str]] = []

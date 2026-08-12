@@ -67,6 +67,13 @@ _REPORT_KINDS = {
 }
 
 
+def _short_frontend(frontend: str | None) -> str:
+    """Compact origin label for a chat (which frontend created it)."""
+    return {"telegram": "tg", "tui": "tui", "web": "web"}.get(
+        str(frontend or ""), str(frontend or "?")
+    )
+
+
 def _cycle_progress_report(settings: Settings, cycle_id: str, *, repo_path: Any = None) -> str:
     """Build a human-readable progress report from the persisted cycle trace."""
     db = services.open_db(settings)
@@ -406,17 +413,20 @@ class NelkeBot:
         db = services.open_db(self.state.settings)
         current = self.state.current_sessions.get(chat_id)
         lines: list[str] = []
-        for row in db.list_sessions(frontend="telegram", limit=200):
-            if str(self._session_meta(row).get("tg_chat_id")) != str(chat_id):
-                continue
+        # Chats are shared across web/TUI/Telegram, so this lists every
+        # conversation (with its origin) — a chat started on the web can be
+        # continued here with /open, and vice versa.
+        for row in db.list_sessions(limit=200):
             title = self._session_meta(row).get("title") or self._title_from_first_user(db, row["id"])
+            origin = _short_frontend(row["frontend"])
             marker = " ◀ current" if current and str(row["id"]) == str(current) else ""
-            lines.append(f"· {row['id'][-8:]} {title} ({row['message_count'] or 0} msgs){marker}")
+            lines.append(f"· {row['id'][-8:]} [{origin}] {title} ({row['message_count'] or 0} msgs){marker}")
         if not lines:
             await message.answer("No chats yet — /chat <text> to start one.")
             return
         await message.answer(
-            "Your chats (last 8 chars of id; /open <id> to continue):\n" + "\n".join(lines)[:4000]
+            "All chats (web/TUI/Telegram; /open <id> to continue anywhere):\n"
+            + "\n".join(lines)[:4000]
         )
 
     # ---- /open --------------------------------------------------------------
@@ -428,9 +438,9 @@ class NelkeBot:
             return
         db = services.open_db(self.state.settings)
         target: str | None = None
-        for row in db.list_sessions(frontend="telegram", limit=500):
-            if str(self._session_meta(row).get("tg_chat_id")) != str(chat_id):
-                continue
+        # Any chat, from any frontend, is resumable — not just this Telegram
+        # chat's own sessions.
+        for row in db.list_sessions(limit=2000):
             rid = str(row["id"])
             if rid == arg or rid.endswith(arg) or rid.startswith(arg):
                 target = rid
@@ -439,10 +449,15 @@ class NelkeBot:
             await message.answer(f"chat '{arg}' not found — /chats to list your chats")
             return
         self.state.current_sessions[chat_id] = target
-        title = self._session_meta(db.get_session(target)).get("title") \
-            or self._title_from_first_user(db, target)
+        sess_row = db.get_session(target)
+        if sess_row is not None:
+            origin = _short_frontend(sess_row["frontend"])
+            title = self._session_meta(sess_row).get("title") or self._title_from_first_user(db, target)
+        else:
+            origin = ""
+            title = "New chat"
         await message.answer(
-            f"Opened chat {target[-8:]} {title}.\n/history to see it, /chat <text> to continue."
+            f"Opened [{origin}] chat {target[-8:]} {title}.\n/history to see it, /chat <text> to continue."
         )
 
     # ---- /improve -----------------------------------------------------------

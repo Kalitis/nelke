@@ -21,6 +21,7 @@ ToolHandler = Callable[[str, dict[str, Any]], Any] | None
 ToolResultHandler = Callable[[str, dict[str, Any], str], Any] | None
 UsageHandler = Callable[[dict[str, Any]], Any] | None
 DegradedHandler = Callable[[DegradationReport], Any] | None
+TurnHandler = Callable[[], Any] | None
 
 _EMPTY_USAGE = {
     "prompt_tokens": 0,
@@ -63,6 +64,7 @@ class Agent:
         memory_index: str | None = None,
         memory_location: str | None = None,
         plan_first: bool = False,
+        on_turn_end: TurnHandler = None,
     ) -> None:
         self.name = name
         self.system_prompt = system_prompt
@@ -74,6 +76,7 @@ class Agent:
         self.on_tool_result = on_tool_result
         self.on_usage = on_usage
         self.on_degraded = on_degraded
+        self.on_turn_end = on_turn_end
         self.degrade_error_threshold = degrade_error_threshold
         self.temperature = temperature
         self.memory_index = memory_index
@@ -177,6 +180,8 @@ class Agent:
                 msgs.append({"role": "assistant", "content": resp.content or ""})
                 answer = (resp.content or "").strip()
                 self._finalize_usage()
+                if self.on_turn_end is not None:
+                    self.on_turn_end()
                 result = AgentResult(
                     answer=answer, iterations=i + 1, tool_calls=tool_calls_total,
                     tool_errors=self._tool_errors, messages=msgs, usage=self._usage,
@@ -184,11 +189,15 @@ class Agent:
                 self._maybe_degrade(result, task)
                 return result
             msgs.append(self._assistant_tool_message(resp))
+            if self.on_turn_end is not None:
+                self.on_turn_end()
             for tc in resp.tool_calls:
                 tool_calls_total += 1
                 tool_result = await self._execute_tool(tc)
                 msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result.render()})
         self._finalize_usage()
+        if self.on_turn_end is not None:
+            self.on_turn_end()
         result = AgentResult(
             answer="", iterations=self.iteration_cap, tool_calls=tool_calls_total,
             tool_errors=self._tool_errors, messages=msgs, stopped="max_iterations",
@@ -296,6 +305,7 @@ def make_agent(
     db: Any = None,
     temperature: float | None = None,
     plan_first: bool = False,
+    on_turn_end: TurnHandler = None,
 ) -> Agent:
     """Build a normal-mode agent (workspace-scoped tools).
 
@@ -356,4 +366,5 @@ def make_agent(
         memory_location=memory_location,
         temperature=temperature,
         plan_first=plan_first,
+        on_turn_end=on_turn_end,
     )

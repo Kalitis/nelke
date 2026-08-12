@@ -56,3 +56,46 @@ export function siblingPosition(
 export function countActive(tree: MessageTree): number {
   return Object.values(tree.nodes).filter((n) => n.is_active && !n.is_deleted).length;
 }
+
+/**
+ * Immutably append a message to a tree. Returns a NEW tree (the original is
+ * untouched) so it is safe to use as a zustand state update. Used for the
+ * optimistic user-message insert before a streamed turn begins: the bubble
+ * appears immediately while the canonical tree is reloaded on the `done`
+ * event. The new node becomes a child of `msg.parent_id` (or a root if null).
+ */
+export function appendOptimistic(tree: MessageTree, msg: Message): MessageTree {
+  const parentKey = msg.parent_id ?? "null";
+  const siblings = (tree.children[parentKey] ?? []).filter((s) => s.id !== msg.id);
+  const nodes = { ...tree.nodes, [msg.id]: msg };
+  const children = {
+    ...tree.children,
+    [parentKey]: [...siblings, msg],
+  };
+  // If the tree had no root yet, this message becomes the root.
+  const root_id = tree.root_id ?? msg.id;
+  return { root_id, nodes, children };
+}
+
+/**
+ * Immutably remove a node (by id) from a tree. Used to roll back an optimistic
+ * insert when a streamed turn errors out before the canonical tree is reloaded.
+ * Only drops the single node from `nodes` and from its parent's child list; it
+ * does not recurse into descendants (optimistic inserts are always leaves).
+ */
+export function removeOptimistic(tree: MessageTree, nodeId: string): MessageTree {
+  if (!tree.nodes[nodeId]) return tree;
+  const node = tree.nodes[nodeId];
+  const parentKey = node.parent_id ?? "null";
+  const nodes = { ...tree.nodes };
+  delete nodes[nodeId];
+  const siblings = (tree.children[parentKey] ?? []).filter((s) => s.id !== nodeId);
+  const children = { ...tree.children };
+  if (siblings.length > 0) {
+    children[parentKey] = siblings;
+  } else {
+    delete children[parentKey];
+  }
+  const root_id = tree.root_id === nodeId ? null : tree.root_id;
+  return { root_id, nodes, children };
+}

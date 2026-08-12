@@ -65,6 +65,12 @@ _SCHEMA = [
         payload TEXT, created_at TEXT, seq INTEGER
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS cycle_workers (
+        id TEXT PRIMARY KEY, cycle_id TEXT, worker_index INTEGER,
+        title TEXT, detail TEXT, status TEXT, started_at TEXT, ended_at TEXT
+    )
+    """,
 ]
 
 # Additive migrations applied after the base schema (for databases created by
@@ -82,6 +88,11 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id)",
     "ALTER TABLE usage_events ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE usage_events ADD COLUMN cache_read_pct INTEGER NOT NULL DEFAULT 0",
+    # Parallel cycle workers: each worker row records the slice of the
+    # objective it owns. `cycle_steps.worker_id` (nullable) ties a step to the
+    # worker that produced it; null keeps existing single-worker cycles intact.
+    "ALTER TABLE cycle_steps ADD COLUMN worker_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_cycle_workers_cycle ON cycle_workers(cycle_id)",
 ]
 
 
@@ -481,14 +492,15 @@ class Database:
         commit_sha: str | None,
         status: str,
         summary: str,
+        worker_id: str | None = None,
     ) -> str:
         self._prepare()
         sid = new_id()
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO cycle_steps (id, cycle_id, step, commit_sha, status, summary, created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (sid, cycle_id, step, commit_sha, status, summary, _now()),
+                "INSERT INTO cycle_steps (id, cycle_id, step, commit_sha, status, summary, created_at, worker_id) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (sid, cycle_id, step, commit_sha, status, summary, _now(), worker_id),
             )
         return sid
 
@@ -499,6 +511,56 @@ class Database:
                     "SELECT * FROM cycle_steps WHERE cycle_id=? ORDER BY step", (cycle_id,)
                 )
             )
+
+    # ---- cycle workers (parallel planner→worker model) -----------------------
+    def create_cycle_worker(
+        self,
+        cycle_id: str,
+        worker_index: int,
+        title: str,
+        detail: str,
+        worker_id: str | None = None,
+    ) -> str:
+        """Record one slice of the planner's task breakdown.
+
+        ``worker_index`` is the 0-based position in the planner's output; the
+        id is stable across retries of the same cycle so events and steps can
+        reference it.
+        """
+        self._prepare()
+        wid = worker_id or new_id()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO cycle_workers (id, cycle_id, worker_index, title, detail, status, started_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (wid, cycle_id, worker_index, title, detail, "pending", _now()),
+            )
+        return wid
+
+    def update_cycle_worker(self, worker_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE cycle_workers SET {cols} WHERE id=?",
+                (*fields.values(), worker_id),
+            )
+
+    def list_cycle_workers(self, cycle_id: str) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    "SELECT * FROM cycle_workers WHERE cycle_id=? ORDER BY worker_index",
+                    (cycle_id,),
+                )
+            )
+
+    def get_cycle_worker(self, worker_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM cycle_workers WHERE id=?", (worker_id,)
+            ).fetchone()
 
     # ---- cycle events (long-lived progress trace) ----------------------------
     def add_cycle_event(

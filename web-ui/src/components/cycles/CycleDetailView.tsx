@@ -3,6 +3,7 @@ import { useCyclesStore } from "@/state/cyclesStore";
 import { useRouter } from "@/state/router";
 import { Spinner } from "@/components/ui/Spinner";
 import { Markdown } from "@/components/chat/Markdown";
+import { WorkerGrid } from "./WorkerGrid";
 import type { CycleDetail, CycleEvent } from "@/state/types";
 
 function formatTime(iso: string | null): string {
@@ -96,6 +97,9 @@ export function CycleDetailView({ cycleId }: { cycleId: string }) {
             <Markdown content={d.objective || "(no objective)"} />
           </div>
         </div>
+
+        {/* Parallel worker cards (only populated by parallel-mode cycles). */}
+        <WorkerGrid cycleId={d.id} />
 
         <h2 className="mb-2 text-sm font-medium text-zinc-300">Steps</h2>
         {d.steps.length === 0 ? (

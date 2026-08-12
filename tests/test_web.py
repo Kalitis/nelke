@@ -22,14 +22,25 @@ from nelke.frontends.web import AppState, create_app
 def _scripted_llm_factory(responses: list[LLMResponse], cycle_reviewer=None):
     """Return an llm_factory closure backed by a scripted responder.
 
-    For cycle flows (worker vs reviewer), routes by system-prompt keyword.
+    For cycle flows (planner / worker / reviewer), routes by system-prompt
+    keyword so each agent role gets its own scripted responses. The planner
+    is served a single-task JSON plan (the legacy single-worker shape) so the
+    parallel cycle behaves like the old single-worker one for tests that
+    supply a worker script.
     """
+    import json as _json
+
     state = {"i": 0, "r": 0}
+    planner_payload = final_response(
+        _json.dumps({"tasks": [{"title": "all", "detail": "do everything"}]})
+    )
 
     def _factory(_profile: str | None):
         class _LLM:
             async def chat(self, messages, *, tools=None, stream=False, on_token=None, **_kw):
                 system = next((m["content"] for m in messages if m.get("role") == "system"), "")
+                if "task planner" in system:
+                    return planner_payload
                 if "review gate" in system or "AI review gate" in system:
                     state["r"] += 1
                     return cycle_reviewer(messages, tools)
@@ -339,7 +350,11 @@ def test_improve_auto_approve_merges(settings, tmp_repo):
     client = _client(settings, tmp_repo, factory, governance=FakeGovernance())
     with client:
         r = client.post("/api/improve", json={"objective": "add a memory lesson", "auto_approve": True})
-        assert r.json() == {"status": "started"}
+        body = r.json()
+        assert body["status"] == "started"
+        # The engine mints a cycle_id synchronously before the endpoint replies
+        # (captured from the `cycle_start` event), so the UI can navigate to it.
+        assert "cycle_id" in body and body["cycle_id"]
     # the background task ran to completion within the TestClient context
     assert (tmp_repo.repo / "memory" / "facts" / "web.md").exists()
     assert tmp_repo.current_branch() == "main"

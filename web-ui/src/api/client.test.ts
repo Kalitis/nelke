@@ -79,12 +79,31 @@ describe("pumpStream", () => {
     expect(events.map((e) => e.event)).toEqual(["token", "token"]);
   });
 
-  it("does not emit a partial frame before the separator arrives", async () => {
+  it("flushes a trailing frame without a closing separator on stream end", async () => {
+    // sse_starlette may close the response immediately after the final frame
+    // without a trailing "\r\n\r\n". The terminal event (e.g. `done`) must
+    // still be delivered — otherwise the canonical chat tree never reloads.
     const events: StreamEvent[] = [];
     const handlers = { onEvent: (ev: StreamEvent) => events.push(ev) };
-    // First chunk has no closing separator — must not emit yet.
+    await pumpStream(
+      streamedResponse([
+        'event: token\r\ndata: {"text": "X"}\r\n\r\n',
+        'event: done\r\ndata: {"answer": "X", "chat_id": "c1"}',
+      ]),
+      handlers,
+    );
+    expect(events.map((e) => e.event)).toEqual(["token", "done"]);
+    expect(events[1].data).toMatchObject({ answer: "X", chat_id: "c1" });
+  });
+
+  it("emits a partial frame only once when no separator arrives and stream ends", async () => {
+    // A single partial frame (no separator) still resolves to one event on
+    // stream close — it is not lost, and it is not duplicated.
+    const events: StreamEvent[] = [];
+    const handlers = { onEvent: (ev: StreamEvent) => events.push(ev) };
     await pumpStream(streamedResponse(['event: token\r\ndata: {"text": "X"}']), handlers);
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual<StreamEvent>({ event: "token", data: { text: "X" } });
   });
 
   it("emits frames incrementally as chunks arrive across reads", async () => {

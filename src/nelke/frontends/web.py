@@ -583,10 +583,17 @@ def create_app(state: AppState | None = None) -> FastAPI:
                 state.gate_request_ids[req.cycle_id] = human_reqs[0]["id"]
             return await future
 
+        # The cycle_id is minted inside services.run_cycle; capture it from the
+        # first `cycle_start` event so we can return it to the caller. The UI
+        # uses it to navigate straight to the cycle's detail page.
+        cycle_id_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+
         def push_events(ev: Any) -> None:
             """Broadcast each live cycle event to all SSE subscribers."""
             data = {"cycle_id": getattr(ev, "cycle_id", ""), "kind": ev.kind,
                     "message": ev.message, "payload": ev.data}
+            if ev.kind == "cycle_start" and not cycle_id_future.done():
+                cycle_id_future.set_result(data["cycle_id"])
             for _, events in state.stream_events.items():
                 for q in list(events.values()):
                     try:
@@ -604,6 +611,9 @@ def create_app(state: AppState | None = None) -> FastAPI:
                     llm_factory=state.llm_factory,
                     governance=state.governance,
                     on_event=push_events,
+                    # The web frontend renders one card per parallel worker;
+                    # the planner splits the objective into <= 6 slices.
+                    mode="parallel",
                 )
                 # Notify any SSE subscribers that the cycle finished.
                 for _, events in state.stream_events.items():
@@ -616,10 +626,22 @@ def create_app(state: AppState | None = None) -> FastAPI:
                             }),
                         })
             except Exception:  # noqa: BLE001 - the gate future is abandoned on failure
-                pass
+                if not cycle_id_future.done():
+                    cycle_id_future.set_result("")
 
         asyncio.create_task(runner())
-        return JSONResponse({"status": "started"})
+        # Wait briefly for the cycle_id so the response can include it. If the
+        # engine is slow to emit `cycle_start` (or fails before that), fall
+        # back to a bare "started" and let the UI refresh the list instead.
+        cycle_id = ""
+        try:
+            cycle_id = await asyncio.wait_for(cycle_id_future, timeout=2.0)
+        except asyncio.TimeoutError:
+            pass
+        body: dict[str, Any] = {"status": "started"}
+        if cycle_id:
+            body["cycle_id"] = cycle_id
+        return JSONResponse(body)
 
     @app.get("/api/cycles/stream")
     async def api_cycles_stream(request: Request) -> EventSourceResponse:

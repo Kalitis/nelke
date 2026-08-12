@@ -1,4 +1,5 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { Dialog, DialogPanel } from "@headlessui/react";
 import { useCyclesStore } from "@/state/cyclesStore";
 import { useRouter } from "@/state/router";
 import { Spinner } from "@/components/ui/Spinner";
@@ -59,6 +60,7 @@ export function CyclesView() {
   const cycles = useCyclesStore((s) => s.cycles);
   const loadCycles = useCyclesStore((s) => s.loadCycles);
   const error = useCyclesStore((s) => s.error);
+  const [modalOpen, setModalOpen] = useState(false);
 
   useEffect(() => {
     void loadCycles();
@@ -74,11 +76,20 @@ export function CyclesView() {
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="mx-auto max-w-3xl px-4 py-6">
-        <h1 className="mb-4 text-lg font-medium text-zinc-100">Self-improvement cycles</h1>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h1 className="text-lg font-medium text-zinc-100">Self-improvement cycles</h1>
+          <button
+            type="button"
+            onClick={() => setModalOpen(true)}
+            className="rounded-lg border border-edge bg-panel2 px-3 py-1.5 text-sm font-medium text-zinc-100 transition-colors hover:bg-edge"
+          >
+            + New cycle
+          </button>
+        </div>
         {error && <p className="mb-3 text-sm text-red-400">{error}</p>}
         {cycles.length === 0 ? (
           <p className="py-10 text-center text-sm text-zinc-600">
-            No cycles yet. Run one from the chat or <code className="text-zinc-400">nelke improve</code>.
+            No cycles yet. Start one with “New cycle” or <code className="text-zinc-400">nelke improve</code>.
           </p>
         ) : (
           <div className="space-y-2">
@@ -86,7 +97,103 @@ export function CyclesView() {
           </div>
         )}
       </div>
+      <NewCycleModal open={modalOpen} onClose={() => setModalOpen(false)} />
     </div>
+  );
+}
+
+function NewCycleModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const startCycle = useCyclesStore((s) => s.startCycle);
+  const navigate = useRouter((s) => s.navigate);
+  const [objective, setObjective] = useState("");
+  const [autoApprove, setAutoApprove] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const reset = () => {
+    setObjective("");
+    setAutoApprove(false);
+    setError(null);
+    setSubmitting(false);
+  };
+
+  const handleSubmit = async () => {
+    const trimmed = objective.trim();
+    if (!trimmed || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    const id = await startCycle(trimmed, autoApprove);
+    setSubmitting(false);
+    if (id) {
+      reset();
+      onClose();
+      navigate(`/cycles/${id}`);
+    } else {
+      setError(useCyclesStore.getState().error ?? "Failed to start cycle");
+    }
+  };
+
+  return (
+    <Dialog
+      open={open}
+      onClose={() => {
+        if (!submitting) {
+          reset();
+          onClose();
+        }
+      }}
+      className="relative z-50"
+    >
+      <div className="fixed inset-0 bg-black/60" />
+      <div className="fixed inset-0 flex items-center justify-center p-4">
+        <DialogPanel className="w-full max-w-lg rounded-xl border border-edge bg-panel p-5 shadow-xl">
+          <h2 className="mb-3 text-base font-medium text-zinc-100">New self-improvement cycle</h2>
+          <label className="mb-1 block text-[11px] uppercase text-zinc-500">Objective</label>
+          <textarea
+            value={objective}
+            onChange={(e) => setObjective(e.target.value)}
+            placeholder="e.g. add a memory lesson about cycles"
+            rows={4}
+            className="mb-3 w-full resize-none rounded-lg border border-edge bg-canvas px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-accent focus:outline-none"
+            autoFocus
+          />
+          <label className="mb-4 flex cursor-pointer items-center gap-2 text-sm text-zinc-300">
+            <input
+              type="checkbox"
+              checked={autoApprove}
+              onChange={(e) => setAutoApprove(e.target.checked)}
+              className="h-4 w-4 rounded border-edge bg-canvas accent-accent"
+            />
+            <span>
+              Auto-approve human gate
+              <span className="ml-1 text-[11px] text-zinc-600">(merges without manual review)</span>
+            </span>
+          </label>
+          {error && <p className="mb-3 text-sm text-red-400">{error}</p>}
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                reset();
+                onClose();
+              }}
+              disabled={submitting}
+              className="rounded-lg border border-edge bg-panel2 px-3 py-1.5 text-sm text-zinc-300 hover:bg-edge disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={submitting || !objective.trim()}
+              className="rounded-lg border border-accent/40 bg-accent/20 px-3 py-1.5 text-sm font-medium text-accent hover:bg-accent/30 disabled:opacity-50"
+            >
+              {submitting ? "Starting…" : "Start cycle"}
+            </button>
+          </div>
+        </DialogPanel>
+      </div>
+    </Dialog>
   );
 }
 

@@ -129,6 +129,19 @@ export const api = {
     return json(await fetch(`/api/cycles/${encodeURIComponent(cycleId)}`));
   },
 
+  async startCycle(
+    objective: string,
+    autoApprove: boolean,
+  ): Promise<{ status: string; cycle_id?: string }> {
+    return json(
+      await fetch("/api/improve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ objective, auto_approve: autoApprove }),
+      }),
+    );
+  },
+
   async memoryFiles(): Promise<MemoryFile[]> {
     return json(await fetch("/api/memory"));
   },
@@ -162,9 +175,19 @@ export async function pumpStream(resp: Response, handlers: StreamHandlers): Prom
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const flush = () => {
+    if (!buffer.trim()) return;
+    const ev = parseFrame(buffer);
+    if (ev) handlers.onEvent(ev);
+    buffer = "";
+  };
   while (true) {
     const { value, done } = await reader.read();
     if (done) {
+      // sse_starlette may close the stream immediately after the final frame
+      // without a trailing blank-line separator. Flush whatever remains so the
+      // terminal `done`/`cycle_result` event is not silently dropped.
+      flush();
       break;
     }
     buffer += decoder.decode(value, { stream: true });
@@ -239,4 +262,24 @@ export async function streamRegenerate(
   } catch (err) {
     handlers.onError?.(err as Error);
   }
+}
+
+// Live SSE subscription for cycle progress (worker tokens/tools/gate/merge).
+// `onEvent` receives `cycle_event` / `cycle_result` / `ping` frames; the
+// returned AbortController lets the caller stop the infinite stream.
+export function streamCycleEvents(handlers: StreamHandlers): AbortController {
+  const controller = new AbortController();
+  (async () => {
+    try {
+      const resp = await fetch("/api/cycles/stream", { signal: controller.signal });
+      await pumpStream(resp, handlers);
+    } catch (err) {
+      // AbortError is expected when the caller stops the stream; only surface
+      // real failures.
+      if ((err as Error).name !== "AbortError") {
+        handlers.onError?.(err as Error);
+      }
+    }
+  })();
+  return controller;
 }

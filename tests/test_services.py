@@ -425,6 +425,49 @@ async def test_list_cycles_and_detail(tmp_repo, settings):
     assert detail["id"] == first["id"]
     assert detail["events"]  # timeline present
     assert detail["reviews"]
+    # Single-worker cycles populate no parallel worker rows.
+    assert detail["workers"] == []
+
+
+async def test_parallel_cycle_detail_exposes_workers(tmp_repo, settings):
+    """Parallel cycles expose one worker row per planner slice in the detail DTO."""
+    import json as _json
+
+    async def human(_req) -> bool:
+        return True
+
+    worker_responses = [
+        tool_response("self_write", {"path": "memory/facts/a.md", "content": "# a\ndone"}),
+        final_response("done"),
+    ]
+    planner_payload = _json.dumps({"tasks": [{"title": "all", "detail": "do everything"}]})
+
+    def factory(_profile):
+        class _LLM:
+            async def chat(self, messages, *, tools=None, **_kw):
+                system = next((m["content"] for m in messages if m.get("role") == "system"), "")
+                if "task planner" in system:
+                    return final_response(planner_payload)
+                if "review gate" in system or "AI review gate" in system:
+                    return final_response("VERDICT: APPROVE\nSUMMARY: ok\nCOMMENTS: none")
+                # Workers are stateless here; reuse the same scripted plan for each.
+                return worker_responses[0]
+
+        return _LLM()
+
+    await services.run_cycle(
+        "do two things", settings, None,
+        human_approve=human, repo_path=tmp_repo.repo, llm_factory=factory,
+        governance=FakeGovernance(), mode="parallel",
+    )
+    cycles = services.list_cycles(settings)
+    first = cycles[0]
+    detail = services.get_cycle_detail(settings, first["id"])
+    assert detail is not None
+    # At least one worker row was persisted; the planner returned a single task.
+    assert len(detail["workers"]) >= 1
+    w = detail["workers"][0]
+    assert {"id", "worker_index", "title", "detail", "status"} <= set(w.keys())
 
 
 def test_reconcile_stale_cycles_marks_empty_branches(tmp_repo, settings):

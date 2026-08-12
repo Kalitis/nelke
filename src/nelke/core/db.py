@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from nelke.core.llm import usage_cache_pct
 
@@ -114,8 +115,29 @@ class Database:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        """Context manager that COMMITS and CLOSES the connection on exit.
+
+        The plain ``with self.connect() as conn:`` form relies on
+        sqlite3.Connection's ``__exit__``, which only commits and never
+        closes — every query therefore leaked an open file handle (visible
+        as ResourceWarning under tracemalloc, and worse under parallel
+        workers). This wraps both behaviours: on normal exit we commit then
+        close; on an exception we roll back then close.
+        """
+        conn = self.connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def migrate(self) -> None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             for statement in _SCHEMA:
                 conn.execute(statement)
             for statement in _MIGRATIONS:
@@ -165,7 +187,7 @@ class Database:
     def create_session(self, frontend: str, meta: dict | None = None) -> str:
         self._prepare()
         sid = new_id()
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO sessions (id, frontend, started_at, meta) VALUES (?,?,?,?)",
                 (sid, frontend, _now(), json.dumps(meta or {})),
@@ -173,13 +195,13 @@ class Database:
         return sid
 
     def end_session(self, session_id: str) -> None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "UPDATE sessions SET ended_at=? WHERE id=?", (_now(), session_id)
             )
 
     def get_session(self, session_id: str) -> sqlite3.Row | None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             return conn.execute(
                 "SELECT * FROM sessions WHERE id=?", (session_id,)
             ).fetchone()
@@ -213,7 +235,7 @@ class Database:
         if limit is not None:
             q += " LIMIT ?"
             args.append(str(limit))
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(conn.execute(q, args))
 
     def update_session_meta(self, session_id: str, **fields: Any) -> None:
@@ -228,14 +250,14 @@ class Database:
         if not isinstance(meta, dict):
             meta = {}
         meta.update(fields)
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "UPDATE sessions SET meta=? WHERE id=?", (json.dumps(meta), session_id)
             )
 
     def delete_session(self, session_id: str) -> None:
         """Remove a chat session and its messages (chat management)."""
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
 
@@ -253,7 +275,7 @@ class Database:
     ) -> str:
         self._prepare()
         mid = new_id()
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO messages "
                 "(id, session_id, role, content, tool_calls, tool_call_id, created_at, "
@@ -292,7 +314,7 @@ class Database:
         if not include_deleted:
             conds.append("is_deleted=0")
         where = " AND ".join(conds)
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(
                 conn.execute(
                     f"SELECT * FROM messages WHERE {where} ORDER BY created_at, rowid",
@@ -302,7 +324,7 @@ class Database:
 
     def first_user_message(self, session_id: str) -> sqlite3.Row | None:
         """The first user message, used to derive a chat title."""
-        with self.connect() as conn:
+        with self._conn() as conn:
             return conn.execute(
                 "SELECT * FROM messages WHERE session_id=? AND role='user' "
                 "ORDER BY created_at LIMIT 1",
@@ -311,14 +333,14 @@ class Database:
 
     # ---- message tree (branching / swipes) ----------------------------------
     def get_message(self, message_id: str) -> sqlite3.Row | None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             return conn.execute(
                 "SELECT * FROM messages WHERE id=?", (message_id,)
             ).fetchone()
 
     def list_message_tree(self, session_id: str) -> list[sqlite3.Row]:
         """Every non-deleted message node in a session (all branches)."""
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(
                 conn.execute(
                     "SELECT * FROM messages WHERE session_id=? AND is_deleted=0 "
@@ -329,7 +351,7 @@ class Database:
 
     def get_children(self, parent_id: str) -> list[sqlite3.Row]:
         """Direct children of a node — the swipe alternatives for that turn."""
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(
                 conn.execute(
                     "SELECT * FROM messages WHERE parent_id=? AND is_deleted=0 "
@@ -340,7 +362,7 @@ class Database:
 
     def next_sibling_order(self, parent_id: str | None, session_id: str) -> int:
         """Next ``sibling_order`` value for a new child of ``parent_id``."""
-        with self.connect() as conn:
+        with self._conn() as conn:
             if parent_id is None:
                 row = conn.execute(
                     "SELECT COALESCE(MAX(sibling_order), -1) AS m FROM messages "
@@ -356,7 +378,7 @@ class Database:
             return int(row["m"]) + 1
 
     def update_message_content(self, message_id: str, content: str) -> None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "UPDATE messages SET content=? WHERE id=?", (content, message_id)
             )
@@ -369,7 +391,7 @@ class Database:
         report what was removed.
         """
         deleted: list[str] = []
-        with self.connect() as conn:
+        with self._conn() as conn:
             stack = [message_id]
             while stack:
                 current = stack.pop()
@@ -385,7 +407,7 @@ class Database:
         return deleted
 
     def set_message_active(self, message_id: str, is_active: bool) -> None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "UPDATE messages SET is_active=? WHERE id=?",
                 (1 if is_active else 0, message_id),
@@ -403,7 +425,7 @@ class Database:
         chain: list[str] = []
         session_id: str | None = None
         current: str | None = message_id
-        with self.connect() as conn:
+        with self._conn() as conn:
             seen: set[str] = set()
             while current and current not in seen:
                 seen.add(current)
@@ -440,7 +462,7 @@ class Database:
         Active nodes with no active children are leaves of the current path.
         Returns ``None`` for an empty chat.
         """
-        with self.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 "SELECT m.* FROM messages m "
                 "WHERE m.session_id=? AND m.is_active=1 AND m.is_deleted=0 "
@@ -457,7 +479,7 @@ class Database:
     def create_cycle(self, objective: str, branch: str, cycle_id: str | None = None) -> str:
         self._prepare()
         cid = cycle_id or new_id()
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO cycles (id, objective, branch, status, started_at) VALUES (?,?,?,?,?)",
                 (cid, objective, branch, "running", _now()),
@@ -468,19 +490,19 @@ class Database:
         if not fields:
             return
         cols = ", ".join(f"{k}=?" for k in fields)
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 f"UPDATE cycles SET {cols} WHERE id=?",
                 (*fields.values(), cycle_id),
             )
 
     def get_cycle(self, cycle_id: str) -> sqlite3.Row | None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute("SELECT * FROM cycles WHERE id=?", (cycle_id,)).fetchone()
         return row
 
     def list_cycles(self, status: str | None = None) -> list[sqlite3.Row]:
-        with self.connect() as conn:
+        with self._conn() as conn:
             if status:
                 return list(conn.execute("SELECT * FROM cycles WHERE status=? ORDER BY started_at DESC", (status,)))
             return list(conn.execute("SELECT * FROM cycles ORDER BY started_at DESC"))
@@ -496,7 +518,7 @@ class Database:
     ) -> str:
         self._prepare()
         sid = new_id()
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO cycle_steps (id, cycle_id, step, commit_sha, status, summary, created_at, worker_id) "
                 "VALUES (?,?,?,?,?,?,?,?)",
@@ -505,7 +527,7 @@ class Database:
         return sid
 
     def get_steps(self, cycle_id: str) -> list[sqlite3.Row]:
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(
                 conn.execute(
                     "SELECT * FROM cycle_steps WHERE cycle_id=? ORDER BY step", (cycle_id,)
@@ -529,7 +551,7 @@ class Database:
         """
         self._prepare()
         wid = worker_id or new_id()
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO cycle_workers (id, cycle_id, worker_index, title, detail, status, started_at) "
                 "VALUES (?,?,?,?,?,?,?)",
@@ -541,14 +563,14 @@ class Database:
         if not fields:
             return
         cols = ", ".join(f"{k}=?" for k in fields)
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 f"UPDATE cycle_workers SET {cols} WHERE id=?",
                 (*fields.values(), worker_id),
             )
 
     def list_cycle_workers(self, cycle_id: str) -> list[sqlite3.Row]:
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(
                 conn.execute(
                     "SELECT * FROM cycle_workers WHERE cycle_id=? ORDER BY worker_index",
@@ -557,7 +579,7 @@ class Database:
             )
 
     def get_cycle_worker(self, worker_id: str) -> sqlite3.Row | None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             return conn.execute(
                 "SELECT * FROM cycle_workers WHERE id=?", (worker_id,)
             ).fetchone()
@@ -574,7 +596,7 @@ class Database:
         self._prepare()
         eid = new_id()
         seq = self._next_cycle_event_seq(cycle_id)
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO cycle_events (id, cycle_id, kind, message, payload, created_at, seq) "
                 "VALUES (?,?,?,?,?,?,?)",
@@ -583,7 +605,7 @@ class Database:
         return eid
 
     def _next_cycle_event_seq(self, cycle_id: str) -> int:
-        with self.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 "SELECT COALESCE(MAX(seq), -1) AS m FROM cycle_events WHERE cycle_id=?", (cycle_id,)
             ).fetchone()
@@ -601,14 +623,14 @@ class Database:
         if limit is not None:
             q += " LIMIT ?"
             args.append(str(limit))
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(conn.execute(q, args))
 
     # ---- review requests -----------------------------------------------------
     def create_review_request(self, cycle_id: str, kind: str, **fields: str) -> str:
         self._prepare()
         rid = new_id()
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO review_requests (id, cycle_id, kind, verdict, comments, created_at) "
                 "VALUES (?,?,?,?,?,?)",
@@ -617,7 +639,7 @@ class Database:
         return rid
 
     def resolve_review_request(self, request_id: str, verdict: str) -> None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "UPDATE review_requests SET verdict=?, resolved_at=? WHERE id=?",
                 (verdict, _now(), request_id),
@@ -637,14 +659,14 @@ class Database:
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY created_at"
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(conn.execute(q, args))
 
     # ---- tasks ---------------------------------------------------------------
     def create_task(self, session_id: str, workspace: str) -> str:
         self._prepare()
         tid = new_id()
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO tasks (id, session_id, workspace, status, created_at) VALUES (?,?,?,?,?)",
                 (tid, session_id, workspace, "running", _now()),
@@ -652,7 +674,7 @@ class Database:
         return tid
 
     def finish_task(self, task_id: str, status: str, summary: str) -> None:
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "UPDATE tasks SET status=?, summary=? WHERE id=?",
                 (status, summary, task_id),
@@ -660,7 +682,7 @@ class Database:
 
     def status(self) -> dict[str, int]:
         self._prepare()
-        with self.connect() as conn:
+        with self._conn() as conn:
             out: dict[str, int] = {}
             for table in (
                 "sessions",
@@ -686,7 +708,7 @@ class Database:
         self._prepare()
         uid = new_id()
         cache_read = int(usage.get("cache_read_tokens", 0) or 0)
-        with self.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT INTO usage_events "
                 "(id, session_id, cycle_id, prompt_tokens, completion_tokens, total_tokens, "
@@ -721,7 +743,7 @@ class Database:
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY created_at"
-        with self.connect() as conn:
+        with self._conn() as conn:
             return list(conn.execute(q, args))
 
     def usage_totals(

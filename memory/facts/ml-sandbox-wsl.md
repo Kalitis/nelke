@@ -37,3 +37,5 @@ Related: [LLM providers](facts/llms.md)
 Related: [Lessons](lessons.md)
 
 Related: [Skills](skills.md)
+
+Related: [Оценка двух подходов к долговременной памяти (steering vs merging) — 2026-08-12](chats/20260812093926-ff525969/cycles/notes.md)

@@ -17,3 +17,4 @@
 
 ## facts
 - [LLM providers](facts/llms.md) — - Nelke talks to any OpenAI-compatible endpoint via the `openai` library. #facts llm providers
+- [ML Sandbox (WSL)](facts/ml-sandbox-wsl.md) — - WSL дистрибутив: **Ubuntu** (WSL 2), пользователь **n4** (вход без пароля через `wsl -d Ubuntu`).

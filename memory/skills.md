@@ -28,3 +28,5 @@ Related: [LLM providers](facts/llms.md)
 Related: [Lessons](lessons.md)
 
 Related: [Зачем существует N4 — Нова и REBIRTH](chats/unknown/rebirth-nova.md)
+
+Related: [ML Sandbox (WSL)](facts/ml-sandbox-wsl.md)

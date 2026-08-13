@@ -176,17 +176,15 @@ class KanbanBoardTool(BaseTool):
         self.repo_root = repo_root
 
     async def execute(self, **kwargs) -> ToolResult:
-        from nelke.core import services
-
         project_id = str(kwargs.get("project_id", ""))
         board_id = kwargs.get("board_id")
         if self.db.get_project(project_id) is None:
             return ToolResult.failure(f"project not found: {project_id}")
         if board_id:
-            board = services.get_kanban_board(None, board_id)
+            board = self.db.get_kanban_board(board_id)
             if board is None or board["project_id"] != project_id:
                 return ToolResult.failure(f"board not found: {board_id}")
-            boards = [board]
+            boards = [_board_dto(self.db, board)]
         else:
             boards = self._list_boards(project_id)
         if not boards:

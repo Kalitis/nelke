@@ -203,6 +203,33 @@ def open_project_memory(repo: Path, project_id: str) -> MemoryStore:
     return _ProjectMemoryStore(repo / "memory" / "projects" / project_id)
 
 
+def ensure_project_directory(
+    repo: Path | None = None,
+    project_id: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> Path | None:
+    """Ensure a project's localised directory exists (idempotently).
+
+    Unlike ``create_project_directory`` (called only on new projects), this
+    runs for *any* project — including legacy ones created before the directory
+    feature existed — so every project gets a working root around which it is
+    localised. Returns the directory, or ``None`` if it cannot be determined
+    (e.g. unknown project or unavailable repo).
+    """
+    if not project_id:
+        return None
+    try:
+        repo_path = repo or find_repo(settings or Settings())
+        # Only create for projects that actually exist in the DB.
+        db = open_db(settings)
+        if db.get_project(project_id) is None:
+            return None
+        return create_project_directory(repo_path, project_id)
+    except Exception:  # noqa: BLE001 - directory creation is best-effort
+        return None
+
+
 def build_chat_session(
     settings: Settings,
     profile: str | None,
@@ -556,10 +583,18 @@ def create_chat(
     *,
     title: str | None = None,
     frontend: str = "web",
+    project_id: str | None = None,
 ) -> str:
-    """Create a new (empty) chat session; returns its id."""
+    """Create a new (empty) chat session; returns its id.
+
+    When ``project_id`` is given, the chat is attached to that project
+    immediately (creating the chat in the project's context).
+    """
     db = open_db(settings)
-    return db.create_session(frontend, meta={"title": title} if title else {})
+    chat_id = db.create_session(frontend, meta={"title": title} if title else {})
+    if project_id:
+        db.set_session_project(chat_id, project_id)
+    return chat_id
 
 
 def list_chats(
@@ -692,21 +727,51 @@ def create_project(
         raise ValueError("project name is required")
     db = open_db(settings)
     pid = db.create_project(name, description=description, stage=stage, meta=meta)
-    # Seed the project's memory directory so the card always has a memory link.
+    # Seed the project's localised directory and its memory so the card always
+    # has a working root and a memory link.
     try:
         repo_path = repo or find_repo(settings)
+        create_project_directory(repo_path, pid)
         store = open_project_memory(repo_path, pid)
         store.write("INDEX.md", f"# {name}\n\nProject memory.\n", overwrite=True)
-    except Exception:  # noqa: BLE001 - memory seeding is best-effort
+    except Exception:  # noqa: BLE001 - directory/memory seeding is best-effort
         pass
     return pid
 
 
+def create_project_directory(repo: Path, project_id: str) -> Path:
+    """Create (idempotently) and return a project's localised directory.
+
+    The project directory is the root **around which the project is organized
+    and in which** its artifacts live: ``<repo>/projects/<id>/``. A default
+    ``README.md`` is seeded on first creation so the directory (and therefore
+    the project) has a local anchor in the working tree.
+    """
+    from nelke.core.tools.projects import project_directory
+
+    path = project_directory(repo, project_id)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        seed = path / "README.md"
+        if not seed.exists():
+            seed.write_text(f"# Project {project_id}\n\nLocalised project root.\n", encoding="utf-8")
+    return path
+
+
 def list_projects(settings: Settings | None = None) -> list[dict[str, Any]]:
     """All projects, most recently updated first, with chat counts."""
+    settings = settings or Settings()
     db = open_db(settings)
+    # Lazily ensure each project's localised directory exists (covers legacy
+    # projects that predate the directory feature).
+    try:
+        repo_path = find_repo(settings)
+    except Exception:  # noqa: BLE001 - repo discovery is best-effort
+        repo_path = None
     out: list[dict[str, Any]] = []
     for row in db.list_projects():
+        if repo_path is not None:
+            ensure_project_directory(repo_path, row["id"], settings=settings)
         out.append(_project_dto(db, row))
     return out
 
@@ -723,6 +788,9 @@ def get_project(
     row = db.get_project(project_id)
     if row is None:
         return None
+    # Ensure the localised working directory exists for every project,
+    # including legacy ones created before the directory feature landed.
+    ensure_project_directory(repo, project_id, settings=settings)
     dto = _project_dto(db, row)
     dto["chats"] = [
         _chat_summary_for_project(r)
@@ -1090,7 +1158,14 @@ def delete_kanban_card(
 
 
 def _project_dto(db: Database, row: Any) -> dict[str, Any]:
+    from nelke.core.tools.projects import project_directory
+
     keys = row.keys()
+    # The localised directory path (may not exist yet for legacy projects).
+    try:
+        directory = str(project_directory(find_repo(), row["id"]))
+    except Exception:  # noqa: BLE001 - best-effort UI field
+        directory = ""
     return {
         "id": row["id"],
         "name": row["name"],
@@ -1100,6 +1175,7 @@ def _project_dto(db: Database, row: Any) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "chat_count": int(row["chat_count"] or 0) if "chat_count" in keys else 0,
+        "directory": directory,
     }
 
 

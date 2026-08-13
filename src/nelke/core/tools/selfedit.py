@@ -17,23 +17,31 @@ from nelke.core.tools.base import BaseTool, ToolResult, resolve_within
 
 DEFAULT_ENCODING = "utf-8"
 MAX_SELF_OUTPUT = 60_000
-MAX_GLOB_RESULTS = 400
+MAX_GLOB_RESULTS = 2000
 
-# Directories/files that must never be globbed/grepped: vendor stacks and caches
-# balloon every tool result (and thus every following LLM prompt), make the cycle
-# slow/stall-prone and defeat prompt caching. Anything here is irrelevant to
-# improving the repo's own source.
+# Directories/files that must never be globbed/grepped: vendor stacks, caches and
+# the repo's own build/artifact trees balloon every tool result (and thus every
+# following LLM prompt), make the cycle slow/stall-prone and defeat prompt
+# caching. Anything here is irrelevant to improving the repo's own source. The
+# repo-local entries mirror .gitignore so glob/grep never surface what git
+# already excludes.
 _SKIP_DIR_PARTS = {
     ".git", ".hg", ".svn", ".venv", "venv", "env", "__pycache__",
     "node_modules", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     ".cache", ".tox", ".eggs", "dist", "build", "target", "site-packages",
+    # repo-local, from .gitignore
+    ".zcode", "gui-test-screenshots", "chats",
 }
 _SKIP_FILE_SUFFIXES = {".pyc", ".pyo"}
+# Whole-file names excluded by .gitignore (secrets / coverage / editor droppings).
+_SKIP_FILE_NAMES = {".env", "config.toml", ".coverage", ".DS_Store", "Thumbs.db"}
 
 
 def _is_ignored(rel: Path) -> bool:
     parts = rel.parts
     if any(p in _SKIP_DIR_PARTS for p in parts):
+        return True
+    if rel.name in _SKIP_FILE_NAMES:
         return True
     if rel.suffix in _SKIP_FILE_SUFFIXES:
         return True

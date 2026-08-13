@@ -1,3 +1,0 @@
-# nelke
-
-Project memory.

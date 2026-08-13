@@ -590,7 +590,7 @@ class NelkeTUI(App):
 
     def _refresh_projects(self, select_id: str | None = None) -> None:
         try:
-            projects = services.list_projects(self.state.settings)
+            projects = services.list_projects(self.state.settings, repo=self._repo())
         except Exception:  # noqa: BLE001 - project list is best-effort
             return
         lv = self.query_one("#project-list", ListView)

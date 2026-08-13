@@ -755,8 +755,8 @@ class NelkeBot:
         )
 
     async def _project_list(self, message: Message) -> None:
-        projects = services.list_projects(self.state.settings)
         repo = self.state.repo_path or services.find_repo(self.state.settings)
+        projects = services.list_projects(self.state.settings, repo=repo)
         if not projects:
             await message.answer("no projects yet — /project create <name>")
             return

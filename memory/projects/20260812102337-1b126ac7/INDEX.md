@@ -1,3 +1,0 @@
-# Nachtschatten
-
-Project memory.

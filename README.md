@@ -6,6 +6,12 @@ Nelke can **edit and commit into its own repository** (source code, prompts, too
 memory store) via a bounded **self-improvement cycle** governed by tests/lint/typecheck, an AI reviewer
 agent, and a human review gate.
 
+Self-improvement loops are **project-scoped**: each project drives its own independent
+improve → verify → commit cycle that only touches files inside that project. The main
+**Nelke** project is the primary loop, configured at the repo root; other projects (e.g. your
+own app) get their own independent loop. No loop ever affects another project's files,
+commits, or localization.
+
 ## Install
 
 ```bash
@@ -154,7 +160,13 @@ scripts/                # build_web_ui.py (SPA build), spa_smoke.mjs (playwright
 
 ## Self-improvement cycle
 
-`nelke improve "<objective>"`:
+`nelke improve "<objective>"` runs a **project-scoped** loop. Each project has its
+own cycle; the main **Nelke** project is the primary loop (configured at the repo
+root in `examples/nelke_cycle.yaml`), and any other project gets its own independent
+loop (see `examples/project_cycle.yaml`). A cycle only ever touches files inside its
+own project — it never affects another project's files, commits, or localization.
+
+The Nelke primary loop:
 
 1. Branch `improve/<cycle-id>-<slug>` off `main`.
 2. Working agent (self-edit tools on) edits the repo toward the objective.

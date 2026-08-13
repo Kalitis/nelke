@@ -452,7 +452,7 @@ def create_app(state: AppState | None = None) -> FastAPI:
     # ---- projects (group chats + per-project memory) -----------------------
     @app.get("/api/projects")
     async def api_projects() -> list[dict[str, Any]]:
-        return services.list_projects(state.settings)
+        return services.list_projects(state.settings, repo=state.repo_path)
 
     @app.post("/api/projects")
     async def api_create_project(payload: dict[str, Any]) -> JSONResponse:

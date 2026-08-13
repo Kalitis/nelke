@@ -172,6 +172,10 @@ def memory_store(tmp_path) -> MemoryStore:
 @pytest.fixture
 def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("NELKE_NELKE_HOME", str(tmp_path / "home"))
+    # Isolate repo discovery from the developer's real checkout: without this,
+    # find_repo() falls back to ~/source/repos/nelke and tests seed
+    # memory/projects/<id>/ + projects/<id>/ into the live repo.
+    monkeypatch.setenv("NELKE_REPO", str(tmp_path / "repo"))
     from nelke.config import Settings
 
     return Settings()

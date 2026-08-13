@@ -758,14 +758,20 @@ def create_project_directory(repo: Path, project_id: str) -> Path:
     return path
 
 
-def list_projects(settings: Settings | None = None) -> list[dict[str, Any]]:
-    """All projects, most recently updated first, with chat counts."""
+def list_projects(
+    settings: Settings | None = None,
+    repo: Path | None = None,
+) -> list[dict[str, Any]]:
+    """All projects, most recently updated first, with chat counts.
+
+    ``repo`` names the working-tree root around which project directories are
+    localised; when omitted it is discovered via :func:`find_repo`."""
     settings = settings or Settings()
     db = open_db(settings)
     # Lazily ensure each project's localised directory exists (covers legacy
     # projects that predate the directory feature).
     try:
-        repo_path = find_repo(settings)
+        repo_path = repo or find_repo(settings)
     except Exception:  # noqa: BLE001 - repo discovery is best-effort
         repo_path = None
     out: list[dict[str, Any]] = []

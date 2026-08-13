@@ -80,6 +80,40 @@ async def test_self_glob_grep_skip_vendor_dirs(tmp_repo):
     assert "from_venv" not in grepped.output
 
 
+async def test_self_glob_skips_gitignored_entries(tmp_repo):
+    """.gitignore'd repo-local trees (memory/chats, .zcode, gui-test-screenshots)
+    and secret/editor files (.env, config.toml, .coverage, .DS_Store, Thumbs.db)
+    must not surface in self_glob — but durable memory notes must stay visible."""
+    root = tmp_repo.repo
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src" / "main.py").write_text("print(1)\n", encoding="utf-8")
+    (root / "memory" / "chats").mkdir(parents=True)
+    (root / "memory" / "chats" / "s1.md").write_text("chat\n", encoding="utf-8")
+    (root / "memory" / "lessons.md").write_text("# lessons\n", encoding="utf-8")
+    (root / ".zcode").mkdir()
+    (root / ".zcode" / "plan.md").write_text("plan\n", encoding="utf-8")
+    (root / "gui-test-screenshots").mkdir()
+    (root / "gui-test-screenshots" / "shot.png").write_bytes(b"png")
+    (root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    (root / "config.toml").write_text("key = 'x'\n", encoding="utf-8")
+    (root / ".coverage").write_text("!coverage.py\n", encoding="utf-8")
+    (root / ".DS_Store").write_text("", encoding="utf-8")
+    (root / "Thumbs.db").write_text("", encoding="utf-8")
+
+    ctx = _ctx(tmp_repo)
+    out = await SelfGlobTool(ctx).execute(pattern="**/*")
+    assert "src/main.py" in out.output
+    assert "memory/lessons.md" in out.output
+    assert "memory/chats" not in out.output
+    assert ".zcode" not in out.output
+    assert "gui-test-screenshots" not in out.output
+    assert ".env" not in out.output
+    assert "config.toml" not in out.output
+    assert ".coverage" not in out.output
+    assert ".DS_Store" not in out.output
+    assert "Thumbs.db" not in out.output
+
+
 async def test_allowed_files_blocks_write_outside_scope(tmp_repo):
     """A worker whose slice owns memory/facts/in.md must not be able to write a
     file outside that scope: self_write refuses with a clear message."""

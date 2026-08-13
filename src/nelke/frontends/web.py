@@ -531,6 +531,41 @@ def create_app(state: AppState | None = None) -> FastAPI:
         )
         return JSONResponse({"id": board_id, "name": name})
 
+    @app.patch("/api/projects/{project_id}/kanban/{board_id}")
+    async def api_update_project_kanban(project_id: str, board_id: str, payload: dict[str, Any]) -> JSONResponse:
+        """Rename/redescribe a project board."""
+        board = services.get_kanban_board(state.settings, board_id)
+        if board is None or board["project_id"] != project_id:
+            return JSONResponse({"error": "board not found"}, status_code=404)
+        ok = services.update_kanban_board(
+            state.settings, board_id,
+            name=payload.get("name"), description=payload.get("description"),
+        )
+        if not ok:
+            return JSONResponse({"error": "board not found"}, status_code=404)
+        return JSONResponse({"ok": True, "id": board_id})
+
+    @app.delete("/api/projects/{project_id}/kanban/{board_id}")
+    async def api_delete_project_kanban(project_id: str, board_id: str) -> JSONResponse:
+        """Delete a project board (with its columns + cards)."""
+        board = services.get_kanban_board(state.settings, board_id)
+        if board is None or board["project_id"] != project_id:
+            return JSONResponse({"error": "board not found"}, status_code=404)
+        services.delete_kanban_board(state.settings, board_id)
+        return JSONResponse({"ok": True})
+
+    @app.post("/api/projects/{project_id}/kanban/{board_id}/columns")
+    async def api_add_kanban_column(project_id: str, board_id: str, payload: dict[str, Any]) -> JSONResponse:
+        """Add a column to a project board."""
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return JSONResponse({"error": "column name is required"}, status_code=400)
+        board = services.get_kanban_board(state.settings, board_id)
+        if board is None or board["project_id"] != project_id:
+            return JSONResponse({"error": "board not found"}, status_code=404)
+        col_id = services.add_kanban_column(state.settings, board_id, name)
+        return JSONResponse({"id": col_id, "name": name})
+
     @app.post("/api/projects/{project_id}/kanban/{board_id}/cards")
     async def api_add_kanban_card(project_id: str, board_id: str, payload: dict[str, Any]) -> JSONResponse:
         """Add a card to a column of a project's kanban board."""
@@ -558,6 +593,16 @@ def create_app(state: AppState | None = None) -> FastAPI:
             state.settings, card_id,
             column_id=str(column_id) if column_id else None,
             position=int(position) if position is not None else None,
+        ):
+            return JSONResponse({"error": "card not found"}, status_code=404)
+        return JSONResponse({"ok": True, "id": card_id})
+
+    @app.patch("/api/kanban/cards/{card_id}/edit")
+    async def api_edit_kanban_card(card_id: str, payload: dict[str, Any]) -> JSONResponse:
+        """Rename / update a card's description."""
+        if not services.update_kanban_card(
+            state.settings, card_id,
+            title=payload.get("title"), description=payload.get("description"),
         ):
             return JSONResponse({"error": "card not found"}, status_code=404)
         return JSONResponse({"ok": True, "id": card_id})

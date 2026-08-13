@@ -45,3 +45,5 @@ Related: [ML Sandbox (WSL)](facts/ml-sandbox-wsl.md)
 Related: [Оценка двух подходов к долговременной памяти (steering vs merging) — 2026-08-12](chats/20260812093926-ff525969/cycles/notes.md)
 
 Related: [N4 / Nachtschatten — долговременная память: прототипы steering / merging / associative](chats/20260812093926-ff525969/cycles/nachtschatten-memory-prototypes.md)
+
+- Project agent tools must not call `services.*` helpers that open their own DB (`open_db(settings)`) — the repo-root DB differs from the test/fixture DB, so lookups return "not found". Build DTOs directly from the injected `db` handle instead. #lessons projects tools

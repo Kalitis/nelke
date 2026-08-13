@@ -352,6 +352,14 @@ def make_agent(
         WriteFileTool,
     )
     from nelke.core.tools.memory import MemoryListTool, MemoryShowTool, MemoryWriteTool, RecallTool
+    from nelke.core.tools.projects import (
+        KanbanAddCardTool,
+        KanbanBoardTool,
+        KanbanCreateBoardTool,
+        ProjectDirectoryTool,
+        ProjectMemoryReadTool,
+        ProjectMemoryWriteTool,
+    )
     from nelke.core.tools.shell import BashTool, PythonRunTool
     from nelke.core.tools.subagent import TaskTool
     from nelke.core.tools.web import WebFetchTool, WebSearchTool
@@ -377,6 +385,24 @@ def make_agent(
         tools += [TaskTool(task_factory)]
     if db is not None:
         tools += [CyclesTool(db)]
+        # Project tools: localised project directory, per-project memory, and
+        # kanban boards. The workspace is under settings.workspaces_dir; projects
+        # live at the repo root (sibling of the memory store), so lift the
+        # workspace up to the repo's own directory.
+        candidates = []
+        for cand in ws.parents:
+            if (cand / "memory").exists() or (cand / "src" / "nelke").exists():
+                candidates.append(cand)
+        repo_root = candidates[0] if candidates else None
+        if repo_root is not None:
+            tools += [
+                ProjectDirectoryTool(db, repo_root),
+                ProjectMemoryReadTool(db, repo_root),
+                ProjectMemoryWriteTool(db, repo_root),
+                KanbanBoardTool(db, repo_root),
+                KanbanCreateBoardTool(db, repo_root),
+                KanbanAddCardTool(db, repo_root),
+            ]
     return Agent(
         name=name,
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,

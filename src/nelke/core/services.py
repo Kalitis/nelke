@@ -692,14 +692,35 @@ def create_project(
         raise ValueError("project name is required")
     db = open_db(settings)
     pid = db.create_project(name, description=description, stage=stage, meta=meta)
-    # Seed the project's memory directory so the card always has a memory link.
+    # Seed the project's localised directory and its memory so the card always
+    # has a working root and a memory link.
     try:
         repo_path = repo or find_repo(settings)
+        create_project_directory(repo_path, pid)
         store = open_project_memory(repo_path, pid)
         store.write("INDEX.md", f"# {name}\n\nProject memory.\n", overwrite=True)
-    except Exception:  # noqa: BLE001 - memory seeding is best-effort
+    except Exception:  # noqa: BLE001 - directory/memory seeding is best-effort
         pass
     return pid
+
+
+def create_project_directory(repo: Path, project_id: str) -> Path:
+    """Create (idempotently) and return a project's localised directory.
+
+    The project directory is the root **around which the project is organized
+    and in which** its artifacts live: ``<repo>/projects/<id>/``. A default
+    ``README.md`` is seeded on first creation so the directory (and therefore
+    the project) has a local anchor in the working tree.
+    """
+    from nelke.core.tools.projects import project_directory
+
+    path = project_directory(repo, project_id)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        seed = path / "README.md"
+        if not seed.exists():
+            seed.write_text(f"# Project {project_id}\n\nLocalised project root.\n", encoding="utf-8")
+    return path
 
 
 def list_projects(settings: Settings | None = None) -> list[dict[str, Any]]:
@@ -1090,7 +1111,14 @@ def delete_kanban_card(
 
 
 def _project_dto(db: Database, row: Any) -> dict[str, Any]:
+    from nelke.core.tools.projects import project_directory
+
     keys = row.keys()
+    # The localised directory path (may not exist yet for legacy projects).
+    try:
+        directory = str(project_directory(find_repo(), row["id"]))
+    except Exception:  # noqa: BLE001 - best-effort UI field
+        directory = ""
     return {
         "id": row["id"],
         "name": row["name"],
@@ -1100,6 +1128,7 @@ def _project_dto(db: Database, row: Any) -> dict[str, Any]:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "chat_count": int(row["chat_count"] or 0) if "chat_count" in keys else 0,
+        "directory": directory,
     }
 
 

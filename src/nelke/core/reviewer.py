@@ -33,7 +33,11 @@ Review the proposed changes (the attached diff) against the stated objective for
   could brick the project (bad imports, broken syntax, unbounded processes).
 - Alignment: do the changes actually serve the objective?
 
-Return EXACTLY this format (no markdown fences):
+You may inspect the repo with the read-only tools to judge the diff in context.
+Budget your exploration: a couple of targeted reads at most, then judge.
+
+When you are ready to judge, you MUST end your turn with a plain-text answer
+(no further tool calls) in EXACTLY this format (no markdown fences):
 
 VERDICT: APPROVE
 SUMMARY: <one line summary>
@@ -41,6 +45,8 @@ COMMENTS:
 - <issue or concern, one per line>
 - none if nothing to fix
 
+Do NOT end your turn without a VERDICT line. If you ran out of tool iterations,
+your next message MUST be the verdict above with no tool calls.
 Only use APPROVE when the changes are safe and aligned; otherwise use REQUEST_CHANGES.
 """
 
@@ -62,7 +68,17 @@ class ReviewVerdict:
 def parse_verdict(text: str) -> ReviewVerdict:
     m = _VERDICT_RE.search(text)
     if not m:
-        # Conservative default: an approval must be explicit.
+        # Conservative default: an approval must be explicit. An EMPTY or
+        # tool-only answer (the reviewer ran out of iterations without a plain
+        # verdict) must not silently count as approval — and must carry a
+        # visible comment so the cycle log explains WHY it didn't merge.
+        if not text.strip():
+            return ReviewVerdict(
+                verdict="request_changes",
+                summary="reviewer produced no verdict",
+                comments="The reviewer produced no verdict text. "
+                         "Re-run the review or rework the change.",
+            )
         approved = re.search(r"\bAPPROVE\b", text, re.IGNORECASE) is not None and \
             re.search(r"\bREQUEST_CHANGES\b|REQUEST-CHANGES", text, re.IGNORECASE) is None
         return ReviewVerdict(
@@ -95,7 +111,7 @@ class Reviewer:
         name: str = "reviewer",
         system_prompt: str | None = None,
         base: str = "main",
-        iteration_cap: int = 10,
+        iteration_cap: int = 6,
         temperature: float = 0.0,
     ) -> None:
         self.repo = repo
@@ -134,5 +150,36 @@ class Reviewer:
             "Give your verdict in the required format."
         )
         result = await self.agent.run(task)
+        answer = result.answer
+        # Fallback: if the reviewer agent spent all its tool iterations reading
+        # files and never produced a plain verdict (no VERDICT: line), force one
+        # final no-tool LLM call that MUST answer with the verdict format. This
+        # is what keeps a review from silently failing as request_changes with
+        # empty comments when the model gets lost in exploration.
+        if "VERDICT:" not in answer.upper():
+            answer = await self._force_verdict(objective, diff)
         self.last_usage = result.usage
-        return parse_verdict(result.answer)
+        return parse_verdict(answer)
+
+    async def _force_verdict(self, objective: str, diff: str | None) -> str:
+        """One-shot, tool-less LLM call demanding a verdict right now.
+
+        Used when the reviewer agent returned no VERDICT line (it either ran out
+        of tool iterations or answered with prose only). The prompt leaves the
+        model no room to defer — no tools are offered, so it must commit to a
+        verdict in this single call.
+        """
+        messages = [
+            {"role": "system", "content": self.agent.system_content()},
+            {"role": "user", "content": (
+                "You previously inspected the changes but did not return a verdict. "
+                "Answer NOW with the verdict format and NOTHING ELSE — no tool calls, "
+                "no exploration. Base it on the diff you already saw.\n\n"
+                f"OBJECTIVE: {objective}\n\n"
+                f"```diff\n{diff or '(empty diff)'}\n```\n\n"
+                "Reply with:\nVERDICT: APPROVE|REQUEST_CHANGES\nSUMMARY: ...\n"
+                "COMMENTS:\n- ..."
+            )},
+        ]
+        resp = await self.llm.chat(messages, stream=False, temperature=self.temperature)
+        return (resp.content if resp else "") or ""

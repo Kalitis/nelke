@@ -791,6 +791,253 @@ def set_project_memory(
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Kanban boards for projects (service layer)
+# --------------------------------------------------------------------------- #
+def _kanban_card_dto(
+    db: Database, card: Any, *, column_id: str | None = None
+) -> dict[str, Any]:
+    return {
+        "id": card["id"],
+        "title": card["title"],
+        "description": card["description"] or "",
+        "task_id": card["task_id"],
+        "position": int(card["position"]),
+        "column_id": column_id or card["column_id"],
+        "created_at": card["created_at"],
+    }
+
+
+def _kanban_column_dto(db: Database, col: Any) -> dict[str, Any]:
+    return {
+        "id": col["id"],
+        "name": col["name"],
+        "position": int(col["position"]),
+        "cards": [
+            _kanban_card_dto(db, card, column_id=col["id"])
+            for card in db.list_kanban_cards(column_id=col["id"])
+        ],
+    }
+
+
+def create_kanban_board(
+    settings: Settings | None = None,
+    project_id: str | None = None,
+    name: str = "",
+    description: str = "",
+) -> str:
+    """Create a kanban board for a project (with default columns).
+
+    Raises ``ValueError`` when the project is missing or the name is empty.
+    Returns the new board id.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("board name is required")
+    if not project_id:
+        raise ValueError("project_id is required")
+    db = open_db(settings)
+    if db.get_project(project_id) is None:
+        raise ValueError("project not found")
+    return db.create_kanban_board(project_id, name, description=description)
+
+
+def get_kanban_board(
+    settings: Settings | None = None, board_id: str | None = None
+) -> dict[str, Any] | None:
+    """A single board (with columns and cards) or ``None``."""
+    if not board_id:
+        return None
+    db = open_db(settings)
+    board = db.get_kanban_board(board_id)
+    if board is None:
+        return None
+    return {
+        "id": board["id"],
+        "project_id": board["project_id"],
+        "name": board["name"],
+        "description": board["description"] or "",
+        "created_at": board["created_at"],
+        "columns": [
+            _kanban_column_dto(db, c) for c in db.list_kanban_columns(board_id)
+        ],
+    }
+
+
+def list_kanban_boards(
+    settings: Settings | None = None, project_id: str | None = None
+) -> list[dict[str, Any]]:
+    """All boards of a project, each with its columns and cards."""
+    if not project_id:
+        return []
+    db = open_db(settings)
+    return [
+        {
+            "id": board["id"],
+            "project_id": board["project_id"],
+            "name": board["name"],
+            "description": board["description"] or "",
+            "created_at": board["created_at"],
+            "columns": [
+                _kanban_column_dto(db, c)
+                for c in db.list_kanban_columns(board["id"])
+            ],
+        }
+        for board in db.list_kanban_boards(project_id)
+    ]
+
+
+def update_kanban_board(
+    settings: Settings | None = None,
+    board_id: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+) -> bool:
+    """Rename/redescribe a board. False if the board is missing."""
+    if not board_id:
+        return False
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise ValueError("board name is required")
+    return open_db(settings).update_kanban_board(
+        board_id, name=name, description=description
+    )
+
+
+def delete_kanban_board(
+    settings: Settings | None = None, board_id: str | None = None
+) -> bool:
+    if not board_id:
+        return False
+    return open_db(settings).delete_kanban_board(board_id)
+
+
+def add_kanban_column(
+    settings: Settings | None = None,
+    board_id: str | None = None,
+    name: str = "",
+    position: int | None = None,
+) -> str:
+    """Add a column to a board at ``position`` (default: append at the end).
+
+    Raises ``ValueError`` when the board is missing or the name is empty.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("column name is required")
+    if not board_id:
+        raise ValueError("board not found")
+    db = open_db(settings)
+    if db.get_kanban_board(board_id) is None:
+        raise ValueError("board not found")
+    return db.add_kanban_column(board_id, name, position)
+
+
+def update_kanban_column(
+    settings: Settings | None = None,
+    column_id: str | None = None,
+    name: str | None = None,
+    position: int | None = None,
+) -> bool:
+    """Rename or reposition a column. False if the column is missing."""
+    if not column_id:
+        return False
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise ValueError("column name is required")
+    return open_db(settings).update_kanban_column(
+        column_id, name=name, position=position
+    )
+
+
+def delete_kanban_column(
+    settings: Settings | None = None, column_id: str | None = None
+) -> bool:
+    """Delete a column along with its cards. False if the column is missing."""
+    if not column_id:
+        return False
+    return open_db(settings).delete_kanban_column(column_id)
+
+
+def add_kanban_card(
+    settings: Settings | None = None,
+    board_id: str | None = None,
+    column_id: str | None = None,
+    title: str = "",
+    description: str = "",
+    task_id: str | None = None,
+) -> str:
+    """Add a card to a board column. Raises ValueError on invalid input."""
+    title = (title or "").strip()
+    if not title:
+        raise ValueError("card title is required")
+    if not board_id:
+        raise ValueError("board not found")
+    db = open_db(settings)
+    board = db.get_kanban_board(board_id)
+    if board is None:
+        raise ValueError("board not found")
+    if not column_id:
+        raise ValueError("column not found")
+    cols = db.list_kanban_columns(board_id)
+    if not any(c["id"] == column_id for c in cols):
+        raise ValueError("column not found")
+    return db.add_kanban_card(board_id, column_id, title, description, task_id)
+
+
+def move_kanban_card(
+    settings: Settings | None = None,
+    card_id: str | None = None,
+    column_id: str | None = None,
+    position: int | None = None,
+) -> bool:
+    """Move a card to another column and/or reorder it."""
+    if not card_id:
+        return False
+    db = open_db(settings)
+    card = db.get_kanban_card(card_id)
+    if card is None:
+        return False
+    if column_id is not None and card["column_id"] != column_id:
+        # Validate the target column belongs to the same board.
+        cols = db.list_kanban_columns(card["board_id"])
+        if not any(c["id"] == column_id for c in cols):
+            return False
+    return db.move_kanban_card(card_id, column_id, position)
+
+
+def set_kanban_card_task(
+    settings: Settings | None = None,
+    card_id: str | None = None,
+    task_id: str | None = None,
+) -> bool:
+    """Bind a card to a project task (``task_id=None`` clears the binding)."""
+    if not card_id:
+        return False
+    return open_db(settings).set_kanban_card_task(card_id, task_id)
+
+
+def update_kanban_card(
+    settings: Settings | None = None,
+    card_id: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+) -> bool:
+    if not card_id:
+        return False
+    return open_db(settings).update_kanban_card(card_id, title, description)
+
+
+def delete_kanban_card(
+    settings: Settings | None = None, card_id: str | None = None
+) -> bool:
+    if not card_id:
+        return False
+    return open_db(settings).delete_kanban_card(card_id)
+
+
 def _project_dto(db: Database, row: Any) -> dict[str, Any]:
     keys = row.keys()
     return {

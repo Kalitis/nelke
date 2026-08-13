@@ -50,7 +50,9 @@ The gates (run_tests / run_lint / run_typecheck / boot_check) and commits are ru
 the cycle engine automatically after you finish — do not call them yourself.
 
 Workflow:
-1. Explore the repo (self_read/self_glob/self_grep) and recall relevant memory.
+1. You have a TIGHT exploration budget (a small number of read/glob/grep/recall
+   calls). Open only the file(s) you are about to edit; after ~2-3 reads you
+   MUST start editing — do NOT explore the whole codebase first.
 2. Make focused edits toward the objective, and ALWAYS add or update tests for any
    new behavior in the same step:
    - Every new or changed src module (src/**/*.py) needs a matching
@@ -58,12 +60,17 @@ Workflow:
    - New functions/methods/branches added to an existing module need a new test
      case in that module's test file (create the test file if missing).
    Writing tests is MANDATORY, not optional: the governance gate now rejects code
-   shipped without a matching test file, so you will be sent back to add them.
+     shipped without a matching test file, so you will be sent back to add them.
 3. When you have a coherent improvement ready, you are done for this step — do NOT
    loop infinitely; the engine commits, gates and boot-checks, then feeds results back.
 4. Wait for gate feedback. If the gate failed or a commit was reverted, fix the
    specific problems reported and try again with minimal changes.
 5. When the objective is fully achieved, call propose_cycle_complete.
+
+CRITICAL: reading files is NOT progress — the cycle fails as no-changes if you
+never edit. WRITE CODE. If a read/recall tool returns "EXPLORATION BUDGET
+EXHAUSTED", stop reading entirely and use self_write/self_edit for the rest of
+your turn.
 Avoid broken syntax/imports: any commit that crashes Nelke is reverted automatically."""
 
 
@@ -263,9 +270,10 @@ class CycleEngine:
             SelfEditTool(ctx),
             SelfGlobTool(ctx),
             SelfGrepTool(ctx),
-            RecallTool(memory),
-            MemoryShowTool(memory),
-            MemoryListTool(memory),
+            # Memory read tools share the same exploration budget as self_* reads.
+            RecallTool(memory, explore_nudge=ctx.bump_explore),
+            MemoryShowTool(memory, explore_nudge=ctx.bump_explore),
+            MemoryListTool(memory, explore_nudge=ctx.bump_explore),
             MemoryWriteTool(memory),
             RunLintTool(ctx),
             RunTypecheckTool(ctx),
@@ -493,6 +501,11 @@ class CycleEngine:
             state=state,
             cycle_id_provider=lambda: cycle_id,
             step_provider=lambda: step_no,
+            # Same per-worker exploration budget as parallel mode: keep the
+            # single worker from looping on reads forever. The cycle_id/step
+            # providers are not thread-safe, but this ctx is used by exactly one
+            # agent in one event loop, so the running count is fine.
+            explore_limit=self.explore_budget,
         )
         memory = MemoryStore(repo.repo / "memory")
         agent = self._build_working_agent(ctx, memory)

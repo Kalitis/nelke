@@ -57,6 +57,36 @@ class SelfEditContext:
     # copy instead of re-reading + re-streaming the same file. Workers exploring
     # the same files thus stop duplicating each other's reads.
     read_cache: dict[str, str] | None = None
+    # Exploration budget: caps how many read-only tool calls a worker may make
+    # in a single run. ``explore_limit`` is the cap (0 disables); ``explore_used``
+    # is the running count, bumped by each read-only tool. Once the cap is hit,
+    # further read-only calls return a failure that tells the model to switch to
+    # editing — instead of silently letting it loop on exploration. The engine
+    # sets these per worker per round.
+    explore_limit: int = 0
+    explore_used: int = 0
+
+    def bump_explore(self) -> str | None:
+        """Count one read-only call. Returns a 'stop exploring, start editing'
+        failure message once the budget is exhausted, else None (call proceeds).
+
+        On the call that crosses the limit we still allow it (the model already
+        issued it), but every call AFTER returns the nudge. That keeps the tool
+        result visible to the model so it learns to switch, rather than the run
+        being yanked away mid-thought (which just restarted exploration next round).
+        """
+        if self.explore_limit <= 0:
+            return None
+        self.explore_used += 1
+        if self.explore_used <= self.explore_limit:
+            return None
+        return (
+            "EXPLORATION BUDGET EXHAUSTED. You have already explored enough. "
+            "Do NOT call self_read/self_glob/self_grep/recall again. "
+            "Use self_write or self_edit NOW to make the concrete edits your "
+            "task requires. Exploration alone produces no changes and the cycle "
+            "will fail — write code."
+        )
 
     def trailer(self) -> str:
         return f"Nelke-Self-Improve: cycle {self.cycle_id_provider()} step {self.step_provider()}"
@@ -105,6 +135,9 @@ class SelfReadTool(BaseTool):
         self.ctx = ctx
 
     async def execute(self, **kwargs: Any) -> ToolResult:
+        nudge = self.ctx.bump_explore()
+        if nudge is not None:
+            return ToolResult.failure(nudge)
         path = resolve_within(self.ctx.repo_root, kwargs.get("path", ""))
         rel = self.ctx._rel(path)
         cache = self.ctx.read_cache
@@ -219,6 +252,9 @@ class SelfGlobTool(BaseTool):
         self.ctx = ctx
 
     async def execute(self, **kwargs: Any) -> ToolResult:
+        nudge = self.ctx.bump_explore()
+        if nudge is not None:
+            return ToolResult.failure(nudge)
         root = self.ctx.repo_root.resolve()
         matches = sorted(
             p.relative_to(root).as_posix()
@@ -250,6 +286,9 @@ class SelfGrepTool(BaseTool):
     async def execute(self, **kwargs: Any) -> ToolResult:
         import re
 
+        nudge = self.ctx.bump_explore()
+        if nudge is not None:
+            return ToolResult.failure(nudge)
         pattern = str(kwargs.get("pattern", ""))
         include = str(kwargs.get("include") or "**/*")
         try:

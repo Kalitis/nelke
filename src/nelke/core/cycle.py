@@ -80,7 +80,10 @@ completion — the cycle engine handles commits and gates centrally after all
 workers finish.
 
 Workflow:
-1. Read your assigned task (title + detail). Explore only the files in scope.
+1. Read your assigned task (title + detail). You have a TIGHT exploration budget
+   (a small number of read/glob/grep/recall calls). After ~2-3 reads you MUST
+   start editing — do NOT explore the whole codebase first. Open only the file
+   you are about to edit, then edit it.
 2. Make focused edits toward the task, and ALWAYS add or update tests for any new
    behavior in the same pass:
    - Every new or changed src module (src/**/*.py) needs a matching
@@ -91,6 +94,11 @@ Workflow:
    shipped without a matching test file, so you will be sent back to add them.
 3. Optionally run the gates to self-check your edits.
 4. When your slice is complete, stop and return a short summary of what you did.
+
+CRITICAL: exploration alone produces NO changes and the cycle will fail as
+no-changes if you never edit. Reading files is not progress — WRITE CODE.
+If a read tool returns "EXPLORATION BUDGET EXHAUSTED", stop reading entirely
+and use self_write/self_edit for the rest of your turn.
 
 Do NOT loop infinitely. Do NOT edit files outside your task's scope. Other
 workers rely on the shared working tree staying consistent with your slice."""
@@ -196,7 +204,7 @@ class CycleEngine:
         mode: Literal["single", "parallel"] = "single",
         max_workers: int = 6,
         max_steps_per_worker: int | None = None,
-        explore_budget: int = 6,
+        explore_budget: int = 12,
     ) -> None:
         self.repo = repo
         self.db = db
@@ -304,9 +312,11 @@ class CycleEngine:
             SelfEditTool(ctx),
             SelfGlobTool(ctx),
             SelfGrepTool(ctx),
-            RecallTool(memory),
-            MemoryShowTool(memory),
-            MemoryListTool(memory),
+            # Memory read tools share the same exploration budget as self_* reads
+            # so a worker can't dodge the cap by switching to recall/memory_show.
+            RecallTool(memory, explore_nudge=ctx.bump_explore),
+            MemoryShowTool(memory, explore_nudge=ctx.bump_explore),
+            MemoryListTool(memory, explore_nudge=ctx.bump_explore),
             MemoryWriteTool(memory),
             RunLintTool(ctx),
             RunTypecheckTool(ctx),
@@ -1093,6 +1103,11 @@ class CycleEngine:
             step_provider=lambda: 0,
             allowed_files=allowed,
             read_cache=read_cache,
+            # Exploration budget: enforced inside the read-only tools. Once a
+            # worker crosses the cap, further reads return a "switch to editing"
+            # failure the model can see and react to — rather than the run being
+            # silently yanked, which only made the worker re-explore next round.
+            explore_limit=self.explore_budget,
         )
         self.db.update_cycle_worker(worker_id, status="running", started_at=_now())
         emit("worker_start", f"worker {worker_index} started",
@@ -1102,12 +1117,6 @@ class CycleEngine:
         # `agent_text` row per finished turn keeps multi-million-token runs from
         # blowing up the DB.
         turn_buf: list[str] = []
-        # Exploration budget bookkeeping. ``explore_count`` is a one-element list
-        # so the ``on_worker_tool`` closure can mutate it without ``nonlocal``;
-        # ``agent_ref`` lets the same closure call ``request_stop`` once the
-        # agent exists (it is created below the callbacks).
-        explore_count = [0]
-        agent_ref: list[Any] = [None]
 
         def on_worker_token(tok: str) -> None:
             turn_buf.append(tok)
@@ -1124,24 +1133,6 @@ class CycleEngine:
                 emit("agent_tool", f"{name}", worker_id=worker_id, tool=name, args=args)
             except Exception:  # noqa: BLE001
                 pass
-            # Exploration budget: count read-only calls and, once the worker
-            # exceeds the cap, ask the agent to stop at the next safe point.
-            # This is what stops a worker from spending its whole iteration
-            # budget on self_read/glob/grep/recall and never editing.
-            if self.explore_budget > 0 and name in _READ_ONLY_TOOLS:
-                explore_count[0] += 1
-                if explore_count[0] > self.explore_budget and agent_ref[0] is not None:
-                    agent_ref[0].request_stop(
-                        "exploration budget exceeded — make edits now"
-                    )
-                    try:
-                        emit("explore_budget_exceeded",
-                             f"worker hit the exploration cap ({self.explore_budget}); "
-                             "stopping to force edits",
-                             worker_id=worker_id, budget=self.explore_budget,
-                             calls=explore_count[0])
-                    except Exception:  # noqa: BLE001
-                        pass
 
         def on_worker_tool_result(name: str, args: dict[str, Any], result: str) -> None:
             try:
@@ -1149,6 +1140,21 @@ class CycleEngine:
                      snippet=(result or "")[:400])
             except Exception:  # noqa: BLE001
                 pass
+            # Surface when the budget has just been exhausted so the UI/timeline
+            # shows the worker was nudged toward editing. Detected from the
+            # canonical nudge text the tools return once over the cap.
+            if (
+                name in _READ_ONLY_TOOLS
+                and self.explore_budget > 0
+                and "EXPLORATION BUDGET EXHAUSTED" in (result or "")
+            ):
+                try:
+                    emit("explore_budget_exceeded",
+                         f"worker hit the exploration cap ({self.explore_budget}); "
+                         "read-only calls now return a 'write code' nudge",
+                         worker_id=worker_id, budget=self.explore_budget)
+                except Exception:  # noqa: BLE001
+                    pass
 
         def on_worker_usage(usage: dict[str, Any]) -> None:
             try:
@@ -1167,9 +1173,6 @@ class CycleEngine:
         agent.on_turn_end = on_worker_turn_end
         agent.on_tool = on_worker_tool
         agent.on_tool_result = on_worker_tool_result
-        # Publish the agent into the on_tool closure so it can request_stop when
-        # the exploration budget is blown.
-        agent_ref[0] = agent
 
         prompt = task.as_prompt()
         if feedback:

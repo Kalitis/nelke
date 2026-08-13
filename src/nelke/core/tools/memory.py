@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from nelke.core.memory import MemoryStore
 from nelke.core.tools.base import BaseTool, ToolError, ToolResult
+
+# Optional hook returning a 'stop exploring' failure message when the caller's
+# exploration budget is exhausted, else None (proceed). Wired up by the cycle
+# engine so recall/memory_show/memory_list respect the same per-worker budget
+# as the self_* read tools.
+ExploreNudge = Callable[[], "str | None"]
 
 
 class RecallTool(BaseTool):
@@ -18,11 +26,17 @@ class RecallTool(BaseTool):
         "required": ["query"],
     }
 
-    def __init__(self, store: MemoryStore, default_top_k: int = 8) -> None:
+    def __init__(self, store: MemoryStore, default_top_k: int = 8,
+                 explore_nudge: ExploreNudge | None = None) -> None:
         self.store = store
         self.default_top_k = default_top_k
+        self.explore_nudge = explore_nudge
 
     async def execute(self, **kwargs) -> ToolResult:
+        if self.explore_nudge is not None:
+            nudge = self.explore_nudge()
+            if nudge is not None:
+                return ToolResult.failure(nudge)
         query = str(kwargs.get("query", ""))
         top_k = int(kwargs.get("top_k") or self.default_top_k)
         hits = await self.store.arecall(query, top_k)
@@ -42,10 +56,15 @@ class MemoryListTool(BaseTool):
     )
     parameters = {"type": "object", "properties": {}}
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryStore, explore_nudge: ExploreNudge | None = None) -> None:
         self.store = store
+        self.explore_nudge = explore_nudge
 
     async def execute(self, **kwargs) -> ToolResult:
+        if self.explore_nudge is not None:
+            nudge = self.explore_nudge()
+            if nudge is not None:
+                return ToolResult.failure(nudge)
         files = self.store.files()
         if not files:
             return ToolResult.success("memory store is empty")
@@ -67,10 +86,15 @@ class MemoryShowTool(BaseTool):
         "required": ["path"],
     }
 
-    def __init__(self, store: MemoryStore) -> None:
+    def __init__(self, store: MemoryStore, explore_nudge: ExploreNudge | None = None) -> None:
         self.store = store
+        self.explore_nudge = explore_nudge
 
     async def execute(self, **kwargs) -> ToolResult:
+        if self.explore_nudge is not None:
+            nudge = self.explore_nudge()
+            if nudge is not None:
+                return ToolResult.failure(nudge)
         path = str(kwargs.get("path", ""))
         try:
             content = self.store.read(path)

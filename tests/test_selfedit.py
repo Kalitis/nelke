@@ -10,6 +10,7 @@ from nelke.core.tools.base import ToolError
 from nelke.core.tools.selfedit import (
     GitCommitTool,
     SelfEditContext,
+    SelfEditTool,
     SelfGlobTool,
     SelfGrepTool,
     SelfReadTool,
@@ -95,8 +96,6 @@ async def test_allowed_files_blocks_write_outside_scope(tmp_repo):
 
 async def test_allowed_files_blocks_edit_outside_scope(tmp_repo):
     """self_edit is scoped the same way as self_write."""
-    from nelke.core.tools.selfedit import SelfEditTool
-
     # seed a file via an unrestricted ctx, then restrict
     seed_ctx = _ctx(tmp_repo)
     await SelfWriteTool(seed_ctx).execute(path="memory/facts/in.md", content="hello")
@@ -143,3 +142,56 @@ async def test_read_cache_serves_cached_copy(tmp_repo):
     assert r2.ok
     assert r2.output.startswith("[cached]")
     assert "unique body text" in r2.output
+
+
+async def test_explore_budget_nudges_after_limit(tmp_repo):
+    """Once the read-only budget is exhausted, further reads return a 'write
+    code' nudge instead of the file content — so the model sees a failure it
+    can react to and switch to editing, rather than the run being silently
+    yanked (which only restarted exploration next round)."""
+    await SelfWriteTool(_ctx(tmp_repo)).execute(
+        path="memory/facts/d.md", content="# D\nbody")
+
+    ctx = _ctx(tmp_repo)
+    ctx.explore_limit = 2  # allow two reads, then nudge
+    reader = SelfReadTool(ctx)
+
+    first = await reader.execute(path="memory/facts/d.md")
+    second = await reader.execute(path="memory/facts/d.md")
+    assert first.ok and second.ok  # within budget
+
+    third = await reader.execute(path="memory/facts/d.md")
+    assert not third.ok
+    assert "EXPLORATION BUDGET EXHAUSTED" in third.error
+    assert "self_write" in third.error  # points the model at the editing tools
+
+
+async def test_explore_budget_zero_disables_nudge(tmp_repo):
+    """explore_limit=0 means no cap (reviewer/legacy) — reads never nudge."""
+    await SelfWriteTool(_ctx(tmp_repo)).execute(
+        path="memory/facts/e.md", content="x")
+    ctx = _ctx(tmp_repo)
+    ctx.explore_limit = 0
+    reader = SelfReadTool(ctx)
+    for _ in range(20):
+        r = await reader.execute(path="memory/facts/e.md")
+        assert r.ok
+
+
+async def test_explore_budget_does_not_block_writes(tmp_repo):
+    """The budget only applies to read-only tools; self_write/self_edit are
+    never nudged, so an over-budget worker can still make its edits."""
+    ctx = _ctx(tmp_repo)
+    ctx.explore_limit = 1
+    # exhaust the read budget
+    await SelfWriteTool(_ctx(tmp_repo)).execute(path="memory/facts/f.md", content="v1")
+    reader = SelfReadTool(ctx)
+    await reader.execute(path="memory/facts/f.md")  # 1/1 — still allowed
+    over = await reader.execute(path="memory/facts/f.md")  # 2 — nudged
+    assert not over.ok
+    # writes still work after the budget is blown
+    w = await SelfWriteTool(ctx).execute(path="memory/facts/f.md", content="v2")
+    assert w.ok
+    e = await SelfEditTool(ctx).execute(
+        path="memory/facts/f.md", old_string="v2", new_string="v3")
+    assert e.ok

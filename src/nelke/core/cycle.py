@@ -354,6 +354,37 @@ class CycleEngine:
             message=message,
         )
 
+    def _build_resume_hint(
+        self,
+        repo: GitRepo,
+        branch: str,
+        read_cache: dict[str, str] | None = None,
+    ) -> str:
+        """Append-only context handed to workers/agent when resuming a round.
+
+        Workers restart from scratch each round (a fresh agent), so without this
+        they re-read every file they already explored. The hint tells them what
+        is already changed on the branch and which files are already understood,
+        so they go straight to the remaining work instead of duplicating prior
+        exploration. Best-effort: any git error just yields an empty hint.
+        """
+        try:
+            changed = repo.changed_files("main", branch)
+        except Exception:  # noqa: BLE001 - resume hint is best-effort
+            changed = []
+        parts: list[str] = []
+        if changed:
+            parts.append("Already changed on this branch (do NOT redo these):")
+            parts.extend(f"- {f}" for f in changed[:50])
+        if read_cache:
+            # Only mention files a worker actually read (not every cache key is
+            # a real read, but the approximation is good enough for a hint).
+            studied = sorted(read_cache.keys())[:50]
+            if studied:
+                parts.append("Files already explored (do NOT re-read; recall from here):")
+                parts.extend(f"- {f}" for f in studied)
+        return "\n".join(parts)
+
     async def run(
         self,
         objective: str,
@@ -529,6 +560,16 @@ class CycleEngine:
 
         while True:
             # ------------------- WORK PHASE -------------------------------
+            # When resuming after feedback, augment it with what is already on
+            # the branch so the agent skips re-exploring (it keeps its own
+            # conversation across steps, but the progress hint is still useful
+            # after an objective-gate / review reset).
+            if feedback:
+                hint = self._build_resume_hint(repo, branch)
+                if hint:
+                    feedback = f"{feedback}\n\n[progress so far]\n{hint}"
+                    emit("round_resume", "resuming with prior-progress context",
+                         step=step_no)
             step_cap_hit = False
             while step_no < self.max_steps:
                 gate_passed = False
@@ -788,6 +829,16 @@ class CycleEngine:
             # Snapshot the diff baseline so we can tell if workers produced
             # anything new this round (clean state -> gate idle path).
             had_changes_before = repo.has_changes()
+            # When resuming after feedback (objective gaps / request_changes /
+            # gate failure), workers start a fresh agent each round. Augment
+            # the feedback with what is already done so they skip re-exploring
+            # and go straight to the remaining work.
+            if feedback:
+                hint = self._build_resume_hint(repo, branch, shared_read_cache)
+                if hint:
+                    feedback = f"{feedback}\n\n[progress so far]\n{hint}"
+                    emit("round_resume", "resuming with prior-progress context",
+                         round=round_no)
 
             # Build per-worker agents and run them concurrently. Each worker
             # gets its own SelfEditContext.state so they do not stomp on each

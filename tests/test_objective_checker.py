@@ -98,3 +98,39 @@ async def test_cycle_does_not_merge_when_objective_not_met(tmp_repo, db):
     result = await engine.run("add a memory lesson")
     assert result.status == "request-changes"
     assert "objective_not_met" in events
+
+
+async def test_resume_hint_adds_progress_context(tmp_repo, db):
+    """When resuming after objective feedback with changes already on the branch,
+    the agent is told what is already done so it does not re-explore. The
+    round_resume event signals the augmented feedback is in flight."""
+    events: list[str] = []
+    seen_feedback: list[str] = []
+
+    def objective_resp(m, t):
+        return final_response("VERDICT: NOT_ACHIEVED\nGAPS:\n- the widget is missing")
+
+    def worker(m, t):
+        # Capture the feedback handed to the agent each round.
+        last_user = next((x["content"] for x in reversed(m)
+                          if x.get("role") == "user" and isinstance(x.get("content"), str)), "")
+        seen_feedback.append(last_user)
+        return tool_response("self_write",
+                             {"path": "memory/facts/p.md", "content": "# p\nmore"})
+
+    llm = driver_fake(worker=worker, objective=objective_resp)
+    # max_step_attempts=2 so the objective gate fires once, the agent resumes,
+    # then the gate fires again and terminates.
+    engine = _engine_single(
+        tmp_repo, db, FakeGovernance(), llm,
+        max_step_attempts=2,
+        on_event=lambda e: events.append(e.kind),
+    )
+    result = await engine.run("add a memory lesson")
+    assert result.status == "request-changes"
+    assert "round_resume" in events
+    # The resumed feedback must carry the progress-so-far section naming the
+    # file the agent already wrote.
+    resumed = [f for f in seen_feedback if "[progress so far]" in f]
+    assert resumed, "expected at least one feedback with a progress hint"
+    assert any("memory/facts/p.md" in f for f in resumed)

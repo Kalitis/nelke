@@ -176,6 +176,11 @@ class GitRepo:
     def diff_stat(self, base: str, head: str = "HEAD") -> str:
         return self._run("diff", "--stat", base, head).text
 
+    def changed_files(self, base: str, head: str = "HEAD") -> list[str]:
+        """Repo-relative file paths changed between ``base`` and ``head``."""
+        text = self._run("diff", "--name-only", base, head).text
+        return [line.strip() for line in text.splitlines() if line.strip()]
+
     # Rollback
     def revert_commit(self, sha: str) -> GitResult:
         """Create a revert commit undoing the given commit (used on boot-check failure)."""

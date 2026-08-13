@@ -34,6 +34,24 @@ def project_directory(repo_root: Path, project_id: str) -> Path:
     return repo_root / PROJECTS_ROOT_NAME / project_id
 
 
+def create_project_directory(repo_root: Path, project_id: str) -> Path:
+    """Create (idempotently) and return a project's localised directory.
+
+    Seeds a default ``README.md`` on first creation so the project has a local
+    anchor (working root) in the tree.
+    """
+    path = project_directory(repo_root, project_id)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        seed = path / "README.md"
+        if not seed.exists():
+            seed.write_text(
+                f"# Project {project_id}\n\nLocalised project root.\n",
+                encoding="utf-8",
+            )
+    return path
+
+
 def _board_dto(db: Database, board) -> dict:
     return {
         "id": board["id"],

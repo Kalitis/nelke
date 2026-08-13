@@ -669,3 +669,54 @@ def test_kanban_move_card_rejects_foreign_column(tmp_repo, settings):
     assert services.move_kanban_card(settings, "ghost-card", col_id_b1) is False
 
 
+def test_kanban_board_update(tmp_repo, settings):
+    pid = services.create_project(settings, name="P", repo=tmp_repo.repo)
+    board_id = services.create_kanban_board(settings, pid, "Board")
+    assert services.update_kanban_board(settings, board_id, name="Renamed", description="D")
+    board = services.get_kanban_board(settings, board_id)
+    assert board["name"] == "Renamed"
+    assert board["description"] == "D"
+    # blank name rejected
+    with pytest.raises(ValueError, match="board name is required"):
+        services.update_kanban_board(settings, board_id, name="  ")
+    assert services.update_kanban_board(settings, "ghost-board", name="x") is False
+
+
+def test_kanban_column_crud(tmp_repo, settings):
+    pid = services.create_project(settings, name="P", repo=tmp_repo.repo)
+    board_id = services.create_kanban_board(settings, pid, "Board")
+    col_id = services.add_kanban_column(settings, board_id, "Review", position=1)
+    board = services.get_kanban_board(settings, board_id)
+    assert [c["name"] for c in board["columns"]] == [
+        "Backlog", "Review", "In Progress", "Done",
+    ]
+
+    # rename / reposition
+    assert services.update_kanban_column(settings, col_id, name="QA", position=0)
+    board = services.get_kanban_board(settings, board_id)
+    assert [c["name"] for c in board["columns"]] == [
+        "QA", "Backlog", "In Progress", "Done",
+    ]
+    with pytest.raises(ValueError, match="column name is required"):
+        services.update_kanban_column(settings, col_id, name=" ")
+    assert services.update_kanban_column(settings, "ghost-col", name="x") is False
+
+    # delete a column
+    assert services.delete_kanban_column(settings, col_id)
+    board = services.get_kanban_board(settings, board_id)
+    assert [c["name"] for c in board["columns"]] == [
+        "Backlog", "In Progress", "Done",
+    ]
+    assert services.delete_kanban_column(settings, "ghost-col") is False
+
+
+def test_kanban_add_column_invalid_inputs(tmp_repo, settings):
+    pid = services.create_project(settings, name="P", repo=tmp_repo.repo)
+    board_id = services.create_kanban_board(settings, pid, "B")
+    with pytest.raises(ValueError, match="column name is required"):
+        services.add_kanban_column(settings, board_id, "  ")
+    with pytest.raises(ValueError, match="board not found"):
+        services.add_kanban_column(settings, "ghost-board", "X")
+
+
+

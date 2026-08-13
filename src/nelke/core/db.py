@@ -427,289 +427,6 @@ class Database:
                 )
             )
 
-    # ---- kanban boards -------------------------------------------------------
-    def create_board(
-        self,
-        project_id: str,
-        name: str,
-        description: str = "",
-        columns: list[str] | None = None,
-        board_id: str | None = None,
-    ) -> str:
-        """Create a kanban board for a project and return its id.
-
-        When ``columns`` is given, a column is created for each label (in
-        order) with ``position`` 0..n-1. A board with no explicit columns
-        starts empty (callers commonly add columns via ``add_column``).
-        """
-        self._prepare()
-        if self.get_project(project_id) is None:
-            raise ValueError(f"unknown project: {project_id}")
-        bid = board_id or new_id()
-        now = _now()
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO kanban_boards (id, project_id, name, description, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (bid, project_id, name, description, now, now),
-            )
-        for i, label in enumerate(columns or []):
-            self.add_column(bid, label, position=i)
-        return bid
-
-    def get_board(self, board_id: str) -> sqlite3.Row | None:
-        with self._conn() as conn:
-            return conn.execute(
-                "SELECT * FROM kanban_boards WHERE id=?", (board_id,)
-            ).fetchone()
-
-    def list_boards(self, project_id: str | None = None) -> list[sqlite3.Row]:
-        """Boards for a project (or all boards), with column and card counts."""
-        if project_id is not None and self.get_project(project_id) is None:
-            return []
-        q = (
-            "SELECT b.*, "
-            "(SELECT COUNT(*) FROM kanban_columns c WHERE c.board_id = b.id) AS column_count, "
-            "(SELECT COUNT(*) FROM kanban_cards k WHERE k.board_id = b.id) AS card_count "
-            "FROM kanban_boards b"
-        )
-        args: list[str] = []
-        if project_id is not None:
-            q += " WHERE b.project_id=?"
-            args.append(project_id)
-        q += " ORDER BY b.created_at"
-        with self._conn() as conn:
-            return list(conn.execute(q, args))
-
-    def update_board(
-        self, board_id: str, *, name: str | None = None, description: str | None = None
-    ) -> bool:
-        """Update a board's name/description. Returns False if the board is missing."""
-        if self.get_board(board_id) is None:
-            return False
-        fields: dict[str, Any] = {}
-        if name is not None:
-            fields["name"] = name
-        if description is not None:
-            fields["description"] = description
-        fields["updated_at"] = _now()
-        cols = ", ".join(f"{k}=?" for k in fields)
-        with self._conn() as conn:
-            conn.execute(
-                f"UPDATE kanban_boards SET {cols} WHERE id=?",
-                (*fields.values(), board_id),
-            )
-        return True
-
-    def delete_board(self, board_id: str) -> bool:
-        """Remove a board and its columns and cards. Returns False if missing."""
-        if self.get_board(board_id) is None:
-            return False
-        with self._conn() as conn:
-            conn.execute("DELETE FROM kanban_cards WHERE board_id=?", (board_id,))
-            conn.execute("DELETE FROM kanban_columns WHERE board_id=?", (board_id,))
-            conn.execute("DELETE FROM kanban_boards WHERE id=?", (board_id,))
-        return True
-
-    # ---- kanban columns ------------------------------------------------------
-    def next_column_position(self, board_id: str) -> int:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) AS m FROM kanban_columns WHERE board_id=?",
-                (board_id,),
-            ).fetchone()
-            return int(row["m"]) + 1
-
-    def add_column(
-        self,
-        board_id: str,
-        name: str,
-        position: int | None = None,
-        column_id: str | None = None,
-    ) -> str:
-        """Add a column to a board at ``position`` (default: append at end)."""
-        self._prepare()
-        if self.get_board(board_id) is None:
-            raise ValueError(f"unknown board: {board_id}")
-        if position is None:
-            position = self.next_column_position(board_id)
-        cid = column_id or new_id()
-        with self._conn() as conn:
-            # Make room for an explicit position: shift any existing column at
-            # or after the target one slot so positions stay unique/sorted.
-            conn.execute(
-                "UPDATE kanban_columns SET position=position+1 "
-                "WHERE board_id=? AND position>=?",
-                (board_id, position),
-            )
-            conn.execute(
-                "INSERT INTO kanban_columns (id, board_id, name, position, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (cid, board_id, name, position, _now()),
-            )
-        return cid
-
-    def get_column(self, column_id: str) -> sqlite3.Row | None:
-        with self._conn() as conn:
-            return conn.execute(
-                "SELECT * FROM kanban_columns WHERE id=?", (column_id,)
-            ).fetchone()
-
-    def list_columns(self, board_id: str) -> list[sqlite3.Row]:
-        """Columns of a board ordered by ``position``, each with its card count."""
-        if self.get_board(board_id) is None:
-            return []
-        with self._conn() as conn:
-            return list(
-                conn.execute(
-                    "SELECT c.*, "
-                    "(SELECT COUNT(*) FROM kanban_cards k WHERE k.column_id = c.id) AS card_count "
-                    "FROM kanban_columns c WHERE c.board_id=? ORDER BY c.position, c.created_at",
-                    (board_id,),
-                )
-            )
-
-    def update_column(self, column_id: str, *, name: str | None = None, position: int | None = None) -> bool:
-        """Update a column's name/position. Returns False if the column is missing."""
-        if self.get_column(column_id) is None:
-            return False
-        fields: dict[str, Any] = {}
-        if name is not None:
-            fields["name"] = name
-        if position is not None:
-            fields["position"] = position
-        cols = ", ".join(f"{k}=?" for k in fields)
-        with self._conn() as conn:
-            conn.execute(
-                f"UPDATE kanban_columns SET {cols} WHERE id=?",
-                (*fields.values(), column_id),
-            )
-        return True
-
-    def delete_column(self, column_id: str) -> bool:
-        """Remove a column and move its cards... to the trash (cards are deleted).
-
-        Returns False if the column is missing. Cards in the column are removed
-        with it — callers that want to preserve content should move them first.
-        """
-        if self.get_column(column_id) is None:
-            return False
-        with self._conn() as conn:
-            conn.execute("DELETE FROM kanban_cards WHERE column_id=?", (column_id,))
-            conn.execute("DELETE FROM kanban_columns WHERE id=?", (column_id,))
-        return True
-
-    # ---- kanban cards --------------------------------------------------------
-    def next_card_position(self, column_id: str) -> int:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) AS m FROM kanban_cards WHERE column_id=?",
-                (column_id,),
-            ).fetchone()
-            return int(row["m"]) + 1
-
-    def add_card(
-        self,
-        board_id: str,
-        column_id: str,
-        title: str,
-        description: str = "",
-        task_id: str | None = None,
-        position: int | None = None,
-        card_id: str | None = None,
-    ) -> str:
-        """Add a card to a column. ``position`` defaults to the end of the column."""
-        self._prepare()
-        if self.get_board(board_id) is None:
-            raise ValueError(f"unknown board: {board_id}")
-        if self.get_column(column_id) is None:
-            raise ValueError(f"unknown column: {column_id}")
-        if position is None:
-            position = self.next_card_position(column_id)
-        kid = card_id or new_id()
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT INTO kanban_cards "
-                "(id, board_id, column_id, title, description, task_id, position, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (kid, board_id, column_id, title, description, task_id, position, _now(), _now()),
-            )
-        return kid
-
-    def get_card(self, card_id: str) -> sqlite3.Row | None:
-        with self._conn() as conn:
-            return conn.execute(
-                "SELECT * FROM kanban_cards WHERE id=?", (card_id,)
-            ).fetchone()
-
-    def list_cards(self, board_id: str, column_id: str | None = None) -> list[sqlite3.Row]:
-        """Cards of a board, optionally filtered to one column, ordered by position."""
-        if self.get_board(board_id) is None:
-            return []
-        q = "SELECT * FROM kanban_cards WHERE board_id=?"
-        args: list[str] = [board_id]
-        if column_id is not None:
-            q += " AND column_id=?"
-            args.append(column_id)
-        q += " ORDER BY position, created_at"
-        with self._conn() as conn:
-            return list(conn.execute(q, args))
-
-    def update_card(
-        self,
-        card_id: str,
-        *,
-        column_id: str | None = None,
-        title: str | None = None,
-        description: str | None = None,
-        task_id: str | None = None,
-        position: int | None = None,
-    ) -> bool:
-        """Update a card's fields. Returns False if the card is missing."""
-        if self.get_card(card_id) is None:
-            return False
-        fields: dict[str, Any] = {}
-        if column_id is not None:
-            fields["column_id"] = column_id
-        if title is not None:
-            fields["title"] = title
-        if description is not None:
-            fields["description"] = description
-        if task_id is not None:
-            fields["task_id"] = task_id
-        if position is not None:
-            fields["position"] = position
-        fields["updated_at"] = _now()
-        cols = ", ".join(f"{k}=?" for k in fields)
-        with self._conn() as conn:
-            conn.execute(
-                f"UPDATE kanban_cards SET {cols} WHERE id=?",
-                (*fields.values(), card_id),
-            )
-        return True
-
-    def move_card(self, card_id: str, column_id: str, position: int | None = None) -> bool:
-        """Move a card to another column (or reorder it in place)."""
-        if self.get_card(card_id) is None:
-            return False
-        if self.get_column(column_id) is None:
-            return False
-        if position is None:
-            position = self.next_card_position(column_id)
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE kanban_cards SET column_id=?, position=?, updated_at=? WHERE id=?",
-                (column_id, position, _now(), card_id),
-            )
-        return True
-
-    def delete_card(self, card_id: str) -> bool:
-        """Remove a card. Returns False if the card is missing."""
-        if self.get_card(card_id) is None:
-            return False
-        with self._conn() as conn:
-            conn.execute("DELETE FROM kanban_cards WHERE id=?", (card_id,))
-        return True
 
     def add_message(
         self,
@@ -1118,24 +835,28 @@ class Database:
         project_id: str,
         name: str,
         description: str = "",
+        columns: list[str] | None = None,
         board_id: str | None = None,
     ) -> str:
-        """Create a kanban board for a project; returns its id.
+        """Create a kanban board for a project and return its id.
 
-        A default set of columns (Backlog / In Progress / Done) is seeded so
-        the board is immediately usable. Raises nothing on missing project —
-        the caller is expected to validate the project first.
+        Raises ``ValueError`` when the project does not exist. Default columns
+        (Backlog / In Progress / Done) are seeded so the board is immediately
+        usable; pass ``columns`` to override (``[]`` seeds none).
         """
         self._prepare()
+        if self.get_project(project_id) is None:
+            raise ValueError(f"unknown project: {project_id}")
         bid = board_id or new_id()
         now = _now()
+        labels = columns if columns is not None else ("Backlog", "In Progress", "Done")
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO kanban_boards (id, project_id, name, description, created_at, updated_at) "
                 "VALUES (?,?,?,?,?,?)",
                 (bid, project_id, name, description, now, now),
             )
-            for i, col_name in enumerate(("Backlog", "In Progress", "Done")):
+            for i, col_name in enumerate(labels):
                 conn.execute(
                     "INSERT INTO kanban_columns (id, board_id, name, position, created_at) "
                     "VALUES (?,?,?,?,?)",
@@ -1158,16 +879,31 @@ class Database:
                 )
             )
 
+    def update_kanban_board(
+        self, board_id: str, *, name: str | None = None, description: str | None = None
+    ) -> bool:
+        """Update a board's name/description. Returns False if the board is missing."""
+        if self.get_kanban_board(board_id) is None:
+            return False
+        fields: dict[str, Any] = {"updated_at": _now()}
+        if name is not None:
+            fields["name"] = name
+        if description is not None:
+            fields["description"] = description
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self._conn() as conn:
+            conn.execute(
+                f"UPDATE kanban_boards SET {cols} WHERE id=?",
+                (*fields.values(), board_id),
+            )
+        return True
+
     def delete_kanban_board(self, board_id: str) -> bool:
         """Delete a board and all its columns + cards. False if missing."""
         if self.get_kanban_board(board_id) is None:
             return False
         with self._conn() as conn:
-            card_rows = conn.execute(
-                "SELECT id FROM kanban_cards WHERE board_id=?", (board_id,)
-            ).fetchall()
-            for cr in card_rows:
-                conn.execute("DELETE FROM kanban_cards WHERE id=?", (cr["id"],))
+            conn.execute("DELETE FROM kanban_cards WHERE board_id=?", (board_id,))
             conn.execute("DELETE FROM kanban_columns WHERE board_id=?", (board_id,))
             conn.execute("DELETE FROM kanban_boards WHERE id=?", (board_id,))
         return True
@@ -1181,21 +917,95 @@ class Database:
                 )
             )
 
+    def get_kanban_column(self, column_id: str) -> sqlite3.Row | None:
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT * FROM kanban_columns WHERE id=?", (column_id,)
+            ).fetchone()
+
     def add_kanban_column(
         self, board_id: str, name: str, position: int | None = None
     ) -> str:
-        """Add a column to a board at the given position (default: end)."""
+        """Add a column to a board at ``position`` (default: append at the end).
+
+        When an explicit ``position`` is given, existing columns at or after it
+        are shifted one slot so positions stay unique and sorted.
+        """
+        self._prepare()
+        if self.get_kanban_board(board_id) is None:
+            raise ValueError(f"unknown board: {board_id}")
         if position is None:
             cols = self.list_kanban_columns(board_id)
             position = int(cols[-1]["position"]) + 1 if cols else 0
         cid = new_id()
         with self._conn() as conn:
             conn.execute(
+                "UPDATE kanban_columns SET position=position+1 "
+                "WHERE board_id=? AND position>=?",
+                (board_id, position),
+            )
+            conn.execute(
                 "INSERT INTO kanban_columns (id, board_id, name, position, created_at) "
                 "VALUES (?,?,?,?,?)",
                 (cid, board_id, name, position, _now()),
             )
         return cid
+
+    def update_kanban_column(
+        self, column_id: str, *, name: str | None = None, position: int | None = None
+    ) -> bool:
+        """Update a column's name and/or position.
+
+        A position update shifts neighbouring columns so every position stays
+        unique and tight. Returns False if the column is missing.
+        """
+        row = self.get_kanban_column(column_id)
+        if row is None:
+            return False
+        with self._conn() as conn:
+            if name is not None:
+                conn.execute(
+                    "UPDATE kanban_columns SET name=? WHERE id=?", (name, column_id)
+                )
+            if position is not None:
+                count = conn.execute(
+                    "SELECT COUNT(*) AS c FROM kanban_columns WHERE board_id=?",
+                    (row["board_id"],),
+                ).fetchone()["c"]
+                target = position
+                if target < 0:
+                    target = 0
+                elif target >= count:
+                    target = count - 1
+                # Pull the column out of its old slot, then make room at target.
+                conn.execute(
+                    "UPDATE kanban_columns SET position=position-1 "
+                    "WHERE board_id=? AND position>? AND id<>?",
+                    (row["board_id"], row["position"], column_id),
+                )
+                conn.execute(
+                    "UPDATE kanban_columns SET position=position+1 "
+                    "WHERE board_id=? AND position>=? AND id<>?",
+                    (row["board_id"], target, column_id),
+                )
+                conn.execute(
+                    "UPDATE kanban_columns SET position=? WHERE id=?",
+                    (target, column_id),
+                )
+        return True
+
+    def delete_kanban_column(self, column_id: str) -> bool:
+        """Delete a column along with its cards. False if the column is missing.
+
+        Cards in the column are removed with it — callers that want to preserve
+        content should move them to another column first.
+        """
+        if self.get_kanban_column(column_id) is None:
+            return False
+        with self._conn() as conn:
+            conn.execute("DELETE FROM kanban_cards WHERE column_id=?", (column_id,))
+            conn.execute("DELETE FROM kanban_columns WHERE id=?", (column_id,))
+        return True
 
     def add_kanban_card(
         self,
@@ -1207,9 +1017,19 @@ class Database:
     ) -> str:
         """Add a card to a column; returns its id.
 
-        The card is appended at the end of the column (highest position). A
-        ``task_id`` optionally links the card to a project task.
+        Raises ``ValueError`` when the board or column does not exist, or when
+        the column belongs to another board. The card is appended at the end of
+        the column (highest position); ``task_id`` optionally links the card to
+        a project task.
         """
+        self._prepare()
+        if self.get_kanban_board(board_id) is None:
+            raise ValueError(f"unknown board: {board_id}")
+        col = self.get_kanban_column(column_id)
+        if col is None:
+            raise ValueError(f"unknown column: {column_id}")
+        if col["board_id"] != board_id:
+            raise ValueError(f"column {column_id} does not belong to board {board_id}")
         rows = self.list_kanban_cards(board_id, column_id=column_id)
         position = int(rows[-1]["position"]) + 1 if rows else 0
         card_id = new_id()
@@ -1253,16 +1073,20 @@ class Database:
     ) -> bool:
         """Move a card to another column and/or reorder it within a column.
 
-        When ``column_id`` is provided the card is moved to that column. When
-        ``position`` is provided the card is placed at that offset within its
-        (possibly new) column, shifting neighbours. Wildcards cannot inject SQL
-        — values are bound parameters. Returns False for an unknown card.
+        When ``column_id`` is provided the card is moved to that column (which
+        must belong to the same board). When ``position`` is provided the card
+        is placed at that offset within its (possibly new) column, shifting
+        neighbours. Returns False for an unknown card or a foreign column.
         """
         row = self.get_kanban_card(card_id)
         if row is None:
             return False
         target_column = column_id if column_id is not None else row["column_id"]
         target_position = position if position is not None else row["position"]
+        if target_column != row["column_id"]:
+            col = self.get_kanban_column(target_column)
+            if col is None or col["board_id"] != row["board_id"]:
+                return False
         with self._conn() as conn:
             # Normalise the target position into [0, count-1].
             count = conn.execute(
@@ -1325,26 +1149,23 @@ class Database:
         return True
 
     def delete_kanban_card(self, card_id: str) -> bool:
-        """Delete a card. Returns False for an unknown card."""
+        """Delete a card and tighten the remaining positions in its column.
+
+        Returns False for an unknown card.
+        """
         row = self.get_kanban_card(card_id)
         if row is None:
             return False
         with self._conn() as conn:
             conn.execute("DELETE FROM kanban_cards WHERE id=?", (card_id,))
-        # Re-order the remaining cards in the same column to keep positions tight.
-        try:
-            for i, r in enumerate(self.list_kanban_cards(column_id=row["column_id"])):
-                conn = self.connect()
-                try:
-                    conn.execute(
-                        "UPDATE kanban_cards SET position=? WHERE id=?",
-                        (i, r["id"]),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-        except Exception:  # noqa: BLE001 - re-ordering is best-effort cosmetic
-            pass
+            remaining = conn.execute(
+                "SELECT id FROM kanban_cards WHERE column_id=? ORDER BY position, created_at",
+                (row["column_id"],),
+            ).fetchall()
+            for i, r in enumerate(remaining):
+                conn.execute(
+                    "UPDATE kanban_cards SET position=? WHERE id=?", (i, r["id"])
+                )
         return True
 
     # ---- tasks ---------------------------------------------------------------

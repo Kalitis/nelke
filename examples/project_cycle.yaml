@@ -1,0 +1,29 @@
+# Example: a self-improvement cycle for a USER project.
+#
+# Every project gets its own self-improvement cycle. This sample shows how to
+# configure a cycle for an arbitrary project (e.g. your own app or tool),
+# independent of the Nelke self-improvement cycle.
+#
+# Unlike the Nelke example (which lives at the repo root with its localization
+# files there), a project's cycle and its localization files typically live in
+# the project's own root directory.
+
+cycle:
+  name: my-project
+  # The project root where this cycle and its localization files live.
+  root: .
+
+  localization:
+    dir: .
+    files:
+      - "locales"
+      - "translations"
+
+  # A project cycle is scoped to that one project. Changes made by the cycle
+  # apply only within this project and never touch other projects' files.
+  loop:
+    steps:
+      - analyze
+      - improve
+      - test
+      - commit

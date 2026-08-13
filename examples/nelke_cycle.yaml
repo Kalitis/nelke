@@ -1,0 +1,32 @@
+# Nelke example — self-improvement cycle
+#
+# This is the reference (example) self-improvement cycle for the Nelke project
+# itself. It lives at the REPO ROOT, and its localization files live alongside
+# it in the same root directory.
+#
+# Each project has its OWN self-improvement cycle. This file is just one
+# concrete example of how such a cycle is configured for Nelke. Copy it (and
+# its localization files) into a project root to give that project its own
+# cycle; do not share a single global cycle across projects.
+
+cycle:
+  name: nelke
+  # The Nelke example lives at the repo root.
+  root: .
+
+  localization:
+    # Localization files shipped with the Nelke example live at the repo root.
+    dir: .
+    files:
+      - "locales"
+      - "messages"
+
+  # Each project drives its own improvement loop; the example below is only a
+  # template for a project-scoped cycle.
+  loop:
+    steps:
+      - observe
+      - propose
+      - implement
+      - verify
+      - commit

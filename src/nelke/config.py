@@ -118,6 +118,11 @@ class Settings(BaseSettings):
     def workspaces_dir(self) -> Path:
         return self.nelke_home / "workspaces"
 
+    @property
+    def cycle_registry_file(self) -> Path:
+        """Location of the central per-project cycle registry YAML file."""
+        return self.nelke_home / "cycle_registry.yaml"
+
 
 @dataclass
 class Profile:

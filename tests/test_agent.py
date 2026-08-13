@@ -320,3 +320,48 @@ async def test_on_tool_result_notified(tmp_path):
     await agent.run("read")
     assert results_seen and results_seen[0][0] == "read"
     assert "hello world" in results_seen[0][1]
+
+
+async def test_request_stop_ends_loop_after_tool_batch(tmp_path):
+    """request_stop() makes the agent yield at the next safe point (after the
+    current tool batch) with stopped='stopped'. This is the mechanism the cycle
+    engine uses to cap a worker's exploration budget."""
+    from nelke.core.tools.base import BaseTool, ToolResult
+
+    class StopTool(BaseTool):
+        name = "trip_stop"
+        description = "calls agent.request_stop mid-run"
+        parameters = {"type": "object", "properties": {}, "required": []}
+
+        def __init__(self, agent_ref):
+            self.agent_ref = agent_ref
+
+        async def execute(self, **kwargs):
+            # The engine sets the agent into the ref before run; trip it now.
+            self.agent_ref[0].request_stop("budget hit")
+            return ToolResult.success("stopped requested")
+
+    agent_ref = [None]
+    # The model calls trip_stop, then would call read — but the stop flag set
+    # during trip_stop must break the loop before the next iteration.
+    llm = llm_with_script([
+        tool_response("trip_stop", {}),
+        tool_response("read", {"path": "x.txt"}),
+        final_response("should not get here"),
+    ])
+    agent = _agent(tmp_path, llm, tools=[StopTool(agent_ref)])
+    agent_ref[0] = agent
+    result = await agent.run("trip the stop")
+    assert result.stopped == "stopped"
+    assert result.iterations == 1  # stopped right after the first tool batch
+    assert result.tool_calls == 1  # the second (read) call never executed
+
+
+async def test_request_stop_without_flag_runs_normally(tmp_path):
+    """If request_stop is never called, the loop behaves exactly as before."""
+    (tmp_path / "x.txt").write_text("hello", encoding="utf-8")
+    llm = llm_with_script([tool_response("read", {"path": "x.txt"}), final_response("done")])
+    agent = _agent(tmp_path, llm)
+    result = await agent.run("read x")
+    assert result.stopped == "answer"
+    assert result.answer == "done"

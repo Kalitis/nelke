@@ -391,6 +391,7 @@ async def run_cycle(
         agent_temperature=settings.agent_temperature,
         mode=mode,  # type: ignore[arg-type]
         max_workers=max_workers,
+        explore_budget=settings.explore_budget,
     )
     return await engine.run(objective, project_id=project_id)
 

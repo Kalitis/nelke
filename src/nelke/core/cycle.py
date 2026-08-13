@@ -95,6 +95,14 @@ Do NOT loop infinitely. Do NOT edit files outside your task's scope. Other
 workers rely on the shared working tree staying consistent with your slice."""
 
 
+# Read-only tools counted against a worker's exploration budget. These explore
+# the repo without changing it; a worker that only calls these never edits.
+_READ_ONLY_TOOLS = frozenset({
+    "self_read", "self_glob", "self_grep", "recall",
+    "memory_show", "memory_list", "git_diff",
+})
+
+
 @dataclass
 class CycleEvent:
     kind: str
@@ -187,6 +195,7 @@ class CycleEngine:
         mode: Literal["single", "parallel"] = "single",
         max_workers: int = 6,
         max_steps_per_worker: int | None = None,
+        explore_budget: int = 6,
     ) -> None:
         self.repo = repo
         self.db = db
@@ -203,6 +212,8 @@ class CycleEngine:
         self.agent_temperature = agent_temperature
         self.mode = mode
         self.max_workers = max(1, max_workers)
+        # Per-worker cap on read-only tool calls per round. 0 disables it.
+        self.explore_budget = max(0, explore_budget)
         # Per-worker step cap. Default keeps the total roughly inside `max_steps`
         # so a parallel cycle does not exceed the legacy single-worker budget.
         self.max_steps_per_worker = max_steps_per_worker or max(
@@ -973,6 +984,12 @@ class CycleEngine:
         # `agent_text` row per finished turn keeps multi-million-token runs from
         # blowing up the DB.
         turn_buf: list[str] = []
+        # Exploration budget bookkeeping. ``explore_count`` is a one-element list
+        # so the ``on_worker_tool`` closure can mutate it without ``nonlocal``;
+        # ``agent_ref`` lets the same closure call ``request_stop`` once the
+        # agent exists (it is created below the callbacks).
+        explore_count = [0]
+        agent_ref: list[Any] = [None]
 
         def on_worker_token(tok: str) -> None:
             turn_buf.append(tok)
@@ -989,6 +1006,24 @@ class CycleEngine:
                 emit("agent_tool", f"{name}", worker_id=worker_id, tool=name, args=args)
             except Exception:  # noqa: BLE001
                 pass
+            # Exploration budget: count read-only calls and, once the worker
+            # exceeds the cap, ask the agent to stop at the next safe point.
+            # This is what stops a worker from spending its whole iteration
+            # budget on self_read/glob/grep/recall and never editing.
+            if self.explore_budget > 0 and name in _READ_ONLY_TOOLS:
+                explore_count[0] += 1
+                if explore_count[0] > self.explore_budget and agent_ref[0] is not None:
+                    agent_ref[0].request_stop(
+                        "exploration budget exceeded — make edits now"
+                    )
+                    try:
+                        emit("explore_budget_exceeded",
+                             f"worker hit the exploration cap ({self.explore_budget}); "
+                             "stopping to force edits",
+                             worker_id=worker_id, budget=self.explore_budget,
+                             calls=explore_count[0])
+                    except Exception:  # noqa: BLE001
+                        pass
 
         def on_worker_tool_result(name: str, args: dict[str, Any], result: str) -> None:
             try:
@@ -1014,6 +1049,9 @@ class CycleEngine:
         agent.on_turn_end = on_worker_turn_end
         agent.on_tool = on_worker_tool
         agent.on_tool_result = on_worker_tool_result
+        # Publish the agent into the on_tool closure so it can request_stop when
+        # the exploration budget is blown.
+        agent_ref[0] = agent
 
         prompt = task.as_prompt()
         if feedback:

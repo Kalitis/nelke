@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     max_cycle_steps: int = 30
     max_review_rounds: int = 3
     max_step_attempts: int = 3
+    # Per-worker cap on read-only tool calls (self_read/self_glob/self_grep/
+    # recall/memory_show/memory_list) in a single round. A worker that exceeds
+    # it is stopped mid-run and re-prompted to make edits instead of looping on
+    # exploration. 0 disables the cap (legacy behaviour).
+    explore_budget: int = 6
     # How many times a cycle sends the agent back to fix governance-gate
     # failures (tests/lint/typecheck/test-gap) before giving up. A single agent
     # slip should bounce back for rework, not kill the whole cycle.

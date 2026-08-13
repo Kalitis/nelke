@@ -26,6 +26,7 @@ def _engine(repo, db, gov, llm, human=lambda req: True, **kw) -> CycleEngine:
         on_event=kw.pop("on_event", None),
         mode=kw.pop("mode", "single"),
         max_workers=kw.pop("max_workers", 6),
+        explore_budget=kw.pop("explore_budget", 6),
     )
 
 
@@ -499,6 +500,37 @@ async def test_parallel_worker_events_carry_worker_id(tmp_repo, db):
     workers = db.list_cycle_workers(result.cycle_id)
     expected_ids = {w["id"] for w in workers}
     assert worker_ids <= expected_ids
+
+
+async def test_parallel_explore_budget_stops_looper_worker(tmp_repo, db):
+    """A worker that burns every call on self_read (exploration only, never
+    edits) is stopped mid-run once it exceeds the exploration budget, and the
+    engine emits explore_budget_exceeded. This is what stops a worker from
+    spending its whole iteration budget reading and never editing."""
+    events: list[str] = []
+
+    # Worker keeps calling self_read forever (on a missing file is fine — the
+    # call is still counted as exploration); the budget must trip before the
+    # iteration cap.
+    endless_reads = [tool_response(
+        "self_read", {"path": "memory/facts/looper.md"}
+    )] * 20
+
+    llm = driver_fake(
+        worker=scripted(endless_reads),
+        planner=planner_returning([{"title": "only", "detail": "do it"}]),
+    )
+    engine = _engine(
+        tmp_repo, db, FakeGovernance(), llm,
+        mode="parallel", max_workers=2,
+        explore_budget=3, on_event=lambda e: events.append(e.kind),
+    )
+    result = await engine.run("explore forever")
+    # The looper was stopped by the budget, not by finishing.
+    assert "explore_budget_exceeded" in events
+    # With no edits produced in round 1, the cycle's no-progress guard kicks in;
+    # either way the run terminates (not a crash, not an infinite loop).
+    assert result.status in {"no-changes", "request-changes", "merged"}
 
 
 async def test_parallel_cycle_gate_failure_then_rework_succeeds(tmp_repo, db):

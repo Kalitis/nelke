@@ -86,6 +86,21 @@ class Agent:
         self._messages: list[dict[str, Any]] = []
         self._tool_errors = 0
         self.last_usage: dict[str, Any] | None = None
+        # Cooperative stop flag: set externally (e.g. by the cycle engine when a
+        # worker blows its exploration budget) to break the tool loop at the
+        # next safe point — after the current tool finishes — rather than
+        # cancelling mid-call (which could interrupt a file write). See
+        # ``request_stop`` / ``run``.
+        self._stop_reason: str | None = None
+
+    def request_stop(self, reason: str = "") -> None:
+        """Ask a running agent to stop after the current tool call completes.
+
+        Checked between tool calls inside :meth:`run`; the agent returns a
+        partial result with ``stopped="stopped"`` carrying the reason. Safe to
+        call from another coroutine / callback while ``run`` is awaiting.
+        """
+        self._stop_reason = reason or "stopped"
 
     def system_content(self) -> str:
         content = self.system_prompt
@@ -195,6 +210,19 @@ class Agent:
                 tool_calls_total += 1
                 tool_result = await self._execute_tool(tc)
                 msgs.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result.render()})
+            # Cooperative stop: an external signal (e.g. the cycle engine
+            # capping exploration) asked us to yield. Finish at this safe point
+            # — after the tool batch — so we never cut a write mid-flight.
+            if self._stop_reason is not None:
+                self._stop_reason = None
+                self._finalize_usage()
+                if self.on_turn_end is not None:
+                    self.on_turn_end()
+                return AgentResult(
+                    answer="", iterations=i + 1, tool_calls=tool_calls_total,
+                    tool_errors=self._tool_errors, messages=msgs,
+                    stopped="stopped", usage=self._usage,
+                )
         self._finalize_usage()
         if self.on_turn_end is not None:
             self.on_turn_end()

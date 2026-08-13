@@ -59,12 +59,14 @@ def driver_fake(
     worker: Callable[[list[dict], list[dict] | None], LLMResponse] | None = None,
     reviewer: Callable[[list[dict], list[dict] | None], LLMResponse] | None = None,
     planner: Callable[[list[dict], list[dict] | None], LLMResponse] | None = None,
+    objective: Callable[[list[dict], list[dict] | None], LLMResponse] | None = None,
 ) -> FakeLLM:
-    """Runs a distinct responder for worker vs reviewer vs planner agents.
+    """Runs a distinct responder for worker vs reviewer vs planner vs objective.
 
     Detected by system prompt: the planner's prompt contains "task planner",
-    the reviewer's contains "review gate", and everything else falls through
-    to the worker responder.
+    the reviewer's contains "review gate", the objective checker's contains
+    "independent gate judging", and everything else falls through to the
+    worker responder.
     """
     reviewer = reviewer or (lambda messages, tools: final_response(
         "VERDICT: APPROVE\nSUMMARY: looks good\nCOMMENTS: none"
@@ -75,6 +77,11 @@ def driver_fake(
     planner = planner or (lambda messages, tools: final_response(
         '{"tasks":[{"title":"all","detail":"do everything"}]}'
     ))
+    # Default objective checker approves, so existing cycle tests that expect a
+    # merge keep working; tests of the objective gate pass a custom responder.
+    objective = objective or (lambda messages, tools: final_response(
+        "VERDICT: ACHIEVED\nGAPS:\n- none"
+    ))
 
     def _respond(messages, tools):
         system = next((m["content"] for m in messages if m.get("role") == "system"), "")
@@ -82,6 +89,8 @@ def driver_fake(
             return planner(messages, tools)
         if "review gate" in system or "AI review gate" in system:
             return reviewer(messages, tools)
+        if "independent gate judging" in system:
+            return objective(messages, tools)
         return worker(messages, tools)
 
     return FakeLLM(responder=_respond)

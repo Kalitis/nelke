@@ -21,6 +21,7 @@ from nelke.core.gitops import GitError, GitRepo
 from nelke.core.governance import Governance
 from nelke.core.llm import ToolCallback
 from nelke.core.memory import MemoryStore
+from nelke.core.objective_checker import ObjectiveChecker
 from nelke.core.planner import TaskSpec, plan_tasks
 from nelke.core.reviewer import Reviewer, ReviewVerdict
 from nelke.core.tools.memory import MemoryListTool, MemoryShowTool, MemoryWriteTool, RecallTool
@@ -521,6 +522,10 @@ class CycleEngine:
         first_run = True
         committed_any = False
         verdict: ReviewVerdict | None = None
+        # Objective-gate rounds: how many times the objective checker has sent
+        # the agent back because the objective was not yet met. Bounded by
+        # max_step_attempts so an unachievable objective eventually terminates.
+        objective_rounds = 0
 
         while True:
             # ------------------- WORK PHASE -------------------------------
@@ -600,6 +605,32 @@ class CycleEngine:
                 return self._result(cycle_id, objective, branch, "no-changes",
                                     ReviewVerdict("request_changes"),
                                     steps=step_no, message="agent made no changes")
+
+            # ------------------- OBJECTIVE GATE --------------------------
+            # Before spending reviewer passes on code quality, check the changes
+            # actually achieve the objective. An unfinished objective must keep
+            # the agent iterating (with concrete gaps as feedback) instead of
+            # going to review on an "ok but incomplete" diff.
+            objective_checker = ObjectiveChecker(self.llm, temperature=self.agent_temperature)
+            objective_verdict = await objective_checker.check(objective, final_diff)
+            self.db.add_usage(objective_checker.last_usage, cycle_id=cycle_id)
+            if not objective_verdict.achieved:
+                objective_rounds += 1
+                emit("objective_not_met", "objective not yet achieved",
+                     step=step_no, gaps=objective_verdict.gaps[:800])
+                if objective_rounds >= self.max_step_attempts:
+                    self.db.update_cycle(cycle_id, status="request-changes", ended_at=_now())
+                    return self._result(
+                        cycle_id, objective, branch, "request-changes",
+                        ReviewVerdict("request_changes"), steps=step_no,
+                        message=f"objective not achieved: {objective_verdict.gaps[:500]}",
+                    )
+                feedback = (
+                    "The objective is NOT yet achieved. Address each gap and "
+                    "make targeted edits:\n" + objective_verdict.gaps
+                )
+                emit("review_feedback", "resuming work to close objective gaps")
+                continue
 
             # ------------------- AI REVIEW --------------------------------
             rounds = 0
@@ -741,6 +772,10 @@ class CycleEngine:
         verdict: ReviewVerdict | None = None
         committed_any = False
         round_no = 0
+        # Objective-gate rounds: how many times the objective checker has sent
+        # workers back because the objective was not yet met. Bounded by
+        # max_step_attempts so an unachievable objective eventually terminates.
+        objective_rounds = 0
         # Consecutive rounds in which NO worker produced any changes. A worker
         # that burns its whole budget on exploration (read/grep/glob) and never
         # edits must be re-prompted to actually implement, not immediately sunk
@@ -869,8 +904,40 @@ class CycleEngine:
             self.db.add_step(cycle_id, round_no, sha, "ok", "boot check passed")
             emit("step_ok", f"round {round_no} committed, boot-check passed", round=round_no)
 
-            # ---- AI REVIEW -----------------------------------------------
+            # ---- OBJECTIVE GATE ------------------------------------------
+            # Before spending a reviewer pass on code quality, check that the
+            # changes actually achieve the objective. An unfinished objective
+            # must keep the workers iterating (with concrete gaps as feedback)
+            # instead of going to review on an "ok but incomplete" diff.
             final_diff = repo.diff("main", branch)
+            objective_checker = ObjectiveChecker(
+                self.llm, temperature=self.agent_temperature,
+            )
+            objective_verdict = await objective_checker.check(objective, final_diff)
+            self.db.add_usage(objective_checker.last_usage, cycle_id=cycle_id)
+            if not objective_verdict.achieved:
+                objective_rounds += 1
+                emit("objective_not_met",
+                     "objective not yet achieved",
+                     round=round_no, gaps=objective_verdict.gaps[:800])
+                if objective_rounds >= self.max_step_attempts:
+                    # The objective stays unmet after the budget: surface it as a
+                    # request-changes outcome so the branch is left for review
+                    # rather than silently merged unfinished.
+                    self.db.update_cycle(cycle_id, status="request-changes", ended_at=_now())
+                    return self._result(
+                        cycle_id, objective, branch, "request-changes",
+                        ReviewVerdict("request_changes"), steps=round_no,
+                        message=f"objective not achieved: {objective_verdict.gaps[:500]}",
+                    )
+                feedback = (
+                    "The objective is NOT yet achieved. Address each gap and "
+                    "make targeted edits:\n" + objective_verdict.gaps
+                )
+                emit("review_feedback", "resuming work to close objective gaps")
+                continue
+
+            # ---- AI REVIEW -----------------------------------------------
             reviewer = Reviewer(repo, self.llm, base="main",
                                 temperature=self.agent_temperature)
             verdict = await reviewer.review(objective, final_diff)

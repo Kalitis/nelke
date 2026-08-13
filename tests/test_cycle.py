@@ -622,3 +622,45 @@ async def test_cycle_reaps_orphan_running_cycles_on_start(tmp_repo, db):
     # the orphan is no longer running
     statuses = {r["id"]: r["status"] for r in db.list_cycles()}
     assert statuses[orphan_id] == "error"
+
+
+async def test_cycle_records_project_id(tmp_repo, db):
+    """A cycle started with an explicit project_id is attributed to it in the DB
+    and in the returned CycleResult, so callers can link cycles back to projects.
+    """
+    pid = db.create_project("test-project", description="for attribution")
+    llm = driver_fake(worker=_scripted_worker(_good_fix_plan()))
+    engine = _engine(tmp_repo, db, FakeGovernance(), llm)
+    result = await engine.run("add a memory lesson", project_id=pid)
+    assert result.merged
+    assert result.project_id == pid
+    row = db.get_cycle(result.cycle_id)
+    assert row["project_id"] == pid
+
+
+async def test_cycle_without_project_id_defaults_to_null(tmp_repo, db):
+    """Backward compatibility: omitting project_id leaves the column NULL and the
+    result's project_id empty — no implicit attribution at the engine layer.
+    """
+    llm = driver_fake(worker=_scripted_worker(_good_fix_plan()))
+    engine = _engine(tmp_repo, db, FakeGovernance(), llm)
+    result = await engine.run("add a memory lesson")
+    assert result.merged
+    assert result.project_id == ""
+    row = db.get_cycle(result.cycle_id)
+    assert row["project_id"] is None
+
+
+def test_list_cycles_filters_by_project(db):
+    """list_cycles(project_id=...) scopes the query so a UI can show a project's
+    cycles without filtering client-side."""
+    pid_a = db.create_project("a")
+    pid_b = db.create_project("b")
+    db.create_cycle("obj a1", "improve/a1", project_id=pid_a)
+    db.create_cycle("obj a2", "improve/a2", project_id=pid_a)
+    db.create_cycle("obj b1", "improve/b1", project_id=pid_b)
+    db.create_cycle("obj orphan", "improve/orphan")
+    a_cycles = db.list_cycles(project_id=pid_a)
+    assert {c["objective"] for c in a_cycles} == {"obj a1", "obj a2"}
+    orphan_cycles = db.list_cycles(project_id="nonexistent")
+    assert orphan_cycles == []

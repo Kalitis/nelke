@@ -139,6 +139,7 @@ class CycleResult:
     ai_verdict: str = ""
     human_verdict: str = ""
     message: str = ""
+    project_id: str = ""
 
     @property
     def merged(self) -> bool:
@@ -346,6 +347,7 @@ class CycleEngine:
         objective: str,
         *,
         human_approve: Callable[[HumanReviewRequest], bool | Awaitable[bool]] | None = None,
+        project_id: str | None = None,
     ) -> CycleResult:
         repo = self.repo
         if not repo.is_repo():
@@ -371,7 +373,7 @@ class CycleEngine:
             repo.checkout("main")
         repo.checkout_new_branch(branch, base="main")
         self._synced = False
-        self.db.create_cycle(objective, branch, cycle_id=cycle_id)
+        self.db.create_cycle(objective, branch, cycle_id=cycle_id, project_id=project_id)
         completed = False
         try:
             if self.mode == "parallel":
@@ -379,6 +381,9 @@ class CycleEngine:
             else:
                 result = await self._run_impl(repo, objective, branch, cycle_id, human_gate)
             completed = True
+            # Attribute the cycle to its project in the result so callers/UI can
+            # link it back without a separate DB lookup.
+            result.project_id = project_id or ""
             return result
         except BaseException:  # noqa: BLE001 - catch CancelledError/KeyboardInterrupt too
             try:

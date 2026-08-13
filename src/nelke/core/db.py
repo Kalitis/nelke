@@ -135,6 +135,11 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_kanban_columns_board ON kanban_columns(board_id)",
     "CREATE INDEX IF NOT EXISTS idx_kanban_cards_board ON kanban_cards(board_id)",
     "CREATE INDEX IF NOT EXISTS idx_kanban_cards_column ON kanban_cards(column_id)",
+    # Cycles → Projects: optional relation so a self-improvement cycle can be
+    # attributed to a project (e.g. the dogfooding "nelke" project). Legacy
+    # cycles keep NULL here.
+    "ALTER TABLE cycles ADD COLUMN project_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_cycles_project ON cycles(project_id)",
 ]
 
 
@@ -643,13 +648,20 @@ class Database:
             return rows[0] if rows else None
 
     # ---- cycles / steps ------------------------------------------------------
-    def create_cycle(self, objective: str, branch: str, cycle_id: str | None = None) -> str:
+    def create_cycle(
+        self,
+        objective: str,
+        branch: str,
+        cycle_id: str | None = None,
+        project_id: str | None = None,
+    ) -> str:
         self._prepare()
         cid = cycle_id or new_id()
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO cycles (id, objective, branch, status, started_at) VALUES (?,?,?,?,?)",
-                (cid, objective, branch, "running", _now()),
+                "INSERT INTO cycles (id, objective, branch, status, started_at, project_id) "
+                "VALUES (?,?,?,?,?,?)",
+                (cid, objective, branch, "running", _now(), project_id),
             )
         return cid
 
@@ -668,11 +680,26 @@ class Database:
             row = conn.execute("SELECT * FROM cycles WHERE id=?", (cycle_id,)).fetchone()
         return row
 
-    def list_cycles(self, status: str | None = None) -> list[sqlite3.Row]:
+    def list_cycles(
+        self,
+        status: str | None = None,
+        project_id: str | None = None,
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list = []
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if project_id:
+            clauses.append("project_id=?")
+            params.append(project_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         with self._conn() as conn:
-            if status:
-                return list(conn.execute("SELECT * FROM cycles WHERE status=? ORDER BY started_at DESC", (status,)))
-            return list(conn.execute("SELECT * FROM cycles ORDER BY started_at DESC"))
+            return list(
+                conn.execute(
+                    f"SELECT * FROM cycles{where} ORDER BY started_at DESC", params
+                )
+            )
 
     def add_step(
         self,

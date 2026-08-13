@@ -65,12 +65,12 @@ def open_settings() -> Settings:
 
 
 def open_db(settings: Settings | None = None):
-    from nelke.core.db import Database
+    # Delegate to services.open_db so the CLI shares the same boot behaviour
+    # as the web frontend — including auto-creating the default "nelke" project.
+    from nelke.core import services
 
     settings = settings or open_settings()
-    db = Database(settings.db_path)
-    db.migrate()
-    return db
+    return services.open_db(settings)
 
 
 def open_memory(repo: Path):

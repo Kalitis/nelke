@@ -528,6 +528,40 @@ def test_create_project_seeds_memory_and_returns_stage(tmp_repo, settings):
     assert any(f["name"] == "INDEX.md" for f in detail["memory_files"])
 
 
+def test_ensure_default_project_is_idempotent(settings):
+    """ensure_default_project creates the "nelke" project once and returns the
+    same id on every subsequent call — never duplicates, even though project
+    names are not unique in the schema."""
+    first = services.ensure_default_project(settings)
+    assert first
+    second = services.ensure_default_project(settings)
+    assert second == first
+    projects = [p for p in services.list_projects(settings) if p["name"] == "nelke"]
+    assert len(projects) == 1
+    assert projects[0]["id"] == first
+
+
+def test_ensure_default_project_does_not_dirty_working_tree(tmp_repo, settings, monkeypatch):
+    """ensure_default_project is called from open_db, which runs mid-cycle where
+    the working tree must stay clean. It writes only the DB row — no memory
+    files — so the repo is left without uncommitted changes."""
+    monkeypatch.setenv("NELKE_REPO", str(tmp_repo.repo))
+    from nelke.core.gitops import GitRepo
+
+    repo = GitRepo(tmp_repo.repo)
+    assert not repo.has_changes()
+    services.ensure_default_project(settings)
+    assert not repo.has_changes(), "ensure_default_project must not write repo files"
+
+
+def test_ensure_default_project_works_via_open_db(settings):
+    """open_db auto-creates the default project so any entry path (web/cli)
+    that opens the DB ends up with the nelke project available for attribution."""
+    db = services.open_db(settings)
+    names = {row["name"] for row in db.list_projects()}
+    assert "nelke" in names
+
+
 def test_set_project_memory_writes_note_and_detail_lists_it(tmp_repo, settings):
     pid = services.create_project(settings, name="P", repo=tmp_repo.repo)
     ok = services.set_project_memory(

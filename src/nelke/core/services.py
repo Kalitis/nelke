@@ -126,7 +126,48 @@ def open_db(settings: Settings | None = None) -> Database:
     settings = settings or Settings()
     db = Database(settings.db_path)
     db.migrate()
+    # Auto-create the dogfooding "nelke" project so self-improvement cycles have
+    # somewhere to attach. Idempotent: a missing/empty project table (e.g. a
+    # half-migrated DB) must not break DB open, which every request depends on.
+    try:
+        ensure_default_project(settings)
+    except Exception:  # noqa: BLE001 - boot must never fail on project seeding
+        pass
     return db
+
+
+# The self-referential project: nelke improving itself. Self-improvement cycles
+# attach to this project by default when no explicit project_id is given.
+DEFAULT_PROJECT_NAME = "nelke"
+DEFAULT_PROJECT_DESCRIPTION = "Nelke improving itself — the dogfooding project."
+
+
+def ensure_default_project(settings: Settings | None = None) -> str:
+    """Return the id of the default "nelke" project, creating it if absent.
+
+    Names are not unique in the schema, so we scan ``list_projects`` by name.
+    The first match wins; on a fresh install we create exactly one. Idempotent:
+    calling it on every ``open_db`` never duplicates the row.
+
+    Writes ONLY the database row — it deliberately does NOT seed the project's
+    ``memory/projects/<id>/`` directory, because this runs from ``open_db``
+    which is called mid-cycle where the working tree must stay clean. The memory
+    dir is created lazily on first ``set_project_memory``/open_project_memory.
+    """
+    settings = settings or Settings()
+    db = Database(settings.db_path)
+    db.migrate()
+    existing = next(
+        (row for row in db.list_projects() if row["name"] == DEFAULT_PROJECT_NAME),
+        None,
+    )
+    if existing is not None:
+        return str(existing["id"])
+    return db.create_project(
+        DEFAULT_PROJECT_NAME,
+        description=DEFAULT_PROJECT_DESCRIPTION,
+        stage="active",
+    )
 
 
 def open_memory(repo: Path) -> MemoryStore:
@@ -298,6 +339,7 @@ async def run_cycle(
     on_usage: UsageHandler = None,
     mode: str = "single",
     max_workers: int = 6,
+    project_id: str | None = None,
 ) -> Any:
     """Run a self-improvement cycle. Returns the :class:`CycleResult`.
 
@@ -328,6 +370,14 @@ async def run_cycle(
         if governance is not None
         else Governance(git, require_tests=settings.require_code_tests)
     )
+    # Self-improvement cycles attach to the dogfooding "nelke" project by
+    # default when the caller did not name one, so cycles are attributable even
+    # on a fresh install.
+    if project_id is None:
+        try:
+            project_id = ensure_default_project(settings)
+        except Exception:  # noqa: BLE001 - attribution is best-effort
+            project_id = None
     engine = CycleEngine(
         git, db, gov, llm_factory(profile),
         on_event=on_event,
@@ -342,7 +392,7 @@ async def run_cycle(
         mode=mode,  # type: ignore[arg-type]
         max_workers=max_workers,
     )
-    return await engine.run(objective)
+    return await engine.run(objective, project_id=project_id)
 
 
 def list_open_reviews(settings: Settings | None = None) -> list[dict[str, Any]]:

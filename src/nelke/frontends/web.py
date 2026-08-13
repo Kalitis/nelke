@@ -639,6 +639,9 @@ def create_app(state: AppState | None = None) -> FastAPI:
         if not objective:
             return JSONResponse({"error": "empty objective"}, status_code=400)
         auto = bool(payload.get("auto_approve", False))
+        # Optional project attribution. When omitted, run_cycle attaches the
+        # cycle to the default "nelke" dogfooding project automatically.
+        project_id = str(payload.get("project_id", "")).strip() or None
 
         async def human_gate(req: Any) -> bool:
             if auto:
@@ -685,6 +688,7 @@ def create_app(state: AppState | None = None) -> FastAPI:
                     # The web frontend renders one card per parallel worker;
                     # the planner splits the objective into <= 6 slices.
                     mode="parallel",
+                    project_id=project_id,
                 )
                 # Notify any SSE subscribers that the cycle finished.
                 for _, events in state.stream_events.items():
@@ -694,6 +698,7 @@ def create_app(state: AppState | None = None) -> FastAPI:
                             "data": json.dumps({
                                 "cycle_id": result.cycle_id, "status": result.status,
                                 "branch": result.branch, "steps": result.steps,
+                                "project_id": result.project_id,
                             }),
                         })
             except Exception:  # noqa: BLE001 - the gate future is abandoned on failure

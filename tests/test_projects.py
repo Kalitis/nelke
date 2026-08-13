@@ -14,6 +14,8 @@ from nelke.core.tools.projects import (
     KanbanAddCardTool,
     KanbanBoardTool,
     KanbanCreateBoardTool,
+    KanbanDeleteCardTool,
+    KanbanMoveCardTool,
     ProjectDirectoryTool,
     ProjectMemoryReadTool,
     ProjectMemoryWriteTool,
@@ -139,6 +141,84 @@ def test_kanban_add_card_by_column_name(tmp_path):
     res = _run(add.execute(project_id=project_id, board_id=bid, column="In Progress", title="ByName"))
     assert res.ok
     assert "ByName" in res.render()
+
+
+def test_kanban_move_and_delete_card(tmp_path):
+    db = _make_db(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project_id = create_project(_Settings(db.path), name="Demo", repo=repo)
+    bid = db.create_kanban_board(project_id, "Board")
+    # Backlog -> In Progress -> Done (default columns).
+    backlog = next(c for c in db.list_kanban_columns(bid) if c["name"] == "Backlog")
+    in_prog = next(c for c in db.list_kanban_columns(bid) if c["name"] == "In Progress")
+    card_id = db.add_kanban_card(bid, backlog["id"], "Task A")
+
+    move = KanbanMoveCardTool(db, repo)
+    res = _run(move.execute(card_id=card_id, column=in_prog["id"]))
+    assert res.ok
+    assert db.get_kanban_card(card_id)["column_id"] == in_prog["id"]
+
+    # Move by column name too.
+    res = _run(move.execute(card_id=card_id, column="Done"))
+    assert res.ok
+    done = next(c for c in db.list_kanban_columns(bid) if c["name"] == "Done")
+    assert db.get_kanban_card(card_id)["column_id"] == done["id"]
+
+    delete = KanbanDeleteCardTool(db, repo)
+    res = _run(delete.execute(card_id=card_id))
+    assert res.ok
+    assert db.get_kanban_card(card_id) is None
+
+
+def test_create_chat_in_project(tmp_path):
+    db = _make_db(tmp_path)
+    from nelke.core.services import create_chat
+
+    project_id = db.create_project("Demo")
+    chat_id = create_chat(_Settings(db.path), title="In project", project_id=project_id)
+    assert chat_id
+    rows = db.list_project_sessions(project_id)
+    assert [r["id"] for r in rows] == [chat_id]
+    # The chat is attached: set_session_project would have failed without it.
+    assert db.get_session(chat_id)["project_id"] == project_id
+
+
+def test_make_agent_registers_project_tools(tmp_path):
+    from nelke.core.agent import make_agent
+
+    db = _make_db(tmp_path)
+    repo = tmp_path / "repo"
+    (repo / "memory").mkdir(parents=True)
+    (repo / "src" / "nelke").mkdir(parents=True)
+
+    class FakeLLM:
+        async def chat(self, *a, **k):
+            from nelke.core.llm import LLMResponse
+
+            return LLMResponse(content="ok", tool_calls=[])
+
+    agent = make_agent(
+        workspace=repo / "workspaces" / "ws1", llm=FakeLLM(),
+        name="t", db=db, system_prompt="sys",
+    )
+    names = agent.registry.names()
+    for expected in (
+        "project_directory",
+        "project_memory_read",
+        "project_memory_write",
+        "kanban_board",
+        "kanban_create_board",
+        "kanban_add_card",
+        "kanban_move_card",
+        "kanban_update_card",
+        "kanban_delete_card",
+    ):
+        assert expected in names, expected
+    # The system prompt mentions project capabilities so agents actually use them.
+    assert "Projects" in agent.system_content()
+    assert "kanban" in agent.system_content()
+    assert "project_memory_read" in agent.system_content()
 
 
 def test_project_tools_reject_unknown_project(tmp_path):

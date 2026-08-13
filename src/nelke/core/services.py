@@ -556,10 +556,18 @@ def create_chat(
     *,
     title: str | None = None,
     frontend: str = "web",
+    project_id: str | None = None,
 ) -> str:
-    """Create a new (empty) chat session; returns its id."""
+    """Create a new (empty) chat session; returns its id.
+
+    When ``project_id`` is given, the chat is attached to that project
+    immediately (creating the chat in the project's context).
+    """
     db = open_db(settings)
-    return db.create_session(frontend, meta={"title": title} if title else {})
+    chat_id = db.create_session(frontend, meta={"title": title} if title else {})
+    if project_id:
+        db.set_session_project(chat_id, project_id)
+    return chat_id
 
 
 def list_chats(

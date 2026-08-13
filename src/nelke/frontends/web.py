@@ -467,6 +467,22 @@ def create_app(state: AppState | None = None) -> FastAPI:
         )
         return JSONResponse({"id": pid, "name": name})
 
+    @app.post("/api/projects/{project_id}/chats")
+    async def api_create_project_chat(project_id: str, payload: dict[str, Any]) -> JSONResponse:
+        """Create a new chat and attach it to a project.
+
+        This is the primary way to add a chat to a project (vs. ``api_link_chat``
+        which attaches an *existing* chat). Returns the new chat id.
+        """
+        db = services.open_db(state.settings)
+        if db.get_project(project_id) is None:
+            return JSONResponse({"error": "project not found"}, status_code=404)
+        title = str(payload.get("title") or "").strip() or None
+        chat_id = services.create_chat(
+            state.settings, title=title, frontend="web", project_id=project_id,
+        )
+        return JSONResponse({"id": chat_id, "project_id": project_id, "title": title or "New chat"})
+
     @app.get("/api/projects/{project_id}")
     async def api_project_detail(project_id: str) -> JSONResponse:
         project = services.get_project(state.settings, project_id, repo=state.repo_path)

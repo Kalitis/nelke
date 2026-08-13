@@ -116,6 +116,18 @@ class Agent:
                 "past lessons. Reach memory files by short name through these tools, "
                 "not by hand."
             )
+        # When project tools are present, point the agent at them so kanban and
+        # per-project memory are actually *used*, not just registered.
+        if self.registry.has("project_memory_read"):
+            content += (
+                "\n\n# Projects\n"
+                "You have project tools available: `project_directory` (a project's "
+                "localised root under repo/projects/<id>), `project_memory_read/write` "
+                "(its durable notes under memory/projects/<id>), and kanban tools "
+                "(`kanban_board`, `kanban_create_board`, `kanban_add_card`, "
+                "`kanban_move_card`, `kanban_update_card`, `kanban_delete_card`). "
+                "Use them to manage a project's work and local memory."
+            )
         if self.memory_index:
             content += "\n\n# Memory index (summary)\n" + self.memory_index
         return content
@@ -355,7 +367,10 @@ def make_agent(
     from nelke.core.tools.projects import (
         KanbanAddCardTool,
         KanbanBoardTool,
+        KanbanCardUpdateTool,
         KanbanCreateBoardTool,
+        KanbanDeleteCardTool,
+        KanbanMoveCardTool,
         ProjectDirectoryTool,
         ProjectMemoryReadTool,
         ProjectMemoryWriteTool,
@@ -387,22 +402,23 @@ def make_agent(
         tools += [CyclesTool(db)]
         # Project tools: localised project directory, per-project memory, and
         # kanban boards. The workspace is under settings.workspaces_dir; projects
-        # live at the repo root (sibling of the memory store), so lift the
-        # workspace up to the repo's own directory.
+        # live at the repo root, so lift the workspace up to the repo's directory.
         candidates = []
         for cand in ws.parents:
             if (cand / "memory").exists() or (cand / "src" / "nelke").exists():
                 candidates.append(cand)
-        repo_root = candidates[0] if candidates else None
-        if repo_root is not None:
-            tools += [
-                ProjectDirectoryTool(db, repo_root),
-                ProjectMemoryReadTool(db, repo_root),
-                ProjectMemoryWriteTool(db, repo_root),
-                KanbanBoardTool(db, repo_root),
-                KanbanCreateBoardTool(db, repo_root),
-                KanbanAddCardTool(db, repo_root),
-            ]
+        repo_root = candidates[0] if candidates else ws.parent
+        tools += [
+            ProjectDirectoryTool(db, repo_root),
+            ProjectMemoryReadTool(db, repo_root),
+            ProjectMemoryWriteTool(db, repo_root),
+            KanbanBoardTool(db, repo_root),
+            KanbanCreateBoardTool(db, repo_root),
+            KanbanAddCardTool(db, repo_root),
+            KanbanMoveCardTool(db, repo_root),
+            KanbanDeleteCardTool(db, repo_root),
+            KanbanCardUpdateTool(db, repo_root),
+        ]
     return Agent(
         name=name,
         system_prompt=system_prompt or DEFAULT_SYSTEM_PROMPT,

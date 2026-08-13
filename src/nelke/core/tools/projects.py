@@ -26,18 +26,63 @@ def project_directory(repo_root: Path, project_id: str) -> Path:
     """The localised directory for a project: ``<repo>/projects/<id>/``.
 
     This is the directory *around which* the project is organized and *in which*
-    its artifacts live. Created lazily on first use. It sits next to the global
-    memory tree (``<repo>/memory``) and the per-project memory store lives under
+    its artifacts live. It sits next to the global memory tree (``<repo>/memory``)
+    and the per-project memory store lives under
     ``<repo>/memory/projects/<id>/`` — the project dir is the working/localisation
     root, distinct from its git-tracked memory notes.
     """
     return repo_root / PROJECTS_ROOT_NAME / project_id
 
 
-def _resolve_repo(settings) -> Path:
-    from nelke.core.services import find_repo
+def _board_dto(db: Database, board) -> dict:
+    return {
+        "id": board["id"],
+        "project_id": board["project_id"],
+        "name": board["name"],
+        "description": board["description"] or "",
+        "created_at": board["created_at"],
+        "columns": [
+            {
+                "id": col["id"],
+                "name": col["name"],
+                "position": int(col["position"]),
+                "cards": [
+                    {
+                        "id": c["id"],
+                        "title": c["title"],
+                        "description": c["description"] or "",
+                        "task_id": c["task_id"],
+                        "position": int(c["position"]),
+                        "column_id": col["id"],
+                        "created_at": c["created_at"],
+                    }
+                    for c in db.list_kanban_cards(column_id=col["id"])
+                ],
+            }
+            for col in db.list_kanban_columns(board["id"])
+        ],
+    }
 
-    return find_repo(settings or None)
+
+def _render_boards(boards) -> str:
+    out: list[str] = []
+    for b in boards:
+        out.append(f"board: {b['name']} (id={b['id'][:8]})")
+        for col in b["columns"]:
+            cards = ", ".join(
+                f"{c['title']} (id={c['id'][:8]})" for c in col["cards"]
+            )
+            out.append(f"  [{col['name']}] {cards or '(empty)'}")
+    return "\n".join(out)
+
+
+def _find_column(board, column: str) -> str | None:
+    if not column:
+        return None
+    for col in board["columns"]:
+        if col["id"] == column or col["id"].startswith(column) or col["name"] == column:
+            return col["id"]
+    return None
 
 
 class ProjectDirectoryTool(BaseTool):
@@ -141,14 +186,22 @@ class ProjectMemoryWriteTool(BaseTool):
             return ToolResult.failure(f"project not found: {project_id}")
         name = (name or "").strip()
         if not name:
-            return ToolResult.failure("project_memory_write failed: memory note name is required")
+            return ToolResult.failure(
+                "project_memory_write failed: memory note name is required"
+            )
         if "/" in name or "\\" in name or not name.endswith(".md"):
-            return ToolResult.failure("project_memory_write failed: name must be a flat *.md file")
+            return ToolResult.failure(
+                "project_memory_write failed: name must be a flat *.md file"
+            )
         store = open_project_memory(self.repo_root, project_id)
         target = store.memory_dir / name
         target.parent.mkdir(parents=True, exist_ok=True)
         if not overwrite and target.exists():
-            body = target.read_text(encoding="utf-8", errors="replace").rstrip() + "\n\n" + content.strip()
+            body = (
+                target.read_text(encoding="utf-8", errors="replace").rstrip()
+                + "\n\n"
+                + content.strip()
+            )
         else:
             body = content
         target.write_text(body, encoding="utf-8")
@@ -186,58 +239,13 @@ class KanbanBoardTool(BaseTool):
                 return ToolResult.failure(f"board not found: {board_id}")
             boards = [_board_dto(self.db, board)]
         else:
-            boards = self._list_boards(project_id)
+            boards = [_board_dto(self.db, b) for b in self.db.list_kanban_boards(project_id)]
         if not boards:
             return ToolResult.success(
                 f"project {project_id} has no kanban boards. "
                 "Create one with kaanban_create_board."
             )
         return ToolResult.success(_render_boards(boards))
-
-    def _list_boards(self, project_id: str):
-        return [_board_dto(self.db, board) for board in self.db.list_kanban_boards(project_id)]
-
-
-def _board_dto(db: Database, board) -> dict:
-    return {
-        "id": board["id"],
-        "project_id": board["project_id"],
-        "name": board["name"],
-        "description": board["description"] or "",
-        "created_at": board["created_at"],
-        "columns": [
-            {
-                "id": col["id"],
-                "name": col["name"],
-                "position": int(col["position"]),
-                "cards": [
-                    {
-                        "id": c["id"],
-                        "title": c["title"],
-                        "description": c["description"] or "",
-                        "task_id": c["task_id"],
-                        "position": int(c["position"]),
-                        "column_id": col["id"],
-                        "created_at": c["created_at"],
-                    }
-                    for c in db.list_kanban_cards(column_id=col["id"])
-                ],
-            }
-            for col in db.list_kanban_columns(board["id"])
-        ],
-    }
-
-
-def _render_boards(boards) -> str:
-    out: list[str] = []
-    for b in boards:
-        out.append(f"board: {b['name']} (id={b['id'][:8]})")
-        for col in b["columns"]:
-            cards = ", ".join(
-                f"{c['title']} (id={c['id'][:8]})" for c in col["cards"]
-            )
-            out.append(f"  [{col['name']}] {cards or '(empty)'}")
-    return "\n".join(out)
 
 
 class KanbanCreateBoardTool(BaseTool):
@@ -315,10 +323,96 @@ class KanbanAddCardTool(BaseTool):
         return ToolResult.success(f"added card '{title}' id={card_id[:8]}")
 
 
-def _find_column(board, column: str) -> str | None:
-    if not column:
-        return None
-    for col in board["columns"]:
-        if col["id"] == column or col["id"].startswith(column) or col["name"] == column:
-            return col["id"]
-    return None
+class KanbanMoveCardTool(BaseTool):
+    name = "kanban_move_card"
+    description = (
+        "Move a kanban card to another column and/or reorder it. Look up the target "
+        "column by id or exact name within the card's board."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "card_id": {"type": "string"},
+            "column": {"type": "string", "default": None,
+                       "description": "Target column id or name (omit to reorder)"},
+            "position": {"type": "integer", "default": None,
+                         "description": "New 0-based position within the column"},
+        },
+        "required": ["card_id"],
+    }
+
+    def __init__(self, db: Database, repo_root: Path) -> None:
+        self.db = db
+        self.repo_root = repo_root
+
+    async def execute(self, **kwargs) -> ToolResult:
+        card_id = str(kwargs.get("card_id", ""))
+        column = kwargs.get("column")
+        position = kwargs.get("position")
+        card = self.db.get_kanban_card(card_id)
+        if card is None:
+            return ToolResult.failure(f"card not found: {card_id}")
+        target_column: str | None = None
+        if column:
+            board_dto = _board_dto(self.db, self.db.get_kanban_board(card["board_id"]))
+            target_column = _find_column(board_dto, str(column))
+            if target_column is None:
+                return ToolResult.failure(f"column not found: {column}")
+        ok = self.db.move_kanban_card(
+            card_id,
+            column_id=target_column,
+            position=int(position) if position is not None else None,
+        )
+        if not ok:
+            return ToolResult.failure(f"could not move card: {card_id}")
+        return ToolResult.success(f"moved card {card_id[:8]}")
+
+
+class KanbanDeleteCardTool(BaseTool):
+    name = "kanban_delete_card"
+    description = "Delete a kanban card from a project's board."
+    parameters = {
+        "type": "object",
+        "properties": {"card_id": {"type": "string"}},
+        "required": ["card_id"],
+    }
+
+    def __init__(self, db: Database, repo_root: Path) -> None:
+        self.db = db
+        self.repo_root = repo_root
+
+    async def execute(self, **kwargs) -> ToolResult:
+        card_id = str(kwargs.get("card_id", ""))
+        if self.db.get_kanban_card(card_id) is None:
+            return ToolResult.failure(f"card not found: {card_id}")
+        self.db.delete_kanban_card(card_id)
+        return ToolResult.success(f"deleted card {card_id[:8]}")
+
+
+class KanbanCardUpdateTool(BaseTool):
+    name = "kanban_update_card"
+    description = "Rename and/or update the description of a kanban card."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "card_id": {"type": "string"},
+            "title": {"type": "string", "default": None},
+            "description": {"type": "string", "default": None},
+        },
+        "required": ["card_id"],
+    }
+
+    def __init__(self, db: Database, repo_root: Path) -> None:
+        self.db = db
+        self.repo_root = repo_root
+
+    async def execute(self, **kwargs) -> ToolResult:
+        card_id = str(kwargs.get("card_id", ""))
+        if self.db.get_kanban_card(card_id) is None:
+            return ToolResult.failure(f"card not found: {card_id}")
+        self.db.update_kanban_card(
+            card_id,
+            title=kwargs.get("title"),
+            description=kwargs.get("description"),
+        )
+        return ToolResult.success(f"updated card {card_id[:8]}")

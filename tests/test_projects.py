@@ -51,7 +51,7 @@ def test_project_directory_path():
     assert project_directory(repo, "abc") == Path("/repo") / "projects" / "abc"
 
 
-def test_project_directory_tool_reports_path(tmp_path):
+def test_project_directory_reports_path(tmp_path):
     db = _make_db(tmp_path)
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -64,6 +64,28 @@ def test_project_directory_tool_reports_path(tmp_path):
     # Directory is created on create_project.
     assert (repo / "projects" / project_id).exists()
     assert (repo / "projects" / project_id / "README.md").exists()
+
+
+def test_project_directory_for_legacy_project(tmp_path):
+    """A project created without a repo dir still gets a localised root."""
+    from nelke.core.services import ensure_project_directory
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Create a project in the DB that ensure_project_directory will read,
+    # WITHOUT seeding a directory.
+    db = _make_db(tmp_path)
+    legacy = db.create_project("Legacy")
+    assert not (repo / "projects" / legacy).exists()
+
+    path = ensure_project_directory(repo, legacy, settings=_Settings(db.path))
+    assert path is not None
+    assert path.exists()
+    assert (path / "README.md").exists()
+    # Idempotent: calling again does not error and returns the same path.
+    assert ensure_project_directory(repo, legacy, settings=_Settings(db.path)) == path
+    # Unknown project -> None.
+    assert ensure_project_directory(repo, "no-such-project", settings=_Settings(db.path)) is None
 
 
 def test_project_memory_read_write(tmp_path):

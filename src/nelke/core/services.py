@@ -203,6 +203,33 @@ def open_project_memory(repo: Path, project_id: str) -> MemoryStore:
     return _ProjectMemoryStore(repo / "memory" / "projects" / project_id)
 
 
+def ensure_project_directory(
+    repo: Path | None = None,
+    project_id: str | None = None,
+    *,
+    settings: Settings | None = None,
+) -> Path | None:
+    """Ensure a project's localised directory exists (idempotently).
+
+    Unlike ``create_project_directory`` (called only on new projects), this
+    runs for *any* project — including legacy ones created before the directory
+    feature existed — so every project gets a working root around which it is
+    localised. Returns the directory, or ``None`` if it cannot be determined
+    (e.g. unknown project or unavailable repo).
+    """
+    if not project_id:
+        return None
+    try:
+        repo_path = repo or find_repo(settings or Settings())
+        # Only create for projects that actually exist in the DB.
+        db = open_db(settings)
+        if db.get_project(project_id) is None:
+            return None
+        return create_project_directory(repo_path, project_id)
+    except Exception:  # noqa: BLE001 - directory creation is best-effort
+        return None
+
+
 def build_chat_session(
     settings: Settings,
     profile: str | None,
@@ -733,9 +760,18 @@ def create_project_directory(repo: Path, project_id: str) -> Path:
 
 def list_projects(settings: Settings | None = None) -> list[dict[str, Any]]:
     """All projects, most recently updated first, with chat counts."""
+    settings = settings or Settings()
     db = open_db(settings)
+    # Lazily ensure each project's localised directory exists (covers legacy
+    # projects that predate the directory feature).
+    try:
+        repo_path = find_repo(settings)
+    except Exception:  # noqa: BLE001 - repo discovery is best-effort
+        repo_path = None
     out: list[dict[str, Any]] = []
     for row in db.list_projects():
+        if repo_path is not None:
+            ensure_project_directory(repo_path, row["id"], settings=settings)
         out.append(_project_dto(db, row))
     return out
 
@@ -752,6 +788,9 @@ def get_project(
     row = db.get_project(project_id)
     if row is None:
         return None
+    # Ensure the localised working directory exists for every project,
+    # including legacy ones created before the directory feature landed.
+    ensure_project_directory(repo, project_id, settings=settings)
     dto = _project_dto(db, row)
     dto["chats"] = [
         _chat_summary_for_project(r)

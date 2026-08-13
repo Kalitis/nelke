@@ -85,6 +85,10 @@ def _scripted_llm_factory(responses: list[LLMResponse], cycle_reviewer=None):
                 if "review gate" in system or "AI review gate" in system:
                     state["r"] += 1
                     return cycle_reviewer(messages, tools)
+                # Objective gate defaults to ACHIEVED so a cycle that did real
+                # work still merges.
+                if "independent gate judging" in system:
+                    return final_response("VERDICT: ACHIEVED\nGAPS:\n- none")
                 resp = responses[min(state["i"], len(responses) - 1)]
                 state["i"] += 1
                 if stream and on_token is not None and resp.content:

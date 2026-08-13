@@ -44,6 +44,10 @@ def _scripted_llm_factory(responses: list[LLMResponse], cycle_reviewer=None):
                 if "review gate" in system or "AI review gate" in system:
                     state["r"] += 1
                     return cycle_reviewer(messages, tools)
+                # Objective gate defaults to ACHIEVED so a cycle that did real
+                # work still merges.
+                if "independent gate judging" in system:
+                    return final_response("VERDICT: ACHIEVED\nGAPS:\n- none")
                 resp = responses[min(state["i"], len(responses) - 1)]
                 state["i"] += 1
                 if stream and on_token is not None and resp.content:
@@ -647,18 +651,21 @@ def _projects_client(settings, tmp_repo) -> TestClient:
 
 def test_api_projects_crud(settings, tmp_repo):
     with _projects_client(settings, tmp_repo) as client:
-        # empty initially
-        assert client.get("/api/projects").json() == []
+        # open_db auto-creates the dogfooding "nelke" project, so it is present
+        # from the start.
+        initial = client.get("/api/projects").json()
+        assert [p["name"] for p in initial] == ["nelke"]
 
         # create
         r = client.post("/api/projects", json={"name": "Nelke", "stage": "idea"})
         assert r.status_code == 200
         pid = r.json()["id"]
 
-        # list reflects it
+        # list reflects it (nelke + the new one)
         rows = client.get("/api/projects").json()
-        assert len(rows) == 1 and rows[0]["id"] == pid
-        assert rows[0]["stage"] == "idea"
+        assert len(rows) == 2
+        created = next(p for p in rows if p["id"] == pid)
+        assert created["stage"] == "idea"
 
         # patch stage
         assert client.patch(f"/api/projects/{pid}", json={"stage": "active"}).status_code == 200

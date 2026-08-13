@@ -141,6 +141,10 @@ def _cycle_llm_factory(worker_responses, reviewer=None):
                 if "review gate" in system or "AI review gate" in system:
                     state["r"] += 1
                     return reviewer(messages, tools)
+                # Objective gate defaults to ACHIEVED so cycles that did real
+                # work still merge; tests of the gate pass a custom responder.
+                if "independent gate judging" in system:
+                    return final_response("VERDICT: ACHIEVED\nGAPS:\n- none")
                 i = state["i"]
                 state["i"] += 1
                 return worker_responses[min(i, len(worker_responses) - 1)]

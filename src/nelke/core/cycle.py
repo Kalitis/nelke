@@ -719,6 +719,12 @@ class CycleEngine:
             wid = self.db.create_cycle_worker(cycle_id, index, task.title, task.detail)
             worker_specs.append((wid, index, task))
 
+        # Shared read cache for the whole cycle: when one worker reads a file,
+        # every other worker (and later round) gets the cached copy instead of
+        # re-reading it. This is what stops parallel workers from duplicating
+        # each other's exploration of the same files.
+        shared_read_cache: dict[str, str] = {}
+
         # ---- WORK (parallel) ---------------------------------------------
         feedback = ""
         verdict: ReviewVerdict | None = None
@@ -742,7 +748,8 @@ class CycleEngine:
             # other's flags (e.g. propose_complete).
             results = await asyncio.gather(
                 *[
-                    self._run_worker(worker_id, index, task, memory, cycle_id, emit, feedback)
+                    self._run_worker(worker_id, index, task, memory, cycle_id, emit, feedback,
+                                     shared_read_cache)
                     for worker_id, index, task in worker_specs
                 ],
                 return_exceptions=True,
@@ -932,6 +939,7 @@ class CycleEngine:
         cycle_id: str,
         emit: Callable[..., None],
         feedback: str,
+        read_cache: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Run a single parallel worker to completion and emit its progress.
 
@@ -943,6 +951,10 @@ class CycleEngine:
         # Each worker has its own SelfEditContext.state so per-worker flags do
         # not collide; the worker has no propose_cycle_complete tool anyway.
         state: dict[str, Any] = {"worker_index": worker_index}
+        # File ownership: only enforced when the planner gave this slice an
+        # explicit file list. The fallback whole-objective slice has files=[]
+        # -> allowed_files stays None (unrestricted), preserving old behaviour.
+        allowed = set(task.files) if task.has_file_scope else None
         ctx = SelfEditContext(
             repo=self.repo,
             governance=self.governance,
@@ -950,6 +962,8 @@ class CycleEngine:
             state=state,
             cycle_id_provider=lambda: "",
             step_provider=lambda: 0,
+            allowed_files=allowed,
+            read_cache=read_cache,
         )
         self.db.update_cycle_worker(worker_id, status="running", started_at=_now())
         emit("worker_start", f"worker {worker_index} started",

@@ -48,9 +48,39 @@ class SelfEditContext:
     state: dict[str, Any] = field(default_factory=dict)
     cycle_id_provider: Callable[[], str] = lambda: ""
     step_provider: Callable[[], int] = lambda: 0
+    # File ownership: when set, self_edit/self_write refuse paths outside this
+    # set (repo-relative forward-slash). None means "no restriction" (reviewer,
+    # sequential worker, fallback whole-objective slice).
+    allowed_files: set[str] | None = None
+    # Shared read cache keyed by repo-relative forward-slash path. When set
+    # (parallel workers share one cache per cycle), self_read serves a cached
+    # copy instead of re-reading + re-streaming the same file. Workers exploring
+    # the same files thus stop duplicating each other's reads.
+    read_cache: dict[str, str] | None = None
 
     def trailer(self) -> str:
         return f"Nelke-Self-Improve: cycle {self.cycle_id_provider()} step {self.step_provider()}"
+
+    def _rel(self, abs_path: Path) -> str:
+        """Repo-relative forward-slash form of ``abs_path`` for scope/cache keys."""
+        try:
+            return abs_path.resolve().relative_to(self.repo_root.resolve()).as_posix()
+        except ValueError:
+            return abs_path.as_posix()
+
+    def check_write_scope(self, abs_path: Path) -> str | None:
+        """Return an error message if ``abs_path`` is outside the allowed scope,
+        else None. ``allowed_files is None`` means unrestricted."""
+        if self.allowed_files is None:
+            return None
+        rel = self._rel(abs_path)
+        if rel in self.allowed_files:
+            return None
+        allowed = ", ".join(sorted(self.allowed_files)) or "(none)"
+        return (
+            f"{rel} is outside your assigned scope. You may only edit: {allowed}. "
+            "Stay in your lane — other workers own the rest."
+        )
 
 
 def _read(path: Path) -> str | None:
@@ -76,9 +106,17 @@ class SelfReadTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         path = resolve_within(self.ctx.repo_root, kwargs.get("path", ""))
+        rel = self.ctx._rel(path)
+        cache = self.ctx.read_cache
+        if cache is not None and rel in cache:
+            # Another worker already read this file; serve the cached copy so
+            # parallel workers stop duplicating each other's exploration.
+            return ToolResult.success(f"[cached]\n{cache[rel]}")
         content = _read(path)
         if content is None:
             return ToolResult.failure(f"file not found: {path}")
+        if cache is not None:
+            cache[rel] = content
         return ToolResult.success(content)
 
 
@@ -96,6 +134,9 @@ class SelfWriteTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         path = resolve_within(self.ctx.repo_root, kwargs.get("path", ""))
+        scope_error = self.ctx.check_write_scope(path)
+        if scope_error is not None:
+            return ToolResult.failure(scope_error)
         content = str(kwargs.get("content", ""))
         # Write then, if the content is effectively empty, remove the scratch
         # file so an accidental empty probe doesn't linger as a git ghost.
@@ -146,6 +187,9 @@ class SelfEditTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         path = resolve_within(self.ctx.repo_root, kwargs.get("path", ""))
+        scope_error = self.ctx.check_write_scope(path)
+        if scope_error is not None:
+            return ToolResult.failure(scope_error)
         if not path.is_file():
             return ToolResult.failure(f"file not found: {path}")
         old = str(kwargs.get("old_string", ""))

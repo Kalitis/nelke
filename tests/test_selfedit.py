@@ -77,3 +77,69 @@ async def test_self_glob_grep_skip_vendor_dirs(tmp_repo):
     grepped = await SelfGrepTool(ctx).execute(pattern="def ", include="**/*")
     assert "src/main.py" in grepped.output
     assert "from_venv" not in grepped.output
+
+
+async def test_allowed_files_blocks_write_outside_scope(tmp_repo):
+    """A worker whose slice owns memory/facts/in.md must not be able to write a
+    file outside that scope: self_write refuses with a clear message."""
+    ctx = _ctx(tmp_repo)
+    ctx.allowed_files = {"memory/facts/in.md"}
+    w = SelfWriteTool(ctx)
+    blocked = await w.execute(path="src/nelke/core/cycle.py", content="x")
+    assert not blocked.ok
+    assert "outside your assigned scope" in blocked.error
+    # writing an in-scope file still works
+    ok = await w.execute(path="memory/facts/in.md", content="# ok")
+    assert ok.ok
+
+
+async def test_allowed_files_blocks_edit_outside_scope(tmp_repo):
+    """self_edit is scoped the same way as self_write."""
+    from nelke.core.tools.selfedit import SelfEditTool
+
+    # seed a file via an unrestricted ctx, then restrict
+    seed_ctx = _ctx(tmp_repo)
+    await SelfWriteTool(seed_ctx).execute(path="memory/facts/in.md", content="hello")
+    (tmp_repo.repo / "src").mkdir(exist_ok=True)
+    (tmp_repo.repo / "src" / "other.py").write_text("X = 1", encoding="utf-8")
+
+    ctx = _ctx(tmp_repo)
+    ctx.allowed_files = {"memory/facts/in.md"}
+    blocked = await SelfEditTool(ctx).execute(
+        path="src/other.py", old_string="X = 1", new_string="X = 2")
+    assert not blocked.ok
+    assert "outside your assigned scope" in blocked.error
+    ok = await SelfEditTool(ctx).execute(
+        path="memory/facts/in.md", old_string="hello", new_string="hi")
+    assert ok.ok
+
+
+async def test_allowed_files_none_is_unrestricted(tmp_repo):
+    """allowed_files=None (reviewer/sequential/fallback) allows any path — the
+    default, preserving the legacy single-worker behaviour."""
+    ctx = _ctx(tmp_repo)
+    assert ctx.allowed_files is None
+    w = SelfWriteTool(ctx)
+    r = await w.execute(path="memory/facts/anywhere.md", content="x")
+    assert r.ok
+
+
+async def test_read_cache_serves_cached_copy(tmp_repo):
+    """A shared read_cache returns a [cached] copy on the second read of the
+    same file, so parallel workers stop duplicating each other's reads."""
+    await SelfWriteTool(_ctx(tmp_repo)).execute(
+        path="memory/facts/c.md", content="# C\n\nunique body text")
+
+    cache: dict[str, str] = {}
+    ctx = _ctx(tmp_repo)
+    ctx.read_cache = cache
+    r1 = await SelfReadTool(ctx).execute(path="memory/facts/c.md")
+    assert r1.ok and "unique body text" in r1.output
+    assert not r1.output.startswith("[cached]")
+    assert "memory/facts/c.md" in cache
+
+    # Second read (e.g. by another worker sharing the cache) is served cached.
+    r2 = await SelfReadTool(ctx).execute(path="memory/facts/c.md")
+    assert r2.ok
+    assert r2.output.startswith("[cached]")
+    assert "unique body text" in r2.output
